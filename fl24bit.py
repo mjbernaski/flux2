@@ -103,12 +103,15 @@ def main():
     current_prompt = None
     last_seed = None
 
+    steps = args.steps
+
     print("\n=== FLUX.2 Image Generator ===")
-    print(f"Using {args.steps} inference steps" + (" (compiled)" if args.compile else ""))
+    print(f"Using {steps} inference steps" + (" (compiled)" if args.compile else ""))
     print("Commands:")
     print("  'quit' or 'q' - Exit the program")
     print("  'same' or 's' - Regenerate with same prompt (uses cached embeddings)")
     print("  'reseed <number>' - Regenerate with specific seed")
+    print("  '/steps <number>' - Change inference steps (current: {})".format(steps))
     print("  Or enter a new/modified prompt\n")
 
     while True:
@@ -128,6 +131,18 @@ def main():
             print("Goodbye!")
             break
 
+        if lower_input.startswith('/steps '):
+            try:
+                new_steps = int(user_input.split()[1])
+                if new_steps < 1:
+                    print("Steps must be at least 1.")
+                    continue
+                steps = new_steps
+                print(f"Inference steps set to {steps}")
+            except (ValueError, IndexError):
+                print("Invalid steps. Usage: /steps 10")
+            continue
+
         if lower_input in ('same', 's') and current_prompt:
             prompt = current_prompt
         elif lower_input.startswith('reseed ') and current_prompt:
@@ -142,8 +157,8 @@ def main():
             current_prompt = prompt
             last_seed = None
 
-        print(f"\nGenerating image...")
-        image, last_seed = generate_image(prompt, last_seed if lower_input.startswith('reseed ') else None, args.steps)
+        print(f"\nGenerating image ({steps} steps)...")
+        image, last_seed = generate_image(prompt, last_seed if lower_input.startswith('reseed ') else None, steps)
 
         image_count += 1
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
