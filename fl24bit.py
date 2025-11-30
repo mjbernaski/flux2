@@ -59,7 +59,7 @@ pipe = Flux2Pipeline.from_pretrained(
     repo_id, transformer=transformer, text_encoder=None, torch_dtype=torch_dtype
 ).to(device)
 
-def generate_image(prompt, seed=None, steps=6):
+def generate_image(prompt, seed=None, steps=6, width=1024, height=1024):
     if seed is None:
         seed = torch.randint(0, 2**32, (1,)).item()
     print(f"Using seed: {seed}")
@@ -77,6 +77,8 @@ def generate_image(prompt, seed=None, steps=6):
             generator=torch.Generator(device=device).manual_seed(seed),
             num_inference_steps=steps,
             guidance_scale=4,
+            width=width,
+            height=height,
         ).images[0]
     t_gen = time.perf_counter() - t1
 
@@ -105,13 +107,25 @@ def main():
 
     steps = args.steps
 
+    # Orientation presets (width, height)
+    orientations = {
+        'square': (1024, 1024),
+        'portrait': (768, 1344),
+        'landscape': (1344, 768),
+    }
+    orientation = 'square'
+    width, height = orientations[orientation]
+
     print("\n=== FLUX.2 Image Generator ===")
-    print(f"Using {steps} inference steps" + (" (compiled)" if args.compile else ""))
+    print(f"Using {steps} inference steps, {orientation} ({width}x{height})" + (" (compiled)" if args.compile else ""))
     print("Commands:")
     print("  'quit' or 'q' - Exit the program")
     print("  'same' or 's' - Regenerate with same prompt (uses cached embeddings)")
     print("  'reseed <number>' - Regenerate with specific seed")
     print("  '/steps <number>' - Change inference steps (current: {})".format(steps))
+    print("  '/square' - Set 1024x1024 aspect ratio")
+    print("  '/portrait' - Set 768x1344 aspect ratio")
+    print("  '/landscape' - Set 1344x768 aspect ratio")
     print("  Or enter a new/modified prompt\n")
 
     while True:
@@ -143,6 +157,12 @@ def main():
                 print("Invalid steps. Usage: /steps 10")
             continue
 
+        if lower_input in ('/square', '/portrait', '/landscape'):
+            orientation = lower_input[1:]  # Remove the leading /
+            width, height = orientations[orientation]
+            print(f"Orientation set to {orientation} ({width}x{height})")
+            continue
+
         if lower_input in ('same', 's') and current_prompt:
             prompt = current_prompt
         elif lower_input.startswith('reseed ') and current_prompt:
@@ -157,8 +177,8 @@ def main():
             current_prompt = prompt
             last_seed = None
 
-        print(f"\nGenerating image ({steps} steps)...")
-        image, last_seed = generate_image(prompt, last_seed if lower_input.startswith('reseed ') else None, steps)
+        print(f"\nGenerating image ({steps} steps, {orientation} {width}x{height})...")
+        image, last_seed = generate_image(prompt, last_seed if lower_input.startswith('reseed ') else None, steps, width, height)
 
         image_count += 1
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
