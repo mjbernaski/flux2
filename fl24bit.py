@@ -107,17 +107,25 @@ def main():
 
     steps = args.steps
 
-    # Orientation presets (width, height)
+    # Orientation presets (width, height) at large size
     orientations = {
         'square': (1024, 1024),
         'portrait': (768, 1344),
         'landscape': (1344, 768),
     }
+    # Size multipliers
+    sizes = {
+        'small': 0.5,
+        'medium': 0.75,
+        'large': 1.0,
+    }
     orientation = 'square'
-    width, height = orientations[orientation]
+    size = 'large'
+    base_w, base_h = orientations[orientation]
+    width, height = int(base_w * sizes[size]), int(base_h * sizes[size])
 
     print("\n=== FLUX.2 Image Generator ===")
-    print(f"Using {steps} inference steps, {orientation} ({width}x{height})" + (" (compiled)" if args.compile else ""))
+    print(f"Using {steps} inference steps, {size} {orientation} ({width}x{height})" + (" (compiled)" if args.compile else ""))
     print("Commands:")
     print("  'quit' or 'q' - Exit the program")
     print("  'same' or 's' - Regenerate with same prompt (uses cached embeddings)")
@@ -126,6 +134,9 @@ def main():
     print("  '/square' - Set 1024x1024 aspect ratio")
     print("  '/portrait' - Set 768x1344 aspect ratio")
     print("  '/landscape' - Set 1344x768 aspect ratio")
+    print("  '/small' - Set 0.5x resolution")
+    print("  '/medium' - Set 0.75x resolution")
+    print("  '/large' - Set 1.0x resolution (default)")
     print("  Or enter a new/modified prompt\n")
 
     while True:
@@ -159,8 +170,16 @@ def main():
 
         if lower_input in ('/square', '/portrait', '/landscape'):
             orientation = lower_input[1:]  # Remove the leading /
-            width, height = orientations[orientation]
+            base_w, base_h = orientations[orientation]
+            width, height = int(base_w * sizes[size]), int(base_h * sizes[size])
             print(f"Orientation set to {orientation} ({width}x{height})")
+            continue
+
+        if lower_input in ('/small', '/medium', '/large'):
+            size = lower_input[1:]  # Remove the leading /
+            base_w, base_h = orientations[orientation]
+            width, height = int(base_w * sizes[size]), int(base_h * sizes[size])
+            print(f"Size set to {size} ({width}x{height})")
             continue
 
         if lower_input in ('same', 's') and current_prompt:
@@ -177,7 +196,7 @@ def main():
             current_prompt = prompt
             last_seed = None
 
-        print(f"\nGenerating image ({steps} steps, {orientation} {width}x{height})...")
+        print(f"\nGenerating image ({steps} steps, {size} {orientation} {width}x{height})...")
         image, last_seed = generate_image(prompt, last_seed if lower_input.startswith('reseed ') else None, steps, width, height)
 
         image_count += 1
