@@ -107,21 +107,20 @@ def main():
 
     steps = args.steps
 
-    # Orientation presets (width, height) at large size
-    orientations = {
+    # Orientation presets (width, height) at 1K base
+    orientations_1k = {
         'square': (1024, 1024),
         'portrait': (768, 1344),
         'landscape': (1344, 768),
     }
-    # Size multipliers
+    # Size presets
     sizes = {
-        'small': 0.5,
-        'medium': 0.75,
-        'large': 1.0,
+        '1k': 1.0,
+        '2k': 2.0,
     }
     orientation = 'square'
-    size = 'large'
-    base_w, base_h = orientations[orientation]
+    size = '1k'
+    base_w, base_h = orientations_1k[orientation]
     width, height = int(base_w * sizes[size]), int(base_h * sizes[size])
 
     print("\n=== FLUX.2 Image Generator ===")
@@ -131,12 +130,11 @@ def main():
     print("  'same' or 's' - Regenerate with same prompt (uses cached embeddings)")
     print("  'reseed <number>' - Regenerate with specific seed")
     print("  '/steps <number>' - Change inference steps (current: {})".format(steps))
-    print("  '/square' - Set 1024x1024 aspect ratio")
-    print("  '/portrait' - Set 768x1344 aspect ratio")
-    print("  '/landscape' - Set 1344x768 aspect ratio")
-    print("  '/small' - Set 0.5x resolution")
-    print("  '/medium' - Set 0.75x resolution")
-    print("  '/large' - Set 1.0x resolution (default)")
+    print("  '/square' - Set square aspect ratio")
+    print("  '/portrait' - Set portrait aspect ratio")
+    print("  '/landscape' - Set landscape aspect ratio")
+    print("  '/1k' - Set 1K resolution (default)")
+    print("  '/2k' - Set 2K resolution")
     print("  Or enter a new/modified prompt\n")
 
     while True:
@@ -170,14 +168,14 @@ def main():
 
         if lower_input in ('/square', '/portrait', '/landscape'):
             orientation = lower_input[1:]  # Remove the leading /
-            base_w, base_h = orientations[orientation]
+            base_w, base_h = orientations_1k[orientation]
             width, height = int(base_w * sizes[size]), int(base_h * sizes[size])
             print(f"Orientation set to {orientation} ({width}x{height})")
             continue
 
-        if lower_input in ('/small', '/medium', '/large'):
+        if lower_input in ('/1k', '/2k'):
             size = lower_input[1:]  # Remove the leading /
-            base_w, base_h = orientations[orientation]
+            base_w, base_h = orientations_1k[orientation]
             width, height = int(base_w * sizes[size]), int(base_h * sizes[size])
             print(f"Size set to {size} ({width}x{height})")
             continue
