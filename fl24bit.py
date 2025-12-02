@@ -137,7 +137,7 @@ def main():
     print("  '/1k' - Set 1K resolution (default)")
     print("  '/2k' - Set 2K resolution")
     print("  '/4k' - Set 4K resolution")
-    print("  Or enter a new/modified prompt\n")
+    print("  Or enter a prompt (can include modifiers: 'a cat /4k /portrait')\n")
 
     while True:
         if current_prompt is None:
@@ -180,6 +180,34 @@ def main():
             base_w, base_h = orientations_1k[orientation]
             width, height = int(base_w * sizes[size]), int(base_h * sizes[size])
             print(f"Size set to {size} ({width}x{height})")
+            continue
+
+        # Parse inline modifiers from prompt (e.g., "a cat /4k /portrait")
+        words = user_input.split()
+        modifiers_found = []
+        prompt_words = []
+        for word in words:
+            lower_word = word.lower()
+            if lower_word in ('/1k', '/2k', '/4k'):
+                size = lower_word[1:]
+                modifiers_found.append(f"size={size}")
+            elif lower_word in ('/square', '/portrait', '/landscape'):
+                orientation = lower_word[1:]
+                modifiers_found.append(f"orientation={orientation}")
+            else:
+                prompt_words.append(word)
+
+        if modifiers_found:
+            base_w, base_h = orientations_1k[orientation]
+            width, height = int(base_w * sizes[size]), int(base_h * sizes[size])
+            print(f"Applied: {', '.join(modifiers_found)} -> {width}x{height}")
+
+        # Reconstruct prompt without modifiers
+        user_input = ' '.join(prompt_words)
+        lower_input = user_input.lower()
+
+        if not user_input:
+            # Input was only modifiers, no prompt
             continue
 
         if lower_input in ('same', 's') and current_prompt:
