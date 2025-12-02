@@ -94,7 +94,7 @@ def compile_pipeline():
 
 def main():
     parser = argparse.ArgumentParser(description="FLUX.2 Image Generator")
-    parser.add_argument("--steps", type=int, default=6, help="Number of inference steps (default: 6)")
+    parser.add_argument("--steps", type=int, default=25, help="Number of inference steps (default: 25)")
     parser.add_argument("--compile", action="store_true", help="Compile model for faster inference (slower startup)")
     args = parser.parse_args()
 
@@ -118,7 +118,7 @@ def main():
         '1k': 1.0,
         '2k': 2.0,
     }
-    orientation = 'square'
+    orientation = 'landscape'
     size = '1k'
     base_w, base_h = orientations_1k[orientation]
     width, height = int(base_w * sizes[size]), int(base_h * sizes[size])
