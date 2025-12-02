@@ -117,6 +117,7 @@ def main():
     sizes = {
         '1k': 1.0,
         '2k': 2.0,
+        '4k': 4.0,
     }
     orientation = 'landscape'
     size = '1k'
@@ -135,6 +136,7 @@ def main():
     print("  '/landscape' - Set landscape aspect ratio")
     print("  '/1k' - Set 1K resolution (default)")
     print("  '/2k' - Set 2K resolution")
+    print("  '/4k' - Set 4K resolution")
     print("  Or enter a new/modified prompt\n")
 
     while True:
@@ -173,7 +175,7 @@ def main():
             print(f"Orientation set to {orientation} ({width}x{height})")
             continue
 
-        if lower_input in ('/1k', '/2k'):
+        if lower_input in ('/1k', '/2k', '/4k'):
             size = lower_input[1:]  # Remove the leading /
             base_w, base_h = orientations_1k[orientation]
             width, height = int(base_w * sizes[size]), int(base_h * sizes[size])
