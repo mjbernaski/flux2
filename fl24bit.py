@@ -9,14 +9,16 @@ import io
 from datetime import datetime
 import uuid
 import time
+import subprocess
+import shutil
 
 repo_id = "diffusers/FLUX.2-dev-bnb-4bit"
 device = "cuda:0"
 torch_dtype = torch.bfloat16
 
-transformer = Flux2Transformer2DModel.from_pretrained(
-    repo_id, subfolder="transformer", torch_dtype=torch_dtype
-)
+# Lazy-loaded model components
+transformer = None
+pipe = None
 
 # Connection pooling with retry strategy for transient failures
 _session = requests.Session()
@@ -32,6 +34,25 @@ _session.mount("https://", _adapter)
 
 # Embedding cache - avoids redundant API calls for same prompts
 _embedding_cache = {}
+
+
+def load_model():
+    """Load the FLUX.2 model components. Call this before generating images."""
+    global transformer, pipe
+    if pipe is not None:
+        return  # Already loaded
+
+    print("Loading FLUX.2 transformer...")
+    transformer = Flux2Transformer2DModel.from_pretrained(
+        repo_id, subfolder="transformer", torch_dtype=torch_dtype
+    )
+
+    print("Loading FLUX.2 pipeline...")
+    pipe = Flux2Pipeline.from_pretrained(
+        repo_id, transformer=transformer, text_encoder=None, torch_dtype=torch_dtype
+    ).to(device)
+    print("Model loaded successfully.")
+
 
 def remote_text_encoder(prompt, use_cache=True):
     if use_cache and prompt in _embedding_cache:
@@ -54,10 +75,6 @@ def remote_text_encoder(prompt, use_cache=True):
         _embedding_cache[prompt] = result
 
     return result
-
-pipe = Flux2Pipeline.from_pretrained(
-    repo_id, transformer=transformer, text_encoder=None, torch_dtype=torch_dtype
-).to(device)
 
 def generate_image(prompt, seed=None, steps=6, width=1024, height=1024):
     if seed is None:
@@ -92,11 +109,44 @@ def compile_pipeline():
     pipe.transformer = torch.compile(pipe.transformer, mode="reduce-overhead")
     print(f"Compilation done in {time.perf_counter() - t0:.1f}s")
 
+
+def play_completion_sound():
+    """Play a pleasant notification sound when image generation is complete."""
+    # Try paplay (PulseAudio) with system sounds first
+    if shutil.which("paplay"):
+        sound_paths = [
+            "/usr/share/sounds/freedesktop/stereo/complete.oga",
+            "/usr/share/sounds/gnome/default/alerts/glass.ogg",
+            "/usr/share/sounds/ubuntu/stereo/message.ogg",
+            "/usr/share/sounds/freedesktop/stereo/message.oga",
+        ]
+        for sound in sound_paths:
+            try:
+                subprocess.run(["paplay", sound], stderr=subprocess.DEVNULL, timeout=2)
+                return
+            except (subprocess.SubprocessError, FileNotFoundError):
+                continue
+
+    # Try aplay with a beep
+    if shutil.which("aplay"):
+        try:
+            subprocess.run(["aplay", "-q", "/usr/share/sounds/alsa/Front_Center.wav"],
+                         stderr=subprocess.DEVNULL, timeout=2)
+            return
+        except (subprocess.SubprocessError, FileNotFoundError):
+            pass
+
+    # Fallback to terminal bell
+    print("\a", end="", flush=True)
+
 def main():
     parser = argparse.ArgumentParser(description="FLUX.2 Image Generator")
     parser.add_argument("--steps", type=int, default=25, help="Number of inference steps (default: 25)")
     parser.add_argument("--compile", action="store_true", help="Compile model for faster inference (slower startup)")
     args = parser.parse_args()
+
+    # Load the model
+    load_model()
 
     if args.compile:
         compile_pipeline()
@@ -112,6 +162,7 @@ def main():
         'square': (1024, 1024),
         'portrait': (768, 1344),
         'landscape': (1344, 768),
+        '16:9': (1360, 768),
     }
     # Size presets
     sizes = {
@@ -134,6 +185,7 @@ def main():
     print("  '/square' - Set square aspect ratio")
     print("  '/portrait' - Set portrait aspect ratio")
     print("  '/landscape' - Set landscape aspect ratio")
+    print("  '/16:9' - Set 16:9 widescreen aspect ratio")
     print("  '/1k' - Set 1K resolution (default)")
     print("  '/2k' - Set 2K resolution")
     print("  '/4k' - Set 4K resolution")
@@ -168,7 +220,7 @@ def main():
                 print("Invalid steps. Usage: /steps 10")
             continue
 
-        if lower_input in ('/square', '/portrait', '/landscape'):
+        if lower_input in ('/square', '/portrait', '/landscape', '/16:9'):
             orientation = lower_input[1:]  # Remove the leading /
             base_w, base_h = orientations_1k[orientation]
             width, height = int(base_w * sizes[size]), int(base_h * sizes[size])
@@ -191,7 +243,7 @@ def main():
             if lower_word in ('/1k', '/2k', '/4k'):
                 size = lower_word[1:]
                 modifiers_found.append(f"size={size}")
-            elif lower_word in ('/square', '/portrait', '/landscape'):
+            elif lower_word in ('/square', '/portrait', '/landscape', '/16:9'):
                 orientation = lower_word[1:]
                 modifiers_found.append(f"orientation={orientation}")
             else:
@@ -233,6 +285,7 @@ def main():
         filename = f"flux2_{timestamp}_{unique_id}.png"
         image.save(filename)
         print(f"Image saved as: {filename}")
+        play_completion_sound()
 
 if __name__ == "__main__":
     main()
