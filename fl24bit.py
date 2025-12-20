@@ -40,24 +40,52 @@ def load_model(local_encoder=False):
     """Load the FLUX.2 model components. Call this before generating images."""
     global transformer, pipe
     if pipe is not None:
-        return  # Already loaded
+        return {}  # Already loaded
+
+    load_timings = {}
+    total_start = time.perf_counter()
 
     print("Loading FLUX.2 transformer...")
+    t0 = time.perf_counter()
     transformer = Flux2Transformer2DModel.from_pretrained(
         repo_id, subfolder="transformer", torch_dtype=torch_dtype
     )
+    load_timings['transformer'] = time.perf_counter() - t0
+    print(f"  Transformer loaded in {load_timings['transformer']:.2f}s")
 
     print("Loading FLUX.2 pipeline...")
+    t0 = time.perf_counter()
     if local_encoder:
         print("Loading local text encoders (this requires more VRAM)...")
         pipe = Flux2Pipeline.from_pretrained(
             repo_id, transformer=transformer, torch_dtype=torch_dtype
-        ).to(device)
+        )
+        load_timings['pipeline'] = time.perf_counter() - t0
+        print(f"  Pipeline loaded in {load_timings['pipeline']:.2f}s")
+
+        print("Moving model to GPU...")
+        t0 = time.perf_counter()
+        pipe = pipe.to(device)
+        load_timings['to_device'] = time.perf_counter() - t0
+        print(f"  Moved to GPU in {load_timings['to_device']:.2f}s")
     else:
         pipe = Flux2Pipeline.from_pretrained(
             repo_id, transformer=transformer, text_encoder=None, torch_dtype=torch_dtype
-        ).to(device)
-    print("Model loaded successfully.")
+        )
+        load_timings['pipeline'] = time.perf_counter() - t0
+        print(f"  Pipeline loaded in {load_timings['pipeline']:.2f}s")
+
+        print("Moving model to GPU...")
+        t0 = time.perf_counter()
+        pipe = pipe.to(device)
+        load_timings['to_device'] = time.perf_counter() - t0
+        print(f"  Moved to GPU in {load_timings['to_device']:.2f}s")
+
+    load_timings['total'] = time.perf_counter() - total_start
+    print(f"Model loaded successfully in {load_timings['total']:.2f}s")
+    print(f"  Summary: transformer={load_timings['transformer']:.2f}s, pipeline={load_timings['pipeline']:.2f}s, to_gpu={load_timings['to_device']:.2f}s")
+
+    return load_timings
 
 
 def remote_text_encoder(prompt, use_cache=True):
