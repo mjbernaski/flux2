@@ -7,12 +7,13 @@ import uuid
 from flask import Flask, request, jsonify, send_from_directory
 
 # Import model components from fl24bit
-from fl24bit import load_model, generate_image, device
+from fl24bit import load_model, generate_image, device, save_prompt_file
 
 app = Flask(__name__)
 
 # Will be set by command-line args
 _local_encoder = False
+_full_model = False
 
 # Configuration
 OUTPUT_DIR = "web-generated"
@@ -33,9 +34,9 @@ ORIENTATIONS_1K = {
 }
 
 SIZES = {
-    '1k': 1.0,
-    '2k': 2.0,
-    '4k': 4.0,
+    '1mp': 1.0,
+    '2mp': 2.0,
+    '4mp': 4.0,
 }
 
 HTML_PAGE = """
@@ -204,7 +205,7 @@ HTML_PAGE = """
 </head>
 <body>
     <h1>FLUX.2 Image Generator</h1>
-    <p class="subtitle">Generate images using FLUX.2-dev-bnb-4bit</p>
+    <p class="subtitle" id="modelInfo">Loading model info...</p>
 
     <form id="generateForm">
         <div class="form-group">
@@ -224,9 +225,9 @@ HTML_PAGE = """
             <div class="form-group">
                 <label for="size">Size</label>
                 <select id="size" name="size">
-                    <option value="1k" selected>1K</option>
-                    <option value="2k">2K</option>
-                    <option value="4k">4K</option>
+                    <option value="1mp" selected>1 MP</option>
+                    <option value="2mp">2 MP</option>
+                    <option value="4mp">4 MP</option>
                 </select>
             </div>
             <div class="form-group">
@@ -284,6 +285,16 @@ HTML_PAGE = """
         function useSeed(seed) {
             document.getElementById('seed').value = seed;
         }
+
+        // Fetch and display model info on page load
+        fetch('/model-info')
+            .then(r => r.json())
+            .then(data => {
+                document.getElementById('modelInfo').textContent = data.description;
+            })
+            .catch(() => {
+                document.getElementById('modelInfo').textContent = 'FLUX.2 Image Generator';
+            });
 
         form.addEventListener('submit', async (e) => {
             e.preventDefault();
@@ -382,7 +393,7 @@ def generate():
             return jsonify({'success': False, 'error': 'Prompt is required'}), 400
 
         orientation = data.get('orientation', 'landscape')
-        size = data.get('size', '1k')
+        size = data.get('size', '1mp')
         steps = int(data.get('steps', 25))
         seed = data.get('seed')  # None if not provided
         batch = min(max(int(data.get('batch', 1)), 1), 4)  # Clamp to 1-4
@@ -418,7 +429,11 @@ def generate():
             image.save(output_path)
             timings['save'] = time.perf_counter() - t_save
 
+            # Save prompt file alongside image
+            prompt_file = save_prompt_file(output_path, prompt, prompt, width, height, used_seed, steps, timings)
+
             print(f"  Saved: {output_path} (seed: {used_seed})")
+            print(f"  Prompt: {prompt_file}")
             print(f"    Timings: encoding={timings['encoding']:.2f}s, diffusion={timings['diffusion']:.2f}s, save={timings['save']:.2f}s")
 
             images_data.append({
@@ -461,17 +476,33 @@ def status():
     return jsonify(_current_status)
 
 
+@app.route('/model-info')
+def model_info():
+    model_type = "FLUX.2-dev (full)" if _full_model else "FLUX.2-dev-bnb-4bit"
+    encoder_type = "local encoder" if _local_encoder else "remote encoder"
+    return jsonify({
+        'model': model_type,
+        'encoder': encoder_type,
+        'description': f"{model_type} with {encoder_type}"
+    })
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="FLUX.2 Web Server")
     parser.add_argument("--local-encoder", action="store_true", help="Use local text encoder instead of remote API (requires more VRAM)")
+    parser.add_argument("--full-model", action="store_true", help="Use full FLUX.2-dev model instead of 4-bit quantized (requires more VRAM)")
     parser.add_argument("--port", type=int, default=PORT, help=f"Port to run server on (default: {PORT})")
     args = parser.parse_args()
 
-    _local_encoder = args.local_encoder
+    _full_model = args.full_model
+    # Full model always uses local encoder
+    _local_encoder = args.local_encoder or args.full_model
+
+    model_mode = "full model" if _full_model else "4-bit quantized"
     encoder_mode = "local encoder" if _local_encoder else "remote encoder"
 
-    print(f"Loading FLUX.2 model ({encoder_mode})...")
-    load_model(local_encoder=_local_encoder)
+    print(f"Loading FLUX.2 ({model_mode}, {encoder_mode})...")
+    load_model(local_encoder=_local_encoder, full_model=_full_model)
     print(f"\nStarting web server on http://0.0.0.0:{args.port}")
     print(f"Access from other devices: http://<your-ip>:{args.port}")
     app.run(host='0.0.0.0', port=args.port, threaded=True)
