@@ -1,6 +1,7 @@
 import os
 import argparse
 import threading
+import time
 from datetime import datetime
 import uuid
 from flask import Flask, request, jsonify, send_from_directory
@@ -157,6 +158,30 @@ HTML_PAGE = """
             font-size: 13px;
             margin-top: 8px;
         }
+        .timings {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
+            gap: 8px;
+            margin-top: 10px;
+            padding: 8px;
+            background: #1a1a2e;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+        .timing-item {
+            color: #aaa;
+        }
+        .timing-label {
+            color: #00d4ff;
+        }
+        .timing-total {
+            color: #fff;
+            font-weight: bold;
+        }
+        .timing-total .timing-label {
+            color: #28a745;
+        }
         .generation-info {
             color: #888;
             font-size: 14px;
@@ -298,6 +323,7 @@ HTML_PAGE = """
                     data.images.forEach((img, i) => {
                         const card = document.createElement('div');
                         card.className = 'image-card';
+                        const timings = img.timings;
                         card.innerHTML = `
                             <img src="/images/${img.filename}?t=${t}" alt="Generated image ${i+1}">
                             <div class="actions">
@@ -305,6 +331,12 @@ HTML_PAGE = """
                                 <a href="#" class="seed-btn" onclick="useSeed(${img.seed}); return false;">Use Seed</a>
                             </div>
                             <p class="info">Seed: ${img.seed}</p>
+                            <div class="timings">
+                                <span class="timing-item"><span class="timing-label">Encode:</span> ${timings.encoding}s</span>
+                                <span class="timing-item"><span class="timing-label">Diffuse:</span> ${timings.diffusion}s</span>
+                                <span class="timing-item"><span class="timing-label">Save:</span> ${timings.save}s</span>
+                                <span class="timing-item timing-total"><span class="timing-label">Total:</span> ${timings.total}s</span>
+                            </div>
                         `;
                         imageGrid.appendChild(card);
                     });
@@ -364,7 +396,6 @@ def generate():
 
         print(f"Generating: '{prompt}' ({batch}x, {steps} steps, {size} {orientation} {width}x{height})")
 
-        import time
         start_time = time.perf_counter()
 
         images_data = []
@@ -376,20 +407,29 @@ def generate():
             current_seed = (seed + i) if seed is not None else None
 
             # Generate the image
-            image, used_seed = generate_image(prompt, seed=current_seed, steps=steps, width=width, height=height, local_encoder=_local_encoder)
+            image, used_seed, timings = generate_image(prompt, seed=current_seed, steps=steps, width=width, height=height, local_encoder=_local_encoder)
 
             # Save to web-generated folder
+            t_save = time.perf_counter()
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             unique_id = uuid.uuid4().hex[:8]
             output_filename = f"flux2_{timestamp}_{unique_id}.png"
             output_path = os.path.join(OUTPUT_DIR, output_filename)
             image.save(output_path)
+            timings['save'] = time.perf_counter() - t_save
 
             print(f"  Saved: {output_path} (seed: {used_seed})")
+            print(f"    Timings: encoding={timings['encoding']:.2f}s, diffusion={timings['diffusion']:.2f}s, save={timings['save']:.2f}s")
 
             images_data.append({
                 'filename': output_filename,
-                'seed': used_seed
+                'seed': used_seed,
+                'timings': {
+                    'encoding': round(timings['encoding'], 2),
+                    'diffusion': round(timings['diffusion'], 2),
+                    'save': round(timings['save'], 2),
+                    'total': round(timings['encoding'] + timings['diffusion'] + timings['save'], 2)
+                }
             })
 
         generation_time = time.perf_counter() - start_time

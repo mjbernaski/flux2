@@ -36,7 +36,7 @@ _session.mount("https://", _adapter)
 _embedding_cache = {}
 
 
-def load_model():
+def load_model(local_encoder=False):
     """Load the FLUX.2 model components. Call this before generating images."""
     global transformer, pipe
     if pipe is not None:
@@ -48,9 +48,15 @@ def load_model():
     )
 
     print("Loading FLUX.2 pipeline...")
-    pipe = Flux2Pipeline.from_pretrained(
-        repo_id, transformer=transformer, text_encoder=None, torch_dtype=torch_dtype
-    ).to(device)
+    if local_encoder:
+        print("Loading local text encoders (this requires more VRAM)...")
+        pipe = Flux2Pipeline.from_pretrained(
+            repo_id, transformer=transformer, torch_dtype=torch_dtype
+        ).to(device)
+    else:
+        pipe = Flux2Pipeline.from_pretrained(
+            repo_id, transformer=transformer, text_encoder=None, torch_dtype=torch_dtype
+        ).to(device)
     print("Model loaded successfully.")
 
 
@@ -76,31 +82,49 @@ def remote_text_encoder(prompt, use_cache=True):
 
     return result
 
-def generate_image(prompt, seed=None, steps=6, width=1024, height=1024):
+def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_encoder=False):
     if seed is None:
         seed = torch.randint(0, 2**32, (1,)).item()
     print(f"Using seed: {seed}")
 
-    # Get embeddings (cached if same prompt)
-    t0 = time.perf_counter()
-    embeds = remote_text_encoder(prompt)
-    t_embed = time.perf_counter() - t0
+    timings = {}
 
     # Generate with inference_mode for better performance
-    t1 = time.perf_counter()
     with torch.inference_mode():
-        image = pipe(
-            prompt_embeds=embeds,
-            generator=torch.Generator(device=device).manual_seed(seed),
-            num_inference_steps=steps,
-            guidance_scale=4,
-            width=width,
-            height=height,
-        ).images[0]
-    t_gen = time.perf_counter() - t1
+        if local_encoder:
+            # Use local text encoder - encoding happens inside pipe()
+            t0 = time.perf_counter()
+            image = pipe(
+                prompt=prompt,
+                generator=torch.Generator(device=device).manual_seed(seed),
+                num_inference_steps=steps,
+                guidance_scale=4,
+                width=width,
+                height=height,
+            ).images[0]
+            timings['diffusion'] = time.perf_counter() - t0
+            timings['encoding'] = 0  # Included in diffusion for local
+        else:
+            # Use remote text encoder - get embeddings first
+            t0 = time.perf_counter()
+            embeds = remote_text_encoder(prompt)
+            timings['encoding'] = time.perf_counter() - t0
 
-    print(f"Timing: embed={t_embed:.2f}s, generate={t_gen:.2f}s, total={t_embed+t_gen:.2f}s")
-    return image, seed
+            t0 = time.perf_counter()
+            image = pipe(
+                prompt_embeds=embeds,
+                generator=torch.Generator(device=device).manual_seed(seed),
+                num_inference_steps=steps,
+                guidance_scale=4,
+                width=width,
+                height=height,
+            ).images[0]
+            timings['diffusion'] = time.perf_counter() - t0
+
+    timings['total'] = timings['encoding'] + timings['diffusion']
+
+    print(f"Timing: encoding={timings['encoding']:.2f}s, diffusion={timings['diffusion']:.2f}s, total={timings['total']:.2f}s")
+    return image, seed, timings
 
 def compile_pipeline():
     """Compile transformer for faster inference (slower first run, faster subsequent)"""
@@ -143,10 +167,11 @@ def main():
     parser = argparse.ArgumentParser(description="FLUX.2 Image Generator")
     parser.add_argument("--steps", type=int, default=25, help="Number of inference steps (default: 25)")
     parser.add_argument("--compile", action="store_true", help="Compile model for faster inference (slower startup)")
+    parser.add_argument("--local-encoder", action="store_true", help="Use local text encoder instead of remote API (requires more VRAM)")
     args = parser.parse_args()
 
     # Load the model
-    load_model()
+    load_model(local_encoder=args.local_encoder)
 
     if args.compile:
         compile_pipeline()
@@ -176,7 +201,8 @@ def main():
     width, height = int(base_w * sizes[size]), int(base_h * sizes[size])
 
     print("\n=== FLUX.2 Image Generator ===")
-    print(f"Using {steps} inference steps, {size} {orientation} ({width}x{height})" + (" (compiled)" if args.compile else ""))
+    encoder_mode = "local encoder" if args.local_encoder else "remote encoder"
+    print(f"Using {steps} inference steps, {size} {orientation} ({width}x{height}), {encoder_mode}" + (" (compiled)" if args.compile else ""))
     print("Commands:")
     print("  'quit' or 'q' - Exit the program")
     print("  'same' or 's' - Regenerate with same prompt (uses cached embeddings)")
@@ -277,14 +303,19 @@ def main():
             last_seed = None
 
         print(f"\nGenerating image ({steps} steps, {size} {orientation} {width}x{height})...")
-        image, last_seed = generate_image(prompt, last_seed if lower_input.startswith('reseed ') else None, steps, width, height)
+        image, last_seed, timings = generate_image(prompt, last_seed if lower_input.startswith('reseed ') else None, steps, width, height, args.local_encoder)
 
         image_count += 1
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         unique_id = uuid.uuid4().hex[:8]
         filename = f"flux2_{timestamp}_{unique_id}.png"
+
+        t0 = time.perf_counter()
         image.save(filename)
+        timings['save'] = time.perf_counter() - t0
+
         print(f"Image saved as: {filename}")
+        print(f"  Steps breakdown: encoding={timings['encoding']:.2f}s, diffusion={timings['diffusion']:.2f}s, save={timings['save']:.2f}s")
         play_completion_sound()
 
 if __name__ == "__main__":
