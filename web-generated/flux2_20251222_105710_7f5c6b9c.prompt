@@ -1,0 +1,42 @@
+# Raw input: We need to output only the final stable diffusion prompt string, no reasoning. The user wants a detailed high-quality image prompt: concept "A small Ugandan child in her arms". We should add artistic style, lighting, details to make it a masterpiece.
+
+We need to produce a prompt string that would be used with stable diffusion. It should include key terms: subject, composition, style, lighting, color palette, atmosphere, details. Must be a single string.
+
+Should we include things like "8k ultra-detailed", etc. We need to describe the scene: a small Ugandan child in her arms (probably being held by someone). Might be an elder or mother, but we can specify "elderly grandmother" or "woman". The child's face, clothing typical Ugandan attire. Maybe she is wearing a colorful dress with patterns. Lighting: warm golden hour, soft diffused light. Style: hyperrealistic, photorealistic with painterly touches. Artists: maybe "in the style of Ansel Adams" or "like a painting by John Singer Sargent". But we must keep it realistic.
+
+Maybe: "A small Ugandan child in her arms, tenderly held by an older woman, under golden sunset light, hyperrealistic portrait, vibrant colors, high detail, 8k, cinematic lighting, warm tones, soft focus, natural setting, lush green background, subtle bokeh."
+
+We should mention "ultra-detailed" and "masterpiece". Use stable diffusion tags: "--v 5 --ar 3:4" maybe.
+
+But the instruction says output ONLY final prompt string. So we provide something like:
+
+"A small Ugandan child in her arms, tenderly held by a grandmother, soft golden hour light illuminating gentle smiles, vibrant traditional dress with intricate patterns, lush green background of savanna, hyperrealistic detail, cinematic lighting, warm tones, ultra-detailed 8k portrait, masterpiece quality, painterly yet photo-realistic style reminiscent of John Singer Sargent, subtle bokeh, high dynamic range."
+
+But we need to keep it as a prompt string. Might include "--v 5 --ar 4:3" etc.
+
+But the user didn't ask for resolution. But we can include style tags. Let's produce something like:
+
+"Portrait of a small Ugandan child in her arms, tenderly cradled by an elderly woman, under warm golden sunset light, vibrant traditional dress with intricate patterns,
+# Prompt: We need to output only the final stable diffusion prompt string, no reasoning. The user wants a detailed high-quality image prompt: concept "A small Ugandan child in her arms". We should add artistic style, lighting, details to make it a masterpiece.
+
+We need to produce a prompt string that would be used with stable diffusion. It should include key terms: subject, composition, style, lighting, color palette, atmosphere, details. Must be a single string.
+
+Should we include things like "8k ultra-detailed", etc. We need to describe the scene: a small Ugandan child in her arms (probably being held by someone). Might be an elder or mother, but we can specify "elderly grandmother" or "woman". The child's face, clothing typical Ugandan attire. Maybe she is wearing a colorful dress with patterns. Lighting: warm golden hour, soft diffused light. Style: hyperrealistic, photorealistic with painterly touches. Artists: maybe "in the style of Ansel Adams" or "like a painting by John Singer Sargent". But we must keep it realistic.
+
+Maybe: "A small Ugandan child in her arms, tenderly held by an older woman, under golden sunset light, hyperrealistic portrait, vibrant colors, high detail, 8k, cinematic lighting, warm tones, soft focus, natural setting, lush green background, subtle bokeh."
+
+We should mention "ultra-detailed" and "masterpiece". Use stable diffusion tags: "--v 5 --ar 3:4" maybe.
+
+But the instruction says output ONLY final prompt string. So we provide something like:
+
+"A small Ugandan child in her arms, tenderly held by a grandmother, soft golden hour light illuminating gentle smiles, vibrant traditional dress with intricate patterns, lush green background of savanna, hyperrealistic detail, cinematic lighting, warm tones, ultra-detailed 8k portrait, masterpiece quality, painterly yet photo-realistic style reminiscent of John Singer Sargent, subtle bokeh, high dynamic range."
+
+But we need to keep it as a prompt string. Might include "--v 5 --ar 4:3" etc.
+
+But the user didn't ask for resolution. But we can include style tags. Let's produce something like:
+
+"Portrait of a small Ugandan child in her arms, tenderly cradled by an elderly woman, under warm golden sunset light, vibrant traditional dress with intricate patterns,
+# Dimensions: 1344x768
+# Seed: 1244791106
+# Steps: 25
+# Timings: encoding=0.00s, diffusion=116.34s, save=0.28s

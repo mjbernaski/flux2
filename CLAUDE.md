@@ -42,9 +42,11 @@ Single-file application (`fl24bit.py`) with:
 - `quit`/`q` - Exit
 - `same`/`s` - Regenerate with same prompt (uses cached embeddings)
 - `reseed <number>` - Regenerate with specific seed
-- `/steps <number>` - Change inference steps at runtime
-- `/square`, `/portrait`, `/landscape` - Change aspect ratio
-- `/small`, `/medium`, `/large` - Change resolution multiplier
+- `/steps <number>` - Change inference steps (default: 25)
+- `/square`, `/portrait`, `/landscape` - Change aspect ratio (default: landscape)
+- `/1k`, `/2k`, `/4k` - Change resolution multiplier (default: 1k)
+
+**Inline modifiers**: Commands can be embedded in prompts, e.g., `a cat /4k /portrait` will apply settings and generate with "a cat".
 
 ## Output
 

@@ -1,0 +1,24 @@
+# Raw input: Create a cinematic image showing two reflections of the same ninja:
+	•	One reflection in a rain-covered window
+	•	One reflection in a shallow puddle on the ground
+
+Both reflections must depict the same ninja, same posture, same armor.
+The actual ninja is not directly visible — only reflections.
+
+Nighttime city setting, neon lights, rain.
+No distortion that changes identity.
+No text, no symbols.
+# Prompt: Create a cinematic image showing two reflections of the same ninja:
+	•	One reflection in a rain-covered window
+	•	One reflection in a shallow puddle on the ground
+
+Both reflections must depict the same ninja, same posture, same armor.
+The actual ninja is not directly visible — only reflections.
+
+Nighttime city setting, neon lights, rain.
+No distortion that changes identity.
+No text, no symbols.
+# Dimensions: 1344x768
+# Seed: 273257379
+# Steps: 25
+# Timings: encoding=0.00s, diffusion=117.41s, save=0.25s

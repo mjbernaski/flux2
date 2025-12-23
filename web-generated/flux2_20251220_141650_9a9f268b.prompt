@@ -1,0 +1,42 @@
+# Raw input: We need to output only the final stable diffusion prompt string, no reasoning. So produce a detailed prompt with descriptive text, style, lighting, etc.
+
+We want: amazing adventure photos, mountains during a winter snowstorm, lots of firewood stored up and the campfire is burning hot. Artistic style, lighting, details to make masterpiece.
+
+So output something like:
+
+"An ultra-high-resolution cinematic photo of a rugged mountain camp in the midst of a fierce winter snowstorm, with swirling white clouds and blinding snowflakes. A massive pile of neatly stacked firewood lies beside a roaring campfire, flames crackling intensely against the cold night sky. The scene is illuminated by the warm glow of the fire, casting dramatic shadows on the surrounding snow-covered pine trees. The composition showcases a dramatic contrast between the harsh, icy environment and the cozy warmth of the fire. Artistic style: hyper-realistic, high dynamic range photography with rich color grading, cinematic lighting, atmospheric depth of field. Include subtle lens flare from the fire, textured snow grains reflecting light, and a hint of distant mountain peaks under a starry sky. The overall mood is adventurous yet serene, capturing the raw beauty of nature and human resilience." But prompt should be concise.
+
+We need to follow "prompt string" style used for stable diffusion. Usually like: "cinematic photo of ...". Include comma-separated.
+
+We need to output only the string. So produce something like:
+
+"Ultra-high-resolution cinematic photo of a rugged mountain camp in the midst of a fierce winter snowstorm, swirling white clouds, blinding snowflakes, massive pile of neatly stacked firewood beside a roaring campfire with intense flames, warm glow illuminating the scene, dramatic shadows on snow-covered pine trees, contrast between icy environment and cozy warmth, hyper-realistic style, high dynamic range, cinematic lighting, atmospheric depth of field, lens flare from fire, textured snow grains reflecting light, distant mountain peaks under starry sky, adventurous yet serene mood"
+
+But maybe add "masterpiece" etc.
+
+Also we can include "Studio lighting, 8k, hyper-detailed". Let's craft:
+
+"Ultra-high-resolution cinematic masterpiece of a rugged mountain camp during a fierce winter snowstorm, swirling white clouds and blinding snowflakes, massive pile of neatly stacked firewood beside a roaring campfire with intense flames, warm glow illuminating the scene and casting dramatic shadows on snow-covered pine trees, hyper-realistic style, high dynamic range, cinematic lighting with
+# Prompt: We need to output only the final stable diffusion prompt string, no reasoning. So produce a detailed prompt with descriptive text, style, lighting, etc.
+
+We want: amazing adventure photos, mountains during a winter snowstorm, lots of firewood stored up and the campfire is burning hot. Artistic style, lighting, details to make masterpiece.
+
+So output something like:
+
+"An ultra-high-resolution cinematic photo of a rugged mountain camp in the midst of a fierce winter snowstorm, with swirling white clouds and blinding snowflakes. A massive pile of neatly stacked firewood lies beside a roaring campfire, flames crackling intensely against the cold night sky. The scene is illuminated by the warm glow of the fire, casting dramatic shadows on the surrounding snow-covered pine trees. The composition showcases a dramatic contrast between the harsh, icy environment and the cozy warmth of the fire. Artistic style: hyper-realistic, high dynamic range photography with rich color grading, cinematic lighting, atmospheric depth of field. Include subtle lens flare from the fire, textured snow grains reflecting light, and a hint of distant mountain peaks under a starry sky. The overall mood is adventurous yet serene, capturing the raw beauty of nature and human resilience." But prompt should be concise.
+
+We need to follow "prompt string" style used for stable diffusion. Usually like: "cinematic photo of ...". Include comma-separated.
+
+We need to output only the string. So produce something like:
+
+"Ultra-high-resolution cinematic photo of a rugged mountain camp in the midst of a fierce winter snowstorm, swirling white clouds, blinding snowflakes, massive pile of neatly stacked firewood beside a roaring campfire with intense flames, warm glow illuminating the scene, dramatic shadows on snow-covered pine trees, contrast between icy environment and cozy warmth, hyper-realistic style, high dynamic range, cinematic lighting, atmospheric depth of field, lens flare from fire, textured snow grains reflecting light, distant mountain peaks under starry sky, adventurous yet serene mood"
+
+But maybe add "masterpiece" etc.
+
+Also we can include "Studio lighting, 8k, hyper-detailed". Let's craft:
+
+"Ultra-high-resolution cinematic masterpiece of a rugged mountain camp during a fierce winter snowstorm, swirling white clouds and blinding snowflakes, massive pile of neatly stacked firewood beside a roaring campfire with intense flames, warm glow illuminating the scene and casting dramatic shadows on snow-covered pine trees, hyper-realistic style, high dynamic range, cinematic lighting with
+# Dimensions: 1344x768
+# Seed: 3841025696
+# Steps: 25
+# Timings: encoding=0.00s, diffusion=117.30s, save=0.17s

@@ -12,13 +12,15 @@ import time
 import subprocess
 import shutil
 
-repo_id = "diffusers/FLUX.2-dev-bnb-4bit"
+REPO_4BIT = "diffusers/FLUX.2-dev-bnb-4bit"
+REPO_FULL = "black-forest-labs/FLUX.2-dev"
 device = "cuda:0"
 torch_dtype = torch.bfloat16
 
 # Lazy-loaded model components
 transformer = None
 pipe = None
+_model_type = None  # Track which model is loaded
 
 # Connection pooling with retry strategy for transient failures
 _session = requests.Session()
@@ -36,30 +38,32 @@ _session.mount("https://", _adapter)
 _embedding_cache = {}
 
 
-def load_model(local_encoder=False):
-    """Load the FLUX.2 model components. Call this before generating images."""
-    global transformer, pipe
+def load_model(local_encoder=False, full_model=False):
+    """Load the FLUX.2 model components. Call this before generating images.
+
+    Args:
+        local_encoder: Use local text encoder instead of remote API
+        full_model: Use full FLUX.2-dev model instead of 4-bit quantized
+    """
+    global transformer, pipe, _model_type
     if pipe is not None:
         return {}  # Already loaded
+
+    repo_id = REPO_FULL if full_model else REPO_4BIT
+    _model_type = "full" if full_model else "4bit"
 
     load_timings = {}
     total_start = time.perf_counter()
 
-    print("Loading FLUX.2 transformer...")
-    t0 = time.perf_counter()
-    transformer = Flux2Transformer2DModel.from_pretrained(
-        repo_id, subfolder="transformer", torch_dtype=torch_dtype
-    )
-    load_timings['transformer'] = time.perf_counter() - t0
-    print(f"  Transformer loaded in {load_timings['transformer']:.2f}s")
+    model_desc = "full FLUX.2-dev" if full_model else "4-bit quantized FLUX.2"
+    print(f"Loading {model_desc}...")
 
-    print("Loading FLUX.2 pipeline...")
-    t0 = time.perf_counter()
-    if local_encoder:
-        print("Loading local text encoders (this requires more VRAM)...")
-        pipe = Flux2Pipeline.from_pretrained(
-            repo_id, transformer=transformer, torch_dtype=torch_dtype
-        )
+    if full_model:
+        # Full model loads directly via pipeline (no separate transformer loading)
+        print("Loading FLUX.2 pipeline...")
+        t0 = time.perf_counter()
+        pipe = Flux2Pipeline.from_pretrained(repo_id, torch_dtype=torch_dtype)
+        load_timings['transformer'] = 0  # Included in pipeline for full model
         load_timings['pipeline'] = time.perf_counter() - t0
         print(f"  Pipeline loaded in {load_timings['pipeline']:.2f}s")
 
@@ -69,9 +73,26 @@ def load_model(local_encoder=False):
         load_timings['to_device'] = time.perf_counter() - t0
         print(f"  Moved to GPU in {load_timings['to_device']:.2f}s")
     else:
-        pipe = Flux2Pipeline.from_pretrained(
-            repo_id, transformer=transformer, text_encoder=None, torch_dtype=torch_dtype
+        # 4-bit model requires separate transformer loading
+        print("Loading FLUX.2 transformer...")
+        t0 = time.perf_counter()
+        transformer = Flux2Transformer2DModel.from_pretrained(
+            repo_id, subfolder="transformer", torch_dtype=torch_dtype
         )
+        load_timings['transformer'] = time.perf_counter() - t0
+        print(f"  Transformer loaded in {load_timings['transformer']:.2f}s")
+
+        print("Loading FLUX.2 pipeline...")
+        t0 = time.perf_counter()
+        if local_encoder:
+            print("Loading local text encoders (this requires more VRAM)...")
+            pipe = Flux2Pipeline.from_pretrained(
+                repo_id, transformer=transformer, torch_dtype=torch_dtype
+            )
+        else:
+            pipe = Flux2Pipeline.from_pretrained(
+                repo_id, transformer=transformer, text_encoder=None, torch_dtype=torch_dtype
+            )
         load_timings['pipeline'] = time.perf_counter() - t0
         print(f"  Pipeline loaded in {load_timings['pipeline']:.2f}s")
 
@@ -191,15 +212,32 @@ def play_completion_sound():
     # Fallback to terminal bell
     print("\a", end="", flush=True)
 
+def save_prompt_file(filepath, raw_prompt, prompt, width, height, seed, steps, timings):
+    """Save prompt metadata alongside image."""
+    prompt_path = filepath.rsplit('.', 1)[0] + '.prompt'
+    with open(prompt_path, 'w') as f:
+        f.write(f"# Raw input: {raw_prompt}\n")
+        f.write(f"# Prompt: {prompt}\n")
+        f.write(f"# Dimensions: {width}x{height}\n")
+        f.write(f"# Seed: {seed}\n")
+        f.write(f"# Steps: {steps}\n")
+        f.write(f"# Timings: encoding={timings['encoding']:.2f}s, diffusion={timings['diffusion']:.2f}s, save={timings.get('save', 0):.2f}s\n")
+    return prompt_path
+
+
 def main():
     parser = argparse.ArgumentParser(description="FLUX.2 Image Generator")
     parser.add_argument("--steps", type=int, default=25, help="Number of inference steps (default: 25)")
     parser.add_argument("--compile", action="store_true", help="Compile model for faster inference (slower startup)")
     parser.add_argument("--local-encoder", action="store_true", help="Use local text encoder instead of remote API (requires more VRAM)")
+    parser.add_argument("--full-model", action="store_true", help="Use full FLUX.2-dev model instead of 4-bit quantized (requires more VRAM)")
     args = parser.parse_args()
 
+    # Full model always uses local encoder
+    use_local_encoder = args.local_encoder or args.full_model
+
     # Load the model
-    load_model(local_encoder=args.local_encoder)
+    load_model(local_encoder=use_local_encoder, full_model=args.full_model)
 
     if args.compile:
         compile_pipeline()
@@ -229,8 +267,9 @@ def main():
     width, height = int(base_w * sizes[size]), int(base_h * sizes[size])
 
     print("\n=== FLUX.2 Image Generator ===")
-    encoder_mode = "local encoder" if args.local_encoder else "remote encoder"
-    print(f"Using {steps} inference steps, {size} {orientation} ({width}x{height}), {encoder_mode}" + (" (compiled)" if args.compile else ""))
+    model_mode = "full model" if args.full_model else "4-bit quantized"
+    encoder_mode = "local encoder" if use_local_encoder else "remote encoder"
+    print(f"Using {model_mode}, {encoder_mode}, {steps} steps, {size} {orientation} ({width}x{height})" + (" (compiled)" if args.compile else ""))
     print("Commands:")
     print("  'quit' or 'q' - Exit the program")
     print("  'same' or 's' - Regenerate with same prompt (uses cached embeddings)")
@@ -331,7 +370,8 @@ def main():
             last_seed = None
 
         print(f"\nGenerating image ({steps} steps, {size} {orientation} {width}x{height})...")
-        image, last_seed, timings = generate_image(prompt, last_seed if lower_input.startswith('reseed ') else None, steps, width, height, args.local_encoder)
+        raw_input = user_input  # Save original input before any processing
+        image, last_seed, timings = generate_image(prompt, last_seed if lower_input.startswith('reseed ') else None, steps, width, height, use_local_encoder)
 
         image_count += 1
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -342,7 +382,11 @@ def main():
         image.save(filename)
         timings['save'] = time.perf_counter() - t0
 
+        # Save prompt file alongside image
+        prompt_file = save_prompt_file(filename, raw_input, prompt, width, height, last_seed, steps, timings)
+
         print(f"Image saved as: {filename}")
+        print(f"Prompt saved as: {prompt_file}")
         print(f"  Steps breakdown: encoding={timings['encoding']:.2f}s, diffusion={timings['diffusion']:.2f}s, save={timings['save']:.2f}s")
         play_completion_sound()
 
