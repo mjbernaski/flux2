@@ -131,7 +131,19 @@ def remote_text_encoder(prompt, use_cache=True):
 
     return result
 
-def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_encoder=False):
+def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_encoder=False, input_image=None, strength=0.75):
+    """Generate an image from a text prompt.
+
+    Args:
+        prompt: Text description of the image to generate
+        seed: Random seed for reproducibility
+        steps: Number of inference steps
+        width: Output image width
+        height: Output image height
+        local_encoder: Use local text encoder instead of remote API
+        input_image: Optional PIL Image for image conditioning (reference image)
+        strength: Not used for Flux2 (kept for API compatibility)
+    """
     if seed is None:
         seed = torch.randint(0, 2**32, (1,)).item()
     print(f"Using seed: {seed}")
@@ -140,11 +152,16 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
 
     # Generate with inference_mode for better performance
     with torch.inference_mode():
-        if local_encoder:
-            # Use local text encoder - encoding happens inside pipe()
+        if local_encoder or input_image is not None:
+            # Use local text encoder - required when using image conditioning
+            # Image conditioning uses the input image as a reference to guide generation
+            if input_image is not None:
+                print(f"Using input image as reference for generation")
+
             t0 = time.perf_counter()
             image = pipe(
                 prompt=prompt,
+                image=input_image,  # None or PIL Image for conditioning
                 generator=torch.Generator(device=device).manual_seed(seed),
                 num_inference_steps=steps,
                 guidance_scale=4,

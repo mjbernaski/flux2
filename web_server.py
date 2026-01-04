@@ -2,9 +2,12 @@ import os
 import argparse
 import threading
 import time
+import base64
+import io
 from datetime import datetime
 import uuid
 from flask import Flask, request, jsonify, send_from_directory
+from PIL import Image
 
 # Import model components from fl24bit
 from fl24bit import load_model, generate_image, device, save_prompt_file
@@ -189,6 +192,63 @@ HTML_PAGE = """
             margin-top: 15px;
             text-align: center;
         }
+        .image-input-container {
+            display: flex;
+            gap: 20px;
+            align-items: flex-start;
+        }
+        .image-upload-area {
+            flex: 0 0 200px;
+            height: 150px;
+            border: 2px dashed #333;
+            border-radius: 8px;
+            cursor: pointer;
+            position: relative;
+            overflow: hidden;
+            transition: border-color 0.2s;
+        }
+        .image-upload-area:hover, .image-upload-area.dragover {
+            border-color: #00d4ff;
+        }
+        .upload-placeholder {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            color: #666;
+            text-align: center;
+            padding: 10px;
+        }
+        .image-preview {
+            width: 100%;
+            height: 100%;
+            position: relative;
+        }
+        .image-preview img {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            background: #0a0a15;
+        }
+        .clear-btn {
+            position: absolute;
+            top: 5px;
+            right: 5px;
+            width: 24px;
+            height: 24px;
+            padding: 0;
+            background: rgba(255, 0, 0, 0.8);
+            color: #fff;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: bold;
+            line-height: 1;
+        }
+        .clear-btn:hover {
+            background: rgba(255, 0, 0, 1);
+        }
         .spinner {
             display: inline-block;
             width: 20px;
@@ -211,6 +271,22 @@ HTML_PAGE = """
         <div class="form-group">
             <label for="prompt">Prompt</label>
             <input type="text" id="prompt" name="prompt" placeholder="A majestic mountain landscape at sunset..." required>
+        </div>
+
+        <div class="form-group">
+            <label>Reference Image (optional - guides generation)</label>
+            <div class="image-input-container">
+                <div class="image-upload-area" id="uploadArea">
+                    <input type="file" id="inputImage" accept="image/*" style="display: none;">
+                    <div class="upload-placeholder" id="uploadPlaceholder">
+                        <span>Click or drag image here</span>
+                    </div>
+                    <div class="image-preview" id="imagePreview" style="display: none;">
+                        <img id="previewImg" src="">
+                        <button type="button" class="clear-btn" id="clearImage">X</button>
+                    </div>
+                </div>
+            </div>
         </div>
 
         <div class="row">
@@ -282,9 +358,67 @@ HTML_PAGE = """
         const imageGrid = document.getElementById('imageGrid');
         const generationInfo = document.getElementById('generationInfo');
 
+        // Image upload elements
+        const uploadArea = document.getElementById('uploadArea');
+        const inputImage = document.getElementById('inputImage');
+        const uploadPlaceholder = document.getElementById('uploadPlaceholder');
+        const imagePreview = document.getElementById('imagePreview');
+        const previewImg = document.getElementById('previewImg');
+        const clearImage = document.getElementById('clearImage');
+
+        let currentInputImage = null;
+
         function useSeed(seed) {
             document.getElementById('seed').value = seed;
         }
+
+        // Image upload handling
+        uploadArea.addEventListener('click', () => inputImage.click());
+
+        uploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadArea.classList.add('dragover');
+        });
+
+        uploadArea.addEventListener('dragleave', () => {
+            uploadArea.classList.remove('dragover');
+        });
+
+        uploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadArea.classList.remove('dragover');
+            const file = e.dataTransfer.files[0];
+            if (file && file.type.startsWith('image/')) {
+                handleImageFile(file);
+            }
+        });
+
+        inputImage.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (file) {
+                handleImageFile(file);
+            }
+        });
+
+        function handleImageFile(file) {
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                currentInputImage = e.target.result;
+                previewImg.src = currentInputImage;
+                uploadPlaceholder.style.display = 'none';
+                imagePreview.style.display = 'block';
+            };
+            reader.readAsDataURL(file);
+        }
+
+        clearImage.addEventListener('click', (e) => {
+            e.stopPropagation();
+            currentInputImage = null;
+            previewImg.src = '';
+            inputImage.value = '';
+            uploadPlaceholder.style.display = 'flex';
+            imagePreview.style.display = 'none';
+        });
 
         // Fetch and display model info on page load
         fetch('/model-info')
@@ -310,6 +444,11 @@ HTML_PAGE = """
                 seed: seedValue ? parseInt(seedValue) : null,
                 batch: batch
             };
+
+            // Add reference image if present
+            if (currentInputImage) {
+                formData.input_image = currentInputImage;
+            }
 
             submitBtn.disabled = true;
             status.className = 'status generating';
@@ -398,6 +537,19 @@ def generate():
         seed = data.get('seed')  # None if not provided
         batch = min(max(int(data.get('batch', 1)), 1), 4)  # Clamp to 1-4
 
+        # Handle optional input image for img2img
+        input_image = None
+        strength = float(data.get('strength', 0.75))
+        input_image_b64 = data.get('input_image')
+        if input_image_b64:
+            # Decode base64 image
+            # Handle data URL format (e.g., "data:image/png;base64,...")
+            if ',' in input_image_b64:
+                input_image_b64 = input_image_b64.split(',', 1)[1]
+            image_data = base64.b64decode(input_image_b64)
+            input_image = Image.open(io.BytesIO(image_data)).convert('RGB')
+            print(f"Received input image: {input_image.size}, strength={strength}")
+
         # Calculate dimensions
         base_w, base_h = ORIENTATIONS_1K.get(orientation, ORIENTATIONS_1K['landscape'])
         scale = SIZES.get(size, 1.0)
@@ -405,7 +557,8 @@ def generate():
 
         _current_status = {"generating": True, "prompt": prompt, "batch": batch, "current": 0}
 
-        print(f"Generating: '{prompt}' ({batch}x, {steps} steps, {size} {orientation} {width}x{height})")
+        img2img_str = f", img2img strength={strength}" if input_image else ""
+        print(f"Generating: '{prompt}' ({batch}x, {steps} steps, {size} {orientation} {width}x{height}{img2img_str})")
 
         start_time = time.perf_counter()
 
@@ -418,7 +571,10 @@ def generate():
             current_seed = (seed + i) if seed is not None else None
 
             # Generate the image
-            image, used_seed, timings = generate_image(prompt, seed=current_seed, steps=steps, width=width, height=height, local_encoder=_local_encoder)
+            image, used_seed, timings = generate_image(
+                prompt, seed=current_seed, steps=steps, width=width, height=height,
+                local_encoder=_local_encoder, input_image=input_image, strength=strength
+            )
 
             # Save to web-generated folder
             t_save = time.perf_counter()
