@@ -268,15 +268,18 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
                 print(f"Using input image as reference for generation")
 
             t0 = time.perf_counter()
-            image = pipe(
-                prompt=prompt,
-                image=input_image,  # None or PIL Image for conditioning
-                generator=torch.Generator(device=device).manual_seed(seed),
-                num_inference_steps=steps,
-                guidance_scale=4,
-                width=width,
-                height=height,
-            ).images[0]
+            pipe_kwargs = {
+                "prompt": prompt,
+                "generator": torch.Generator(device=device).manual_seed(seed),
+                "num_inference_steps": steps,
+                "guidance_scale": 4,
+                "width": width,
+                "height": height,
+            }
+            # Only add image if provided (requires compatible pipeline)
+            if input_image is not None:
+                pipe_kwargs["image"] = input_image
+            image = pipe(**pipe_kwargs).images[0]
             timings['diffusion'] = time.perf_counter() - t0
             timings['encoding'] = 0  # Included in diffusion for local
         else:

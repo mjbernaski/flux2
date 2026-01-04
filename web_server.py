@@ -17,6 +17,7 @@ app = Flask(__name__)
 # Will be set by command-line args
 _local_encoder = False
 _full_model = False
+_gguf_quant = None
 
 # Configuration
 OUTPUT_DIR = "web-generated"
@@ -48,7 +49,7 @@ HTML_PAGE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FLUX.2 Image Generator</title>
+    <title>FLUX.1 Image Generator</title>
     <style>
         * { box-sizing: border-box; }
         body {
@@ -264,7 +265,7 @@ HTML_PAGE = """
     </style>
 </head>
 <body>
-    <h1>FLUX.2 Image Generator</h1>
+    <h1>FLUX.1 Image Generator</h1>
     <p class="subtitle" id="modelInfo">Loading model info...</p>
 
     <form id="generateForm">
@@ -427,7 +428,7 @@ HTML_PAGE = """
                 document.getElementById('modelInfo').textContent = data.description;
             })
             .catch(() => {
-                document.getElementById('modelInfo').textContent = 'FLUX.2 Image Generator';
+                document.getElementById('modelInfo').textContent = 'FLUX.1 Image Generator';
             });
 
         form.addEventListener('submit', async (e) => {
@@ -634,7 +635,12 @@ def status():
 
 @app.route('/model-info')
 def model_info():
-    model_type = "FLUX.2-dev (full)" if _full_model else "FLUX.2-dev-bnb-4bit"
+    if _gguf_quant:
+        model_type = f"FLUX.1-dev GGUF {_gguf_quant.upper()}"
+    elif _full_model:
+        model_type = "FLUX.1-dev (full)"
+    else:
+        model_type = "FLUX.1-dev-bnb-4bit"
     encoder_type = "local encoder" if _local_encoder else "remote encoder"
     return jsonify({
         'model': model_type,
@@ -644,21 +650,29 @@ def model_info():
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="FLUX.2 Web Server")
+    parser = argparse.ArgumentParser(description="FLUX.1 Web Server")
     parser.add_argument("--local-encoder", action="store_true", help="Use local text encoder instead of remote API (requires more VRAM)")
-    parser.add_argument("--full-model", action="store_true", help="Use full FLUX.2-dev model instead of 4-bit quantized (requires more VRAM)")
+    parser.add_argument("--full-model", action="store_true", help="Use full FLUX.1-dev model instead of 4-bit quantized (requires more VRAM)")
+    parser.add_argument("--gguf", type=str, choices=["bf16", "q8", "q4"], default=None,
+                        help="Use GGUF model (recommended for DGX Spark). Options: bf16 (full quality), q8 (8-bit), q4 (4-bit smallest)")
     parser.add_argument("--port", type=int, default=PORT, help=f"Port to run server on (default: {PORT})")
     args = parser.parse_args()
 
     _full_model = args.full_model
+    _gguf_quant = args.gguf
     # Full model always uses local encoder
     _local_encoder = args.local_encoder or args.full_model
 
-    model_mode = "full model" if _full_model else "4-bit quantized"
+    if _gguf_quant:
+        model_mode = f"GGUF {_gguf_quant.upper()}"
+    elif _full_model:
+        model_mode = "full model"
+    else:
+        model_mode = "4-bit BNB"
     encoder_mode = "local encoder" if _local_encoder else "remote encoder"
 
-    print(f"Loading FLUX.2 ({model_mode}, {encoder_mode})...")
-    load_model(local_encoder=_local_encoder, full_model=_full_model)
+    print(f"Loading FLUX.1 ({model_mode}, {encoder_mode})...")
+    load_model(local_encoder=_local_encoder, full_model=_full_model, gguf_quant=_gguf_quant)
     print(f"\nStarting web server on http://0.0.0.0:{args.port}")
     print(f"Access from other devices: http://<your-ip>:{args.port}")
     app.run(host='0.0.0.0', port=args.port, threaded=True)
