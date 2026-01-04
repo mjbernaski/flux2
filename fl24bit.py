@@ -2,6 +2,11 @@ import argparse
 import torch
 import os
 
+# Performance optimizations for Blackwell/DGX Spark GPUs
+torch.backends.cuda.matmul.allow_tf32 = True  # ~3x faster matmul with minimal precision loss
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True  # Auto-tune convolution algorithms
+
 # DGX Spark / Unified Memory fix: Patch safetensors to avoid double memory allocation
 # On unified memory systems, the default copy=True causes memory to double during loading
 import safetensors.torch
