@@ -32,14 +32,18 @@ import time
 import subprocess
 import shutil
 
-REPO_4BIT = "diffusers/FLUX.1-dev-bnb-4bit"
-REPO_FULL = "black-forest-labs/FLUX.1-dev"
-# GGUF models - work better on DGX Spark unified memory (no mmap doubling)
-GGUF_MODELS = {
+# FLUX.1 repos
+FLUX1_REPO_4BIT = "diffusers/FLUX.1-dev-bnb-4bit"
+FLUX1_REPO_FULL = "black-forest-labs/FLUX.1-dev"
+FLUX1_GGUF_MODELS = {
     "bf16": "https://huggingface.co/city96/FLUX.1-dev-gguf/blob/main/flux1-dev-BF16.gguf",
     "q8": "https://huggingface.co/city96/FLUX.1-dev-gguf/blob/main/flux1-dev-Q8_0.gguf",
     "q4": "https://huggingface.co/city96/FLUX.1-dev-gguf/blob/main/flux1-dev-Q4_K_S.gguf",
 }
+
+# FLUX.2 repos
+FLUX2_REPO_4BIT = "diffusers/FLUX.2-dev-bnb-4bit"
+FLUX2_REPO_FULL = "black-forest-labs/FLUX.2-dev"
 device = "cuda:0"
 torch_dtype = torch.bfloat16
 
@@ -48,6 +52,7 @@ transformer = None
 pipe = None
 pipe_img2img = None  # Img2img pipeline (created on-demand from pipe)
 _model_type = None  # Track which model is loaded
+_flux_version = 1  # Track FLUX version (1 or 2)
 
 # Connection pooling with retry strategy for transient failures
 _session = requests.Session()
@@ -65,17 +70,32 @@ _session.mount("https://", _adapter)
 _embedding_cache = {}
 
 
-def load_model(local_encoder=False, full_model=False, gguf_quant=None):
+def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=False):
     """Load the FLUX model components. Call this before generating images.
 
     Args:
         local_encoder: Use local text encoder instead of remote API
-        full_model: Use full FLUX.1-dev model instead of 4-bit quantized
-        gguf_quant: GGUF quantization level ('bf16', 'q8', 'q4') - recommended for DGX Spark
+        full_model: Use full FLUX model instead of 4-bit quantized
+        gguf_quant: GGUF quantization level ('bf16', 'q8', 'q4') - FLUX.1 only
+        flux2: Use FLUX.2 model instead of FLUX.1
     """
-    global transformer, pipe, _model_type
+    global transformer, pipe, _model_type, _flux_version
     if pipe is not None:
         return {}  # Already loaded
+
+    _flux_version = 2 if flux2 else 1
+    flux_name = f"FLUX.{_flux_version}"
+
+    # Select repos based on version
+    if flux2:
+        repo_4bit = FLUX2_REPO_4BIT
+        repo_full = FLUX2_REPO_FULL
+        if gguf_quant:
+            print("Warning: GGUF not available for FLUX.2, using 4-bit instead")
+            gguf_quant = None
+    else:
+        repo_4bit = FLUX1_REPO_4BIT
+        repo_full = FLUX1_REPO_FULL
 
     load_timings = {}
     total_start = time.perf_counter()
@@ -83,21 +103,21 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None):
     # Determine model type
     if gguf_quant:
         _model_type = f"gguf-{gguf_quant}"
-        model_desc = f"GGUF {gguf_quant.upper()} FLUX.1"
+        model_desc = f"GGUF {gguf_quant.upper()} {flux_name}"
     elif full_model:
         _model_type = "full"
-        model_desc = "full FLUX.1-dev"
+        model_desc = f"full {flux_name}-dev"
     else:
         _model_type = "4bit"
-        model_desc = "4-bit quantized FLUX.1"
+        model_desc = f"4-bit quantized {flux_name}"
 
     print(f"Loading {model_desc}...")
 
     if gguf_quant:
-        # GGUF models - recommended for DGX Spark unified memory systems
+        # GGUF models - recommended for DGX Spark unified memory systems (FLUX.1 only)
         from diffusers import GGUFQuantizationConfig
 
-        gguf_url = GGUF_MODELS[gguf_quant]
+        gguf_url = FLUX1_GGUF_MODELS[gguf_quant]
         print(f"Loading GGUF transformer from {gguf_quant.upper()}...")
         t0 = time.perf_counter()
         transformer = FluxTransformer2DModel.from_single_file(
@@ -108,15 +128,15 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None):
         load_timings['transformer'] = time.perf_counter() - t0
         print(f"  Transformer loaded in {load_timings['transformer']:.2f}s")
 
-        print("Loading FLUX.1 pipeline...")
+        print(f"Loading {flux_name} pipeline...")
         t0 = time.perf_counter()
         if local_encoder:
             pipe = FluxPipeline.from_pretrained(
-                REPO_FULL, transformer=transformer, torch_dtype=torch_dtype
+                repo_full, transformer=transformer, torch_dtype=torch_dtype
             )
         else:
             pipe = FluxPipeline.from_pretrained(
-                REPO_FULL, transformer=transformer, text_encoder=None,
+                repo_full, transformer=transformer, text_encoder=None,
                 text_encoder_2=None, torch_dtype=torch_dtype
             )
         load_timings['pipeline'] = time.perf_counter() - t0
@@ -133,8 +153,8 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None):
         import concurrent.futures
         from transformers import CLIPTextModel, T5EncoderModel
 
-        repo_id = REPO_FULL
-        print("Loading FLUX.1 components in parallel...")
+        repo_id = repo_full
+        print(f"Loading {flux_name} components in parallel...")
         t0 = time.perf_counter()
 
         # Define component loaders
@@ -188,8 +208,8 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None):
         print(f"  Pipeline assembled in {load_timings['pipeline']:.2f}s")
     else:
         # 4-bit BNB model
-        repo_id = REPO_4BIT
-        print("Loading FLUX.1 transformer (4-bit)...")
+        repo_id = repo_4bit
+        print(f"Loading {flux_name} transformer (4-bit)...")
         t0 = time.perf_counter()
         transformer = FluxTransformer2DModel.from_pretrained(
             repo_id, subfolder="transformer", torch_dtype=torch_dtype
@@ -197,7 +217,7 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None):
         load_timings['transformer'] = time.perf_counter() - t0
         print(f"  Transformer loaded in {load_timings['transformer']:.2f}s")
 
-        print("Loading FLUX.1 pipeline...")
+        print(f"Loading {flux_name} pipeline...")
         t0 = time.perf_counter()
         if local_encoder:
             print("Loading local text encoders (this requires more VRAM)...")
@@ -274,6 +294,9 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
             if pipe_img2img is None:
                 print("Creating img2img pipeline (first use)...")
                 pipe_img2img = FluxImg2ImgPipeline.from_pipe(pipe)
+                # Ensure VAE is in the correct dtype to avoid bfloat16/float32 mismatch
+                if hasattr(pipe_img2img, 'vae') and pipe_img2img.vae is not None:
+                    pipe_img2img.vae = pipe_img2img.vae.to(torch_dtype)
 
             # Resize input image to target dimensions
             input_image = input_image.resize((width, height))
@@ -376,20 +399,21 @@ def save_prompt_file(filepath, raw_prompt, prompt, width, height, seed, steps, t
 
 
 def main():
-    parser = argparse.ArgumentParser(description="FLUX.1 Image Generator")
+    parser = argparse.ArgumentParser(description="FLUX Image Generator")
     parser.add_argument("--steps", type=int, default=25, help="Number of inference steps (default: 25)")
     parser.add_argument("--compile", action="store_true", help="Compile model for faster inference (slower startup)")
     parser.add_argument("--local-encoder", action="store_true", help="Use local text encoder instead of remote API (requires more VRAM)")
-    parser.add_argument("--full-model", action="store_true", help="Use full FLUX.1-dev model instead of 4-bit quantized (requires more VRAM)")
+    parser.add_argument("--full-model", action="store_true", help="Use full FLUX model instead of 4-bit quantized (requires more VRAM)")
     parser.add_argument("--gguf", type=str, choices=["bf16", "q8", "q4"], default=None,
-                        help="Use GGUF model (recommended for DGX Spark). Options: bf16 (full quality), q8 (8-bit), q4 (4-bit smallest)")
+                        help="Use GGUF model (FLUX.1 only, recommended for DGX Spark). Options: bf16 (full quality), q8 (8-bit), q4 (4-bit smallest)")
+    parser.add_argument("--flux2", action="store_true", help="Use FLUX.2 model instead of FLUX.1 (requires more VRAM)")
     args = parser.parse_args()
 
     # Full model always uses local encoder
     use_local_encoder = args.local_encoder or args.full_model
 
     # Load the model
-    load_model(local_encoder=use_local_encoder, full_model=args.full_model, gguf_quant=args.gguf)
+    load_model(local_encoder=use_local_encoder, full_model=args.full_model, gguf_quant=args.gguf, flux2=args.flux2)
 
     if args.compile:
         compile_pipeline()
@@ -418,7 +442,8 @@ def main():
     base_w, base_h = orientations_1k[orientation]
     width, height = int(base_w * sizes[size]), int(base_h * sizes[size])
 
-    print("\n=== FLUX.1 Image Generator ===")
+    flux_name = f"FLUX.{_flux_version}"
+    print(f"\n=== {flux_name} Image Generator ===")
     if args.gguf:
         model_mode = f"GGUF {args.gguf.upper()}"
     elif args.full_model:
@@ -426,7 +451,7 @@ def main():
     else:
         model_mode = "4-bit BNB"
     encoder_mode = "local encoder" if use_local_encoder else "remote encoder"
-    print(f"Using {model_mode}, {encoder_mode}, {steps} steps, {size} {orientation} ({width}x{height})" + (" (compiled)" if args.compile else ""))
+    print(f"Using {flux_name} {model_mode}, {encoder_mode}, {steps} steps, {size} {orientation} ({width}x{height})" + (" (compiled)" if args.compile else ""))
     print("Commands:")
     print("  'quit' or 'q' - Exit the program")
     print("  'same' or 's' - Regenerate with same prompt (uses cached embeddings)")
@@ -533,7 +558,7 @@ def main():
         image_count += 1
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         unique_id = uuid.uuid4().hex[:8]
-        filename = f"flux2_{timestamp}_{unique_id}.png"
+        filename = f"flux{_flux_version}_{timestamp}_{unique_id}.png"
 
         t0 = time.perf_counter()
         image.save(filename)
