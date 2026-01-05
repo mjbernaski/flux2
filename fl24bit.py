@@ -20,7 +20,7 @@ def _patched_load_file(filename, device="cpu"):
 
 safetensors.torch.load_file = _patched_load_file
 
-from diffusers import FluxPipeline, FluxTransformer2DModel
+from diffusers import FluxPipeline, FluxImg2ImgPipeline, FluxTransformer2DModel
 from huggingface_hub import get_token
 import requests
 from requests.adapters import HTTPAdapter
@@ -46,6 +46,7 @@ torch_dtype = torch.bfloat16
 # Lazy-loaded model components
 transformer = None
 pipe = None
+pipe_img2img = None  # Img2img pipeline (created on-demand from pipe)
 _model_type = None  # Track which model is loaded
 
 # Connection pooling with retry strategy for transient failures
@@ -255,9 +256,11 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
         width: Output image width
         height: Output image height
         local_encoder: Use local text encoder instead of remote API
-        input_image: Optional PIL Image for image conditioning (reference image)
-        strength: Not used for Flux2 (kept for API compatibility)
+        input_image: Optional PIL Image for img2img generation
+        strength: Denoising strength for img2img (0.0-1.0, higher = more change)
     """
+    global pipe_img2img
+
     if seed is None:
         seed = torch.randint(0, 2**32, (1,)).item()
     print(f"Using seed: {seed}")
@@ -266,25 +269,38 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
 
     # Generate with inference_mode for better performance
     with torch.inference_mode():
-        if local_encoder or input_image is not None:
-            # Use local text encoder - required when using image conditioning
-            # Image conditioning uses the input image as a reference to guide generation
-            if input_image is not None:
-                print(f"Using input image as reference for generation")
+        if input_image is not None:
+            # Img2img mode - create pipeline on-demand if needed
+            if pipe_img2img is None:
+                print("Creating img2img pipeline (first use)...")
+                pipe_img2img = FluxImg2ImgPipeline.from_pipe(pipe)
+
+            # Resize input image to target dimensions
+            input_image = input_image.resize((width, height))
+            print(f"Using img2img with strength={strength}")
 
             t0 = time.perf_counter()
-            pipe_kwargs = {
-                "prompt": prompt,
-                "generator": torch.Generator(device=device).manual_seed(seed),
-                "num_inference_steps": steps,
-                "guidance_scale": 4,
-                "width": width,
-                "height": height,
-            }
-            # Only add image if provided (requires compatible pipeline)
-            if input_image is not None:
-                pipe_kwargs["image"] = input_image
-            image = pipe(**pipe_kwargs).images[0]
+            image = pipe_img2img(
+                prompt=prompt,
+                image=input_image,
+                strength=strength,
+                generator=torch.Generator(device=device).manual_seed(seed),
+                num_inference_steps=steps,
+                guidance_scale=4,
+            ).images[0]
+            timings['diffusion'] = time.perf_counter() - t0
+            timings['encoding'] = 0  # Included in diffusion
+        elif local_encoder:
+            # Use local text encoder
+            t0 = time.perf_counter()
+            image = pipe(
+                prompt=prompt,
+                generator=torch.Generator(device=device).manual_seed(seed),
+                num_inference_steps=steps,
+                guidance_scale=4,
+                width=width,
+                height=height,
+            ).images[0]
             timings['diffusion'] = time.perf_counter() - t0
             timings['encoding'] = 0  # Included in diffusion for local
         else:
