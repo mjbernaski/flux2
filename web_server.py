@@ -11,7 +11,7 @@ from PIL import Image
 
 # Import model components from fl24bit
 import fl24bit
-from fl24bit import load_model, generate_image, device, save_prompt_file
+from fl24bit import load_model, generate_image, device, save_prompt_file, load_turbo_lora
 
 app = Flask(__name__)
 
@@ -20,6 +20,7 @@ _local_encoder = False
 _full_model = False
 _gguf_quant = None
 _flux2 = False
+_turbo = False
 
 # Configuration
 OUTPUT_DIR = "web-generated"
@@ -645,10 +646,12 @@ def model_info():
     else:
         model_type = f"{flux_name}-dev-bnb-4bit"
     encoder_type = "local encoder" if _local_encoder else "remote encoder"
+    turbo_str = " + Turbo" if fl24bit._turbo_enabled else ""
     return jsonify({
         'model': model_type,
         'encoder': encoder_type,
-        'description': f"{model_type} with {encoder_type}"
+        'turbo': fl24bit._turbo_enabled,
+        'description': f"{model_type}{turbo_str} with {encoder_type}"
     })
 
 
@@ -659,6 +662,8 @@ if __name__ == '__main__':
     parser.add_argument("--gguf", type=str, choices=["bf16", "q8", "q4"], default=None,
                         help="Use GGUF model (FLUX.1 only, recommended for DGX Spark). Options: bf16 (full quality), q8 (8-bit), q4 (4-bit smallest)")
     parser.add_argument("--flux2", action="store_true", help="Use FLUX.2 model instead of FLUX.1 (requires more VRAM)")
+    parser.add_argument("--turbo", action="store_true", default=None, help="Enable turbo LoRA for faster 8-step inference (FLUX.2 only, default: on for FLUX.2)")
+    parser.add_argument("--no-turbo", action="store_true", help="Disable turbo LoRA (use standard inference)")
     parser.add_argument("--port", type=int, default=PORT, help=f"Port to run server on (default: {PORT})")
     args = parser.parse_args()
 
@@ -667,6 +672,8 @@ if __name__ == '__main__':
     _flux2 = args.flux2
     # Full model always uses local encoder
     _local_encoder = args.local_encoder or args.full_model
+    # Turbo defaults to on for FLUX.2, can be disabled with --no-turbo
+    _turbo = (args.turbo or args.flux2) and not args.no_turbo
 
     flux_name = "FLUX.2" if _flux2 else "FLUX.1"
     if _gguf_quant:
@@ -676,9 +683,14 @@ if __name__ == '__main__':
     else:
         model_mode = "4-bit BNB"
     encoder_mode = "local encoder" if _local_encoder else "remote encoder"
+    turbo_mode = " + Turbo LoRA" if _turbo else ""
 
-    print(f"Loading {flux_name} ({model_mode}, {encoder_mode})...")
+    print(f"Loading {flux_name} ({model_mode}, {encoder_mode}{turbo_mode})...")
     load_model(local_encoder=_local_encoder, full_model=_full_model, gguf_quant=_gguf_quant, flux2=_flux2)
+
+    if _turbo:
+        load_turbo_lora()
+
     print(f"\nStarting web server on http://0.0.0.0:{args.port}")
     print(f"Access from other devices: http://<your-ip>:{args.port}")
     app.run(host='0.0.0.0', port=args.port, threaded=True)

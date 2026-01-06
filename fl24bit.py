@@ -56,6 +56,10 @@ pipe = None
 pipe_img2img = None  # Img2img pipeline (created on-demand from pipe)
 _model_type = None  # Track which model is loaded
 _flux_version = 1  # Track FLUX version (1 or 2)
+_turbo_enabled = False  # Track if turbo LoRA is loaded
+
+# Pre-shifted custom sigmas for 8-step turbo inference (FLUX.2 only)
+TURBO_SIGMAS = [1.0, 0.6509, 0.4374, 0.2932, 0.1893, 0.1108, 0.0495, 0.00031]
 
 # Connection pooling with retry strategy for transient failures
 _session = requests.Session()
@@ -309,6 +313,35 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
     return load_timings
 
 
+def load_turbo_lora():
+    """Load the FLUX.2 turbo LoRA for faster 8-step inference.
+
+    Only works with FLUX.2. Must be called after load_model().
+    """
+    global _turbo_enabled
+
+    if pipe is None:
+        raise RuntimeError("Model must be loaded before loading LoRA")
+
+    if _flux_version != 2:
+        print("Warning: Turbo LoRA only available for FLUX.2, skipping")
+        return
+
+    if _turbo_enabled:
+        print("Turbo LoRA already loaded")
+        return
+
+    print("Loading FLUX.2 turbo LoRA (fal/FLUX.2-dev-Turbo)...")
+    t0 = time.perf_counter()
+    pipe.load_lora_weights(
+        "fal/FLUX.2-dev-Turbo",
+        weight_name="flux.2-turbo-lora.safetensors"
+    )
+    load_time = time.perf_counter() - t0
+    print(f"  Turbo LoRA loaded in {load_time:.2f}s")
+    _turbo_enabled = True
+
+
 def remote_text_encoder(prompt, use_cache=True):
     if use_cache and prompt in _embedding_cache:
         return _embedding_cache[prompt]
@@ -331,7 +364,7 @@ def remote_text_encoder(prompt, use_cache=True):
 
     return result
 
-def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_encoder=False, input_image=None, strength=0.75):
+def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_encoder=False, input_image=None, strength=0.75, sigmas=None, guidance_scale=None):
     """Generate an image from a text prompt.
 
     Args:
@@ -343,12 +376,23 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
         local_encoder: Use local text encoder instead of remote API
         input_image: Optional PIL Image for img2img generation
         strength: Denoising strength for img2img (0.0-1.0, higher = more change)
+        sigmas: Custom noise schedule (for turbo LoRA, use TURBO_SIGMAS)
+        guidance_scale: Classifier-free guidance scale (default: 4, turbo uses 2.5)
     """
     global pipe_img2img
 
     if seed is None:
         seed = torch.randint(0, 2**32, (1,)).item()
     print(f"Using seed: {seed}")
+
+    # Auto-configure for turbo mode if enabled
+    if _turbo_enabled and sigmas is None:
+        sigmas = TURBO_SIGMAS
+        steps = 8  # Turbo uses 8 steps
+        print(f"Turbo mode: using 8 steps with custom sigmas")
+
+    if guidance_scale is None:
+        guidance_scale = 2.5 if _turbo_enabled else 4
 
     timings = {}
 
@@ -363,15 +407,18 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
                 print(f"Using image as reference for generation")
 
                 t0 = time.perf_counter()
-                image = pipe(
-                    prompt=prompt,
-                    image=input_image,
-                    generator=torch.Generator(device=device).manual_seed(seed),
-                    num_inference_steps=steps,
-                    guidance_scale=4,
-                    height=height,
-                    width=width,
-                ).images[0]
+                pipe_kwargs = {
+                    "prompt": prompt,
+                    "image": input_image,
+                    "generator": torch.Generator(device=device).manual_seed(seed),
+                    "num_inference_steps": steps,
+                    "guidance_scale": guidance_scale,
+                    "height": height,
+                    "width": width,
+                }
+                if sigmas is not None:
+                    pipe_kwargs["sigmas"] = sigmas
+                image = pipe(**pipe_kwargs).images[0]
                 timings['diffusion'] = time.perf_counter() - t0
                 timings['encoding'] = 0
             else:
@@ -393,21 +440,24 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
                     strength=strength,
                     generator=torch.Generator(device=device).manual_seed(seed),
                     num_inference_steps=steps,
-                    guidance_scale=4,
+                    guidance_scale=guidance_scale,
                 ).images[0]
                 timings['diffusion'] = time.perf_counter() - t0
                 timings['encoding'] = 0
         elif local_encoder or _flux_version == 2:
             # Use local text encoder
             t0 = time.perf_counter()
-            image = pipe(
-                prompt=prompt,
-                generator=torch.Generator(device=device).manual_seed(seed),
-                num_inference_steps=steps,
-                guidance_scale=4,
-                width=width,
-                height=height,
-            ).images[0]
+            pipe_kwargs = {
+                "prompt": prompt,
+                "generator": torch.Generator(device=device).manual_seed(seed),
+                "num_inference_steps": steps,
+                "guidance_scale": guidance_scale,
+                "width": width,
+                "height": height,
+            }
+            if sigmas is not None:
+                pipe_kwargs["sigmas"] = sigmas
+            image = pipe(**pipe_kwargs).images[0]
             timings['diffusion'] = time.perf_counter() - t0
             timings['encoding'] = 0  # Included in diffusion for local
         else:
@@ -421,7 +471,7 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
                 prompt_embeds=embeds,
                 generator=torch.Generator(device=device).manual_seed(seed),
                 num_inference_steps=steps,
-                guidance_scale=4,
+                guidance_scale=guidance_scale,
                 width=width,
                 height=height,
             ).images[0]
