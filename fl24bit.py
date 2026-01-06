@@ -174,9 +174,11 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
                 )
 
             def load_text_encoder():
+                # Mistral3 doesn't support low_cpu_mem_usage=True with device_map="cuda"
+                # (causes meta tensor dispatch error). Use device_map="auto" instead.
                 return Mistral3ForConditionalGeneration.from_pretrained(
                     repo_id, subfolder="text_encoder", torch_dtype=torch_dtype,
-                    device_map="cuda", low_cpu_mem_usage=True, use_safetensors=True
+                    device_map="auto", use_safetensors=True
                 )
 
             # Load components in parallel
