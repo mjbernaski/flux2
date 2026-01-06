@@ -20,7 +20,10 @@ def _patched_load_file(filename, device="cpu"):
 
 safetensors.torch.load_file = _patched_load_file
 
+# FLUX.1 classes
 from diffusers import FluxPipeline, FluxImg2ImgPipeline, FluxTransformer2DModel
+# FLUX.2 classes (different architecture - img2img is built into Flux2Pipeline)
+from diffusers import Flux2Pipeline, Flux2Transformer2DModel
 from huggingface_hub import get_token
 import requests
 from requests.adapters import HTTPAdapter
@@ -151,57 +154,99 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
     elif full_model:
         # Full model - load transformer and text encoder in parallel for faster startup
         import concurrent.futures
-        from transformers import CLIPTextModel, T5EncoderModel
 
         repo_id = repo_full
         print(f"Loading {flux_name} components in parallel...")
         t0 = time.perf_counter()
 
-        # Define component loaders
-        def load_transformer():
-            return FluxTransformer2DModel.from_pretrained(
-                repo_id, subfolder="transformer", torch_dtype=torch_dtype,
-                device_map="cuda", low_cpu_mem_usage=True, use_safetensors=True
+        if flux2:
+            # FLUX.2 uses Mistral3 text encoder
+            from transformers import Mistral3ForConditionalGeneration
+
+            def load_transformer():
+                return Flux2Transformer2DModel.from_pretrained(
+                    repo_id, subfolder="transformer", torch_dtype=torch_dtype,
+                    device_map="cuda", low_cpu_mem_usage=True, use_safetensors=True
+                )
+
+            def load_text_encoder():
+                return Mistral3ForConditionalGeneration.from_pretrained(
+                    repo_id, subfolder="text_encoder", torch_dtype=torch_dtype,
+                    device_map="cuda", low_cpu_mem_usage=True, use_safetensors=True
+                )
+
+            # Load components in parallel
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                transformer_future = executor.submit(load_transformer)
+                encoder_future = executor.submit(load_text_encoder)
+
+                transformer = transformer_future.result()
+                text_encoder = encoder_future.result()
+
+            load_timings['parallel_load'] = time.perf_counter() - t0
+            print(f"  Components loaded in parallel in {load_timings['parallel_load']:.2f}s")
+
+            # Assemble FLUX.2 pipeline
+            print("Assembling pipeline...")
+            t0 = time.perf_counter()
+            pipe = Flux2Pipeline.from_pretrained(
+                repo_id,
+                transformer=transformer,
+                text_encoder=text_encoder,
+                torch_dtype=torch_dtype,
+                device_map="cuda",
+                low_cpu_mem_usage=True,
+                use_safetensors=True,
+            )
+        else:
+            # FLUX.1 uses T5 + CLIP text encoders
+            from transformers import CLIPTextModel, T5EncoderModel
+
+            def load_transformer():
+                return FluxTransformer2DModel.from_pretrained(
+                    repo_id, subfolder="transformer", torch_dtype=torch_dtype,
+                    device_map="cuda", low_cpu_mem_usage=True, use_safetensors=True
+                )
+
+            def load_text_encoder():
+                return T5EncoderModel.from_pretrained(
+                    repo_id, subfolder="text_encoder_2", torch_dtype=torch_dtype,
+                    device_map="cuda", low_cpu_mem_usage=True, use_safetensors=True
+                )
+
+            def load_text_encoder_clip():
+                return CLIPTextModel.from_pretrained(
+                    repo_id, subfolder="text_encoder", torch_dtype=torch_dtype,
+                    device_map="cuda", low_cpu_mem_usage=True, use_safetensors=True
+                )
+
+            # Load heavy components in parallel
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                transformer_future = executor.submit(load_transformer)
+                t5_future = executor.submit(load_text_encoder)
+                clip_future = executor.submit(load_text_encoder_clip)
+
+                transformer = transformer_future.result()
+                text_encoder_2 = t5_future.result()
+                text_encoder = clip_future.result()
+
+            load_timings['parallel_load'] = time.perf_counter() - t0
+            print(f"  Components loaded in parallel in {load_timings['parallel_load']:.2f}s")
+
+            # Assemble FLUX.1 pipeline
+            print("Assembling pipeline...")
+            t0 = time.perf_counter()
+            pipe = FluxPipeline.from_pretrained(
+                repo_id,
+                transformer=transformer,
+                text_encoder=text_encoder,
+                text_encoder_2=text_encoder_2,
+                torch_dtype=torch_dtype,
+                device_map="cuda",
+                low_cpu_mem_usage=True,
+                use_safetensors=True,
             )
 
-        def load_text_encoder():
-            return T5EncoderModel.from_pretrained(
-                repo_id, subfolder="text_encoder_2", torch_dtype=torch_dtype,
-                device_map="cuda", low_cpu_mem_usage=True, use_safetensors=True
-            )
-
-        def load_text_encoder_clip():
-            return CLIPTextModel.from_pretrained(
-                repo_id, subfolder="text_encoder", torch_dtype=torch_dtype,
-                device_map="cuda", low_cpu_mem_usage=True, use_safetensors=True
-            )
-
-        # Load heavy components in parallel
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            transformer_future = executor.submit(load_transformer)
-            t5_future = executor.submit(load_text_encoder)
-            clip_future = executor.submit(load_text_encoder_clip)
-
-            transformer = transformer_future.result()
-            text_encoder_2 = t5_future.result()
-            text_encoder = clip_future.result()
-
-        load_timings['parallel_load'] = time.perf_counter() - t0
-        print(f"  Components loaded in parallel in {load_timings['parallel_load']:.2f}s")
-
-        # Now load the pipeline with pre-loaded components
-        print("Assembling pipeline...")
-        t0 = time.perf_counter()
-        pipe = FluxPipeline.from_pretrained(
-            repo_id,
-            transformer=transformer,
-            text_encoder=text_encoder,
-            text_encoder_2=text_encoder_2,
-            torch_dtype=torch_dtype,
-            device_map="cuda",
-            low_cpu_mem_usage=True,
-            use_safetensors=True,
-        )
         load_timings['transformer'] = 0  # Already counted above
         load_timings['pipeline'] = time.perf_counter() - t0
         load_timings['to_device'] = 0  # Already on GPU via device_map
@@ -211,23 +256,43 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
         repo_id = repo_4bit
         print(f"Loading {flux_name} transformer (4-bit)...")
         t0 = time.perf_counter()
-        transformer = FluxTransformer2DModel.from_pretrained(
-            repo_id, subfolder="transformer", torch_dtype=torch_dtype
-        )
+
+        if flux2:
+            # FLUX.2 uses different transformer class
+            transformer = Flux2Transformer2DModel.from_pretrained(
+                repo_id, subfolder="transformer", torch_dtype=torch_dtype
+            )
+        else:
+            transformer = FluxTransformer2DModel.from_pretrained(
+                repo_id, subfolder="transformer", torch_dtype=torch_dtype
+            )
         load_timings['transformer'] = time.perf_counter() - t0
         print(f"  Transformer loaded in {load_timings['transformer']:.2f}s")
 
         print(f"Loading {flux_name} pipeline...")
         t0 = time.perf_counter()
-        if local_encoder:
-            print("Loading local text encoders (this requires more VRAM)...")
-            pipe = FluxPipeline.from_pretrained(
-                repo_id, transformer=transformer, torch_dtype=torch_dtype
-            )
+        if flux2:
+            # FLUX.2 uses different pipeline class
+            if local_encoder:
+                print("Loading local text encoder (Mistral3, requires more VRAM)...")
+                pipe = Flux2Pipeline.from_pretrained(
+                    repo_id, transformer=transformer, torch_dtype=torch_dtype
+                )
+            else:
+                pipe = Flux2Pipeline.from_pretrained(
+                    repo_id, transformer=transformer, text_encoder=None, torch_dtype=torch_dtype
+                )
         else:
-            pipe = FluxPipeline.from_pretrained(
-                repo_id, transformer=transformer, text_encoder=None, torch_dtype=torch_dtype
-            )
+            # FLUX.1 pipeline
+            if local_encoder:
+                print("Loading local text encoders (this requires more VRAM)...")
+                pipe = FluxPipeline.from_pretrained(
+                    repo_id, transformer=transformer, torch_dtype=torch_dtype
+                )
+            else:
+                pipe = FluxPipeline.from_pretrained(
+                    repo_id, transformer=transformer, text_encoder=None, torch_dtype=torch_dtype
+                )
         load_timings['pipeline'] = time.perf_counter() - t0
         print(f"  Pipeline loaded in {load_timings['pipeline']:.2f}s")
 
@@ -290,30 +355,49 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
     # Generate with inference_mode for better performance
     with torch.inference_mode():
         if input_image is not None:
-            # Img2img mode - create pipeline on-demand if needed
-            if pipe_img2img is None:
-                print("Creating img2img pipeline (first use)...")
-                pipe_img2img = FluxImg2ImgPipeline.from_pipe(pipe)
-                # Ensure VAE is in the correct dtype to avoid bfloat16/float32 mismatch
-                if hasattr(pipe_img2img, 'vae') and pipe_img2img.vae is not None:
-                    pipe_img2img.vae = pipe_img2img.vae.to(torch_dtype)
+            # Img2img mode
+            if _flux_version == 2:
+                # FLUX.2 has image conditioning built into the main pipeline
+                # (no strength parameter - image is used as reference/conditioning)
+                input_image = input_image.resize((width, height))
+                print(f"Using image as reference for generation")
 
-            # Resize input image to target dimensions
-            input_image = input_image.resize((width, height))
-            print(f"Using img2img with strength={strength}")
+                t0 = time.perf_counter()
+                image = pipe(
+                    prompt=prompt,
+                    image=input_image,
+                    generator=torch.Generator(device=device).manual_seed(seed),
+                    num_inference_steps=steps,
+                    guidance_scale=4,
+                    height=height,
+                    width=width,
+                ).images[0]
+                timings['diffusion'] = time.perf_counter() - t0
+                timings['encoding'] = 0
+            else:
+                # FLUX.1 needs separate img2img pipeline
+                if pipe_img2img is None:
+                    print("Creating img2img pipeline (first use)...")
+                    pipe_img2img = FluxImg2ImgPipeline.from_pipe(pipe)
+                    # Ensure VAE is in the correct dtype to avoid bfloat16/float32 mismatch
+                    if hasattr(pipe_img2img, 'vae') and pipe_img2img.vae is not None:
+                        pipe_img2img.vae = pipe_img2img.vae.to(torch_dtype)
 
-            t0 = time.perf_counter()
-            image = pipe_img2img(
-                prompt=prompt,
-                image=input_image,
-                strength=strength,
-                generator=torch.Generator(device=device).manual_seed(seed),
-                num_inference_steps=steps,
-                guidance_scale=4,
-            ).images[0]
-            timings['diffusion'] = time.perf_counter() - t0
-            timings['encoding'] = 0  # Included in diffusion
-        elif local_encoder:
+                input_image = input_image.resize((width, height))
+                print(f"Using img2img with strength={strength}")
+
+                t0 = time.perf_counter()
+                image = pipe_img2img(
+                    prompt=prompt,
+                    image=input_image,
+                    strength=strength,
+                    generator=torch.Generator(device=device).manual_seed(seed),
+                    num_inference_steps=steps,
+                    guidance_scale=4,
+                ).images[0]
+                timings['diffusion'] = time.perf_counter() - t0
+                timings['encoding'] = 0
+        elif local_encoder or _flux_version == 2:
             # Use local text encoder
             t0 = time.perf_counter()
             image = pipe(
