@@ -190,6 +190,8 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
             print(f"  Components loaded in parallel in {load_timings['parallel_load']:.2f}s")
 
             # Assemble FLUX.2 pipeline
+            # Note: Use device_map="balanced" (not "cuda" + low_cpu_mem_usage) to avoid
+            # meta tensor errors when loading remaining components (VAE, scheduler, etc.)
             print("Assembling pipeline...")
             t0 = time.perf_counter()
             pipe = Flux2Pipeline.from_pretrained(
@@ -197,8 +199,7 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
                 transformer=transformer,
                 text_encoder=text_encoder,
                 torch_dtype=torch_dtype,
-                device_map="cuda",
-                low_cpu_mem_usage=True,
+                device_map="balanced",
                 use_safetensors=True,
             )
         else:
@@ -237,6 +238,8 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
             print(f"  Components loaded in parallel in {load_timings['parallel_load']:.2f}s")
 
             # Assemble FLUX.1 pipeline
+            # Note: Use device_map="balanced" (not "cuda" + low_cpu_mem_usage) to avoid
+            # meta tensor errors when loading remaining components (VAE, scheduler, etc.)
             print("Assembling pipeline...")
             t0 = time.perf_counter()
             pipe = FluxPipeline.from_pretrained(
@@ -245,8 +248,7 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
                 text_encoder=text_encoder,
                 text_encoder_2=text_encoder_2,
                 torch_dtype=torch_dtype,
-                device_map="cuda",
-                low_cpu_mem_usage=True,
+                device_map="balanced",
                 use_safetensors=True,
             )
 
