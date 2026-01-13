@@ -57,6 +57,7 @@ show_menu() {
 # Start server with selected configuration
 start_server() {
     local config=$1
+    shift  # Remove config number from args
     local args=""
     local desc=""
 
@@ -105,14 +106,14 @@ start_server() {
 
     # Save PID and start server
     echo $$ > server.pid
-    python web_server.py $args "$@"
+    exec python web_server.py $args "$@"
 }
 
 # Main loop
 main() {
     # Check if a number was passed as argument
     if [ -n "$1" ] && [[ "$1" =~ ^[1-6]$ ]]; then
-        start_server "$1" "${@:2}"
+        start_server "$@"
         exit $?
     fi
 
