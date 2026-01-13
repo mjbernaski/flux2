@@ -132,6 +132,8 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
             quantization_config=GGUFQuantizationConfig(compute_dtype=torch_dtype),
             torch_dtype=torch_dtype,
         )
+        # Move GGUF transformer to GPU (from_single_file doesn't support device_map)
+        transformer = transformer.to(device)
         load_timings['transformer'] = time.perf_counter() - t0
         print(f"  Transformer loaded in {load_timings['transformer']:.2f}s")
 
