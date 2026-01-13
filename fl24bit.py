@@ -429,8 +429,11 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
                     print("Creating img2img pipeline (first use)...")
                     pipe_img2img = FluxImg2ImgPipeline.from_pipe(pipe)
                     # Ensure VAE is in the correct dtype to avoid bfloat16/float32 mismatch
+                    # Skip for GGUF models - casting quantized models is unsupported, and
+                    # the VAE is already loaded with correct dtype from the full model repo
                     if hasattr(pipe_img2img, 'vae') and pipe_img2img.vae is not None:
-                        pipe_img2img.vae = pipe_img2img.vae.to(torch_dtype)
+                        if _model_type is None or not _model_type.startswith('gguf'):
+                            pipe_img2img.vae = pipe_img2img.vae.to(torch_dtype)
 
                 input_image = input_image.resize((width, height))
                 print(f"Using img2img with strength={strength}")
