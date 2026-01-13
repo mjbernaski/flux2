@@ -77,41 +77,56 @@ _session.mount("https://", _adapter)
 _embedding_cache = {}
 
 
-def _safe_vae_dtype_cast(pipeline):
-    """Safely cast VAE to the target dtype, handling quantized models gracefully.
+def _wrap_vae_for_dtype_safety(pipeline):
+    """Wrap VAE encode/decode methods to handle dtype mismatches automatically.
 
-    Some model configurations (e.g., GGUF, certain BNB setups) don't support
-    dtype casting after loading. This function:
-    1. Checks if VAE exists and needs casting
-    2. Attempts the cast only if dtype differs
-    3. Catches and logs errors for quantized model scenarios
+    For quantized models (4-bit BNB, GGUF), there can be dtype mismatches:
+    - Pipeline uses torch_dtype (bfloat16) for image preprocessing
+    - VAE may be in float32
+    - Transformer outputs may be in a different dtype
+
+    This wrapper ensures inputs are cast to match VAE dtype before processing,
+    and outputs are cast back to the expected dtype.
     """
     if not hasattr(pipeline, 'vae') or pipeline.vae is None:
         return
 
     vae = pipeline.vae
 
-    # Check current dtype - look at first parameter's dtype
+    # Get VAE's parameter dtype
     try:
-        current_dtype = next(vae.parameters()).dtype
+        vae_dtype = next(vae.parameters()).dtype
     except StopIteration:
-        # No parameters, nothing to cast
         return
 
-    if current_dtype == torch_dtype:
-        # Already in correct dtype, no cast needed
+    # Only wrap if VAE dtype differs from torch_dtype
+    if vae_dtype == torch_dtype:
+        print(f"  VAE dtype: {vae_dtype} (matches torch_dtype, no wrapping needed)")
         return
 
-    try:
-        pipeline.vae = vae.to(torch_dtype)
-        print(f"  VAE dtype cast: {current_dtype} -> {torch_dtype}")
-    except Exception as e:
-        # Quantized models don't support dtype casting - that's OK,
-        # the VAE should already be loaded with the correct dtype
-        if "quantized" in str(e).lower():
-            print(f"  VAE dtype cast skipped (quantized model)")
-        else:
-            print(f"  Warning: VAE dtype cast failed: {e}")
+    print(f"  VAE dtype: {vae_dtype} (wrapping for dtype safety)")
+
+    # Store original methods
+    original_encode = vae.encode
+    original_decode = vae.decode
+
+    def wrapped_encode(x, *args, **kwargs):
+        # Cast input to VAE dtype
+        if x.dtype != vae_dtype:
+            x = x.to(vae_dtype)
+        result = original_encode(x, *args, **kwargs)
+        return result
+
+    def wrapped_decode(z, *args, **kwargs):
+        # Cast latents to VAE dtype
+        if z.dtype != vae_dtype:
+            z = z.to(vae_dtype)
+        result = original_decode(z, *args, **kwargs)
+        return result
+
+    # Apply wrappers
+    vae.encode = wrapped_encode
+    vae.decode = wrapped_decode
 
 
 def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=False):
@@ -464,10 +479,23 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
                 # FLUX.1 needs separate img2img pipeline
                 if pipe_img2img is None:
                     print("Creating img2img pipeline (first use)...")
-                    pipe_img2img = FluxImg2ImgPipeline.from_pipe(pipe)
-                    # Ensure VAE is in the correct dtype to avoid bfloat16/float32 mismatch
-                    # Use safe casting that handles quantized models gracefully
-                    _safe_vae_dtype_cast(pipe_img2img)
+                    # For GGUF models, from_pipe() fails because it tries to cast dtype
+                    # on quantized models. Create the pipeline directly instead.
+                    if _model_type and _model_type.startswith('gguf'):
+                        pipe_img2img = FluxImg2ImgPipeline(
+                            scheduler=pipe.scheduler,
+                            vae=pipe.vae,
+                            text_encoder=pipe.text_encoder,
+                            text_encoder_2=pipe.text_encoder_2,
+                            tokenizer=pipe.tokenizer,
+                            tokenizer_2=pipe.tokenizer_2,
+                            transformer=pipe.transformer,
+                        )
+                        print("  Created img2img pipeline directly (GGUF mode)")
+                    else:
+                        pipe_img2img = FluxImg2ImgPipeline.from_pipe(pipe)
+                    # Wrap VAE for dtype safety (handles 4-bit/GGUF dtype mismatches)
+                    _wrap_vae_for_dtype_safety(pipe_img2img)
 
                 input_image = input_image.resize((width, height))
                 print(f"Using img2img with strength={strength}")
