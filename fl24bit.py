@@ -139,21 +139,18 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
         t0 = time.perf_counter()
         if local_encoder:
             pipe = FluxPipeline.from_pretrained(
-                repo_full, transformer=transformer, torch_dtype=torch_dtype
+                repo_full, transformer=transformer, torch_dtype=torch_dtype,
+                device_map="balanced"
             )
         else:
             pipe = FluxPipeline.from_pretrained(
                 repo_full, transformer=transformer, text_encoder=None,
-                text_encoder_2=None, torch_dtype=torch_dtype
+                text_encoder_2=None, torch_dtype=torch_dtype,
+                device_map="balanced"
             )
         load_timings['pipeline'] = time.perf_counter() - t0
+        load_timings['to_device'] = 0  # Already on GPU via device_map
         print(f"  Pipeline loaded in {load_timings['pipeline']:.2f}s")
-
-        print("Moving model to GPU...")
-        t0 = time.perf_counter()
-        pipe = pipe.to(device)
-        load_timings['to_device'] = time.perf_counter() - t0
-        print(f"  Moved to GPU in {load_timings['to_device']:.2f}s")
 
     elif full_model:
         # Full model - load transformer and text encoder in parallel for faster startup
@@ -282,31 +279,30 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
             if local_encoder:
                 print("Loading local text encoder (Mistral3, requires more VRAM)...")
                 pipe = Flux2Pipeline.from_pretrained(
-                    repo_id, transformer=transformer, torch_dtype=torch_dtype
+                    repo_id, transformer=transformer, torch_dtype=torch_dtype,
+                    device_map="balanced"
                 )
             else:
                 pipe = Flux2Pipeline.from_pretrained(
-                    repo_id, transformer=transformer, text_encoder=None, torch_dtype=torch_dtype
+                    repo_id, transformer=transformer, text_encoder=None, torch_dtype=torch_dtype,
+                    device_map="balanced"
                 )
         else:
             # FLUX.1 pipeline
             if local_encoder:
                 print("Loading local text encoders (this requires more VRAM)...")
                 pipe = FluxPipeline.from_pretrained(
-                    repo_id, transformer=transformer, torch_dtype=torch_dtype
+                    repo_id, transformer=transformer, torch_dtype=torch_dtype,
+                    device_map="balanced"
                 )
             else:
                 pipe = FluxPipeline.from_pretrained(
-                    repo_id, transformer=transformer, text_encoder=None, torch_dtype=torch_dtype
+                    repo_id, transformer=transformer, text_encoder=None, torch_dtype=torch_dtype,
+                    device_map="balanced"
                 )
         load_timings['pipeline'] = time.perf_counter() - t0
+        load_timings['to_device'] = 0  # Already on GPU via device_map
         print(f"  Pipeline loaded in {load_timings['pipeline']:.2f}s")
-
-        print("Moving model to GPU...")
-        t0 = time.perf_counter()
-        pipe = pipe.to(device)
-        load_timings['to_device'] = time.perf_counter() - t0
-        print(f"  Moved to GPU in {load_timings['to_device']:.2f}s")
 
     load_timings['total'] = time.perf_counter() - total_start
     print(f"Model loaded successfully in {load_timings['total']:.2f}s")
@@ -521,7 +517,7 @@ def play_completion_sound():
     # Fallback to terminal bell
     print("\a", end="", flush=True)
 
-def save_prompt_file(filepath, raw_prompt, prompt, width, height, seed, steps, timings):
+def save_prompt_file(filepath, raw_prompt, prompt, width, height, seed, steps, timings, guidance_scale=None):
     """Save prompt metadata alongside image."""
     prompt_path = filepath.rsplit('.', 1)[0] + '.prompt'
     with open(prompt_path, 'w') as f:
@@ -530,6 +526,7 @@ def save_prompt_file(filepath, raw_prompt, prompt, width, height, seed, steps, t
         f.write(f"# Dimensions: {width}x{height}\n")
         f.write(f"# Seed: {seed}\n")
         f.write(f"# Steps: {steps}\n")
+        f.write(f"# Guidance: {guidance_scale if guidance_scale else 'auto'}\n")
         f.write(f"# Timings: encoding={timings['encoding']:.2f}s, diffusion={timings['diffusion']:.2f}s, save={timings.get('save', 0):.2f}s\n")
     return prompt_path
 
@@ -537,6 +534,7 @@ def save_prompt_file(filepath, raw_prompt, prompt, width, height, seed, steps, t
 def main():
     parser = argparse.ArgumentParser(description="FLUX Image Generator")
     parser.add_argument("--steps", type=int, default=25, help="Number of inference steps (default: 25)")
+    parser.add_argument("--guidance", type=float, default=None, help="Guidance scale (default: 4 for normal, 2.5 for turbo). Lower values give more variety.")
     parser.add_argument("--compile", action="store_true", help="Compile model for faster inference (slower startup)")
     parser.add_argument("--local-encoder", action="store_true", help="Use local text encoder instead of remote API (requires more VRAM)")
     parser.add_argument("--full-model", action="store_true", help="Use full FLUX model instead of 4-bit quantized (requires more VRAM)")
@@ -559,6 +557,7 @@ def main():
     last_seed = None
 
     steps = args.steps
+    guidance_scale = args.guidance  # None means use default (4 for normal, 2.5 for turbo)
 
     # Orientation presets (width, height) at 1K base
     orientations_1k = {
@@ -593,6 +592,7 @@ def main():
     print("  'same' or 's' - Regenerate with same prompt (uses cached embeddings)")
     print("  'reseed <number>' - Regenerate with specific seed")
     print("  '/steps <number>' - Change inference steps (current: {})".format(steps))
+    print("  '/guidance <number>' - Change guidance scale (current: {}, lower=more variety)".format(guidance_scale if guidance_scale else "auto"))
     print("  '/square' - Set square aspect ratio")
     print("  '/portrait' - Set portrait aspect ratio")
     print("  '/landscape' - Set landscape aspect ratio")
@@ -629,6 +629,18 @@ def main():
                 print(f"Inference steps set to {steps}")
             except (ValueError, IndexError):
                 print("Invalid steps. Usage: /steps 10")
+            continue
+
+        if lower_input.startswith('/guidance '):
+            try:
+                new_guidance = float(user_input.split()[1])
+                if new_guidance < 0:
+                    print("Guidance scale must be non-negative.")
+                    continue
+                guidance_scale = new_guidance
+                print(f"Guidance scale set to {guidance_scale}")
+            except (ValueError, IndexError):
+                print("Invalid guidance scale. Usage: /guidance 3.5")
             continue
 
         if lower_input in ('/square', '/portrait', '/landscape', '/16:9'):
@@ -687,9 +699,10 @@ def main():
             current_prompt = prompt
             last_seed = None
 
-        print(f"\nGenerating image ({steps} steps, {size} {orientation} {width}x{height})...")
+        guidance_str = f", guidance={guidance_scale}" if guidance_scale else ""
+        print(f"\nGenerating image ({steps} steps{guidance_str}, {size} {orientation} {width}x{height})...")
         raw_input = user_input  # Save original input before any processing
-        image, last_seed, timings = generate_image(prompt, last_seed if lower_input.startswith('reseed ') else None, steps, width, height, use_local_encoder)
+        image, last_seed, timings = generate_image(prompt, last_seed if lower_input.startswith('reseed ') else None, steps, width, height, use_local_encoder, guidance_scale=guidance_scale)
 
         image_count += 1
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -701,7 +714,7 @@ def main():
         timings['save'] = time.perf_counter() - t0
 
         # Save prompt file alongside image
-        prompt_file = save_prompt_file(filename, raw_input, prompt, width, height, last_seed, steps, timings)
+        prompt_file = save_prompt_file(filename, raw_input, prompt, width, height, last_seed, steps, timings, guidance_scale)
 
         print(f"Image saved as: {filename}")
         print(f"Prompt saved as: {prompt_file}")

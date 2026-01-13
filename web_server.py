@@ -330,6 +330,19 @@ HTML_PAGE = """
                 <input type="text" id="seed" name="seed" placeholder="Random if empty">
             </div>
             <div class="form-group">
+                <label for="guidance">Guidance Scale</label>
+                <select id="guidance" name="guidance">
+                    <option value="">Auto (4)</option>
+                    <option value="1">1 (high variety)</option>
+                    <option value="2">2</option>
+                    <option value="3">3</option>
+                    <option value="4">4 (default)</option>
+                    <option value="5">5</option>
+                    <option value="6">6</option>
+                    <option value="7">7 (strict)</option>
+                </select>
+            </div>
+            <div class="form-group">
                 <label for="batch">Batch Size</label>
                 <select id="batch" name="batch">
                     <option value="1" selected>1 image</option>
@@ -438,6 +451,7 @@ HTML_PAGE = """
             e.preventDefault();
 
             const seedValue = document.getElementById('seed').value.trim();
+            const guidanceValue = document.getElementById('guidance').value;
             const batch = parseInt(document.getElementById('batch').value);
 
             const formData = {
@@ -446,6 +460,7 @@ HTML_PAGE = """
                 size: document.getElementById('size').value,
                 steps: parseInt(document.getElementById('steps').value),
                 seed: seedValue ? parseInt(seedValue) : null,
+                guidance: guidanceValue ? parseFloat(guidanceValue) : null,
                 batch: batch
             };
 
@@ -539,6 +554,7 @@ def generate():
         size = data.get('size', '1mp')
         steps = int(data.get('steps', 25))
         seed = data.get('seed')  # None if not provided
+        guidance_scale = data.get('guidance')  # None if not provided (uses default)
         batch = min(max(int(data.get('batch', 1)), 1), 4)  # Clamp to 1-4
 
         # Handle optional input image for img2img
@@ -562,7 +578,8 @@ def generate():
         _current_status = {"generating": True, "prompt": prompt, "batch": batch, "current": 0}
 
         img2img_str = f", img2img strength={strength}" if input_image else ""
-        print(f"Generating: '{prompt}' ({batch}x, {steps} steps, {size} {orientation} {width}x{height}{img2img_str})")
+        guidance_str = f", guidance={guidance_scale}" if guidance_scale else ""
+        print(f"Generating: '{prompt}' ({batch}x, {steps} steps{guidance_str}, {size} {orientation} {width}x{height}{img2img_str})")
 
         start_time = time.perf_counter()
 
@@ -577,7 +594,8 @@ def generate():
             # Generate the image
             image, used_seed, timings = generate_image(
                 prompt, seed=current_seed, steps=steps, width=width, height=height,
-                local_encoder=_local_encoder, input_image=input_image, strength=strength
+                local_encoder=_local_encoder, input_image=input_image, strength=strength,
+                guidance_scale=guidance_scale
             )
 
             # Save to web-generated folder
@@ -590,7 +608,7 @@ def generate():
             timings['save'] = time.perf_counter() - t_save
 
             # Save prompt file alongside image
-            prompt_file = save_prompt_file(output_path, prompt, prompt, width, height, used_seed, steps, timings)
+            prompt_file = save_prompt_file(output_path, prompt, prompt, width, height, used_seed, steps, timings, guidance_scale)
 
             print(f"  Saved: {output_path} (seed: {used_seed})")
             print(f"  Prompt: {prompt_file}")
