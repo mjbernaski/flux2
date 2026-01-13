@@ -77,6 +77,43 @@ _session.mount("https://", _adapter)
 _embedding_cache = {}
 
 
+def _safe_vae_dtype_cast(pipeline):
+    """Safely cast VAE to the target dtype, handling quantized models gracefully.
+
+    Some model configurations (e.g., GGUF, certain BNB setups) don't support
+    dtype casting after loading. This function:
+    1. Checks if VAE exists and needs casting
+    2. Attempts the cast only if dtype differs
+    3. Catches and logs errors for quantized model scenarios
+    """
+    if not hasattr(pipeline, 'vae') or pipeline.vae is None:
+        return
+
+    vae = pipeline.vae
+
+    # Check current dtype - look at first parameter's dtype
+    try:
+        current_dtype = next(vae.parameters()).dtype
+    except StopIteration:
+        # No parameters, nothing to cast
+        return
+
+    if current_dtype == torch_dtype:
+        # Already in correct dtype, no cast needed
+        return
+
+    try:
+        pipeline.vae = vae.to(torch_dtype)
+        print(f"  VAE dtype cast: {current_dtype} -> {torch_dtype}")
+    except Exception as e:
+        # Quantized models don't support dtype casting - that's OK,
+        # the VAE should already be loaded with the correct dtype
+        if "quantized" in str(e).lower():
+            print(f"  VAE dtype cast skipped (quantized model)")
+        else:
+            print(f"  Warning: VAE dtype cast failed: {e}")
+
+
 def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=False):
     """Load the FLUX model components. Call this before generating images.
 
@@ -429,11 +466,8 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
                     print("Creating img2img pipeline (first use)...")
                     pipe_img2img = FluxImg2ImgPipeline.from_pipe(pipe)
                     # Ensure VAE is in the correct dtype to avoid bfloat16/float32 mismatch
-                    # Skip for GGUF models - casting quantized models is unsupported, and
-                    # the VAE is already loaded with correct dtype from the full model repo
-                    if hasattr(pipe_img2img, 'vae') and pipe_img2img.vae is not None:
-                        if _model_type is None or not _model_type.startswith('gguf'):
-                            pipe_img2img.vae = pipe_img2img.vae.to(torch_dtype)
+                    # Use safe casting that handles quantized models gracefully
+                    _safe_vae_dtype_cast(pipe_img2img)
 
                 input_image = input_image.resize((width, height))
                 print(f"Using img2img with strength={strength}")
