@@ -267,15 +267,18 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
                 )
 
             def load_text_encoder():
+                # T5 doesn't support low_cpu_mem_usage=True with device_map="cuda"
+                # (causes meta tensor dispatch error). Use device_map="auto" instead.
                 return T5EncoderModel.from_pretrained(
                     repo_id, subfolder="text_encoder_2", torch_dtype=torch_dtype,
-                    device_map="cuda", low_cpu_mem_usage=True, use_safetensors=True
+                    device_map="auto", use_safetensors=True
                 )
 
             def load_text_encoder_clip():
+                # CLIP is small enough to load directly to CUDA
                 return CLIPTextModel.from_pretrained(
                     repo_id, subfolder="text_encoder", torch_dtype=torch_dtype,
-                    device_map="cuda", low_cpu_mem_usage=True, use_safetensors=True
+                    device_map="auto", use_safetensors=True
                 )
 
             # Load heavy components in parallel
@@ -333,10 +336,17 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
         if flux2:
             # FLUX.2 uses different pipeline class
             if local_encoder:
+                # Load Mistral3 encoder separately to avoid meta tensor errors
+                # (device_map="balanced" with from_pretrained doesn't work well for Mistral3)
+                from transformers import Mistral3ForConditionalGeneration
                 print("Loading local text encoder (Mistral3, requires more VRAM)...")
+                text_encoder = Mistral3ForConditionalGeneration.from_pretrained(
+                    repo_id, subfolder="text_encoder", torch_dtype=torch_dtype,
+                    device_map="auto", use_safetensors=True
+                )
                 pipe = Flux2Pipeline.from_pretrained(
-                    repo_id, transformer=transformer, torch_dtype=torch_dtype,
-                    device_map="balanced"
+                    repo_id, transformer=transformer, text_encoder=text_encoder,
+                    torch_dtype=torch_dtype, device_map="balanced"
                 )
             else:
                 pipe = Flux2Pipeline.from_pretrained(
