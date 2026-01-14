@@ -421,6 +421,34 @@ def load_turbo_lora():
     _turbo_enabled = True
 
 
+_uncensored_enabled = False  # Track if uncensored LoRA is loaded
+
+def load_uncensored_lora():
+    """Load the Flux-Uncensored-V2 LoRA for FLUX.1.
+
+    Only works with FLUX.1. Must be called after load_model().
+    """
+    global _uncensored_enabled
+
+    if pipe is None:
+        raise RuntimeError("Model must be loaded before loading LoRA")
+
+    if _flux_version != 1:
+        print("Warning: Uncensored LoRA only available for FLUX.1, skipping")
+        return
+
+    if _uncensored_enabled:
+        print("Uncensored LoRA already loaded")
+        return
+
+    print("Loading Flux-Uncensored-V2 LoRA (enhanceaiteam/Flux-Uncensored-V2)...")
+    t0 = time.perf_counter()
+    pipe.load_lora_weights("enhanceaiteam/Flux-Uncensored-V2")
+    load_time = time.perf_counter() - t0
+    print(f"  Uncensored LoRA loaded in {load_time:.2f}s")
+    _uncensored_enabled = True
+
+
 def remote_text_encoder(prompt, use_cache=True):
     if use_cache and prompt in _embedding_cache:
         return _embedding_cache[prompt]

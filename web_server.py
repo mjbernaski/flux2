@@ -11,7 +11,7 @@ from PIL import Image
 
 # Import model components from fl24bit
 import fl24bit
-from fl24bit import load_model, generate_image, device, save_prompt_file, load_turbo_lora
+from fl24bit import load_model, generate_image, device, save_prompt_file, load_turbo_lora, load_uncensored_lora
 
 app = Flask(__name__)
 
@@ -22,6 +22,7 @@ _gguf_quant = None
 _flux2 = False
 _schnell = False
 _turbo = False
+_uncensored = False
 
 # Configuration
 OUTPUT_DIR = "web-generated"
@@ -677,12 +678,14 @@ def model_info():
         model_type = f"{flux_name}-dev-bnb-4bit"
     encoder_type = "local encoder" if _local_encoder else "remote encoder"
     turbo_str = " + Turbo" if fl24bit._turbo_enabled else ""
+    uncensored_str = " + Uncensored" if fl24bit._uncensored_enabled else ""
     return jsonify({
         'model': model_type,
         'encoder': encoder_type,
         'turbo': fl24bit._turbo_enabled,
         'schnell': _schnell,
-        'description': f"{model_type}{turbo_str} with {encoder_type}"
+        'uncensored': fl24bit._uncensored_enabled,
+        'description': f"{model_type}{turbo_str}{uncensored_str} with {encoder_type}"
     })
 
 
@@ -696,6 +699,7 @@ if __name__ == '__main__':
     parser.add_argument("--schnell", action="store_true", help="Use FLUX.1-schnell (fast 4-step model, Apache 2.0 license)")
     parser.add_argument("--turbo", action="store_true", default=None, help="Enable turbo LoRA for faster 8-step inference (FLUX.2 only, default: on for FLUX.2)")
     parser.add_argument("--no-turbo", action="store_true", help="Disable turbo LoRA (use standard inference)")
+    parser.add_argument("--uncensored", action="store_true", help="Load Flux-Uncensored-V2 LoRA (FLUX.1 only)")
     parser.add_argument("--port", type=int, default=PORT, help=f"Port to run server on (default: {PORT})")
     args = parser.parse_args()
 
@@ -703,8 +707,11 @@ if __name__ == '__main__':
     _gguf_quant = args.gguf
     _flux2 = args.flux2
     _schnell = args.schnell
-    # Full model and schnell always use local encoder
-    _local_encoder = args.local_encoder or args.full_model or args.schnell
+    _uncensored = args.uncensored
+    # Full model and schnell always use local encoder; uncensored needs full model
+    _local_encoder = args.local_encoder or args.full_model or args.schnell or args.uncensored
+    if args.uncensored and not args.full_model:
+        _full_model = True  # Uncensored LoRA requires full model
     # Turbo defaults to on for FLUX.2, can be disabled with --no-turbo
     _turbo = (args.turbo or args.flux2) and not args.no_turbo
 
@@ -719,12 +726,16 @@ if __name__ == '__main__':
         model_mode = "4-bit BNB"
     encoder_mode = "local encoder" if _local_encoder else "remote encoder"
     turbo_mode = " + Turbo LoRA" if _turbo else ""
+    uncensored_mode = " + Uncensored LoRA" if _uncensored else ""
 
-    print(f"Loading {flux_name} ({model_mode}, {encoder_mode}{turbo_mode})...")
+    print(f"Loading {flux_name} ({model_mode}, {encoder_mode}{turbo_mode}{uncensored_mode})...")
     load_model(local_encoder=_local_encoder, full_model=_full_model, gguf_quant=_gguf_quant, flux2=_flux2, schnell=_schnell)
 
     if _turbo:
         load_turbo_lora()
+
+    if _uncensored:
+        load_uncensored_lora()
 
     print(f"\nStarting web server on http://0.0.0.0:{args.port}")
     print(f"Access from other devices: http://<your-ip>:{args.port}")

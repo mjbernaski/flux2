@@ -43,6 +43,7 @@ show_menu() {
     echo -e "${CYAN}║${NC}    ${GREEN}2)${NC} FLUX.1 Full           (High VRAM, best quality)       ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}    ${GREEN}3)${NC} FLUX.1 GGUF Q8        (DGX Spark optimized)           ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}    ${GREEN}4)${NC} FLUX.1-schnell        (4-step fast, Apache 2.0)       ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}    ${GREEN}8)${NC} FLUX.1 + Uncensored   (Full model + LoRA)             ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}                                                              ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}FLUX.2 Models:${NC}                                             ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}    ${GREEN}5)${NC} FLUX.2 4-bit BNB      (Low VRAM, local encoder)       ${CYAN}║${NC}"
@@ -94,6 +95,10 @@ start_server() {
             args="--flux2 --full-model --turbo"
             desc="FLUX.2 Full + Turbo"
             ;;
+        8)
+            args="--uncensored"
+            desc="FLUX.1 + Uncensored LoRA"
+            ;;
         *)
             echo -e "${RED}Invalid selection${NC}"
             return 1
@@ -117,18 +122,18 @@ start_server() {
 # Main loop
 main() {
     # Check if a number was passed as argument
-    if [ -n "$1" ] && [[ "$1" =~ ^[1-7]$ ]]; then
+    if [ -n "$1" ] && [[ "$1" =~ ^[1-8]$ ]]; then
         start_server "$@"
         exit $?
     fi
 
     while true; do
         show_menu
-        echo -ne "${CYAN}Select configuration [1-7, q to quit]: ${NC}"
+        echo -ne "${CYAN}Select configuration [1-8, q to quit]: ${NC}"
         read -r choice
 
         case $choice in
-            [1-7])
+            [1-8])
                 start_server "$choice"
                 exit $?
                 ;;
