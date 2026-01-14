@@ -20,6 +20,7 @@ _local_encoder = False
 _full_model = False
 _gguf_quant = None
 _flux2 = False
+_schnell = False
 _turbo = False
 
 # Configuration
@@ -657,7 +658,9 @@ def status():
 @app.route('/model-info')
 def model_info():
     flux_name = f"FLUX.{fl24bit._flux_version}"
-    if _gguf_quant:
+    if _schnell:
+        model_type = f"{flux_name}-schnell (4-step)"
+    elif _gguf_quant:
         model_type = f"{flux_name}-dev GGUF {_gguf_quant.upper()}"
     elif _full_model:
         model_type = f"{flux_name}-dev (full)"
