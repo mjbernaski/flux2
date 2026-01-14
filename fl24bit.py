@@ -465,15 +465,23 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
         print(f"Turbo mode: using 8 steps with custom sigmas")
 
     # Auto-configure for schnell mode if enabled
+    # Schnell is a distilled model that doesn't use CFG - must force guidance_scale=0
     if _schnell_enabled:
-        steps = 4  # Schnell is optimized for 4 steps
-        print(f"Schnell mode: using 4 steps")
+        # For img2img, effective steps = int(steps * strength), so we need more base steps
+        # to ensure enough denoising. With 8 steps and 0.75 strength = 6 effective steps.
+        if input_image is not None:
+            steps = 8  # More steps for img2img to compensate for strength reduction
+            print(f"Schnell mode (img2img): using 8 steps (effective ~{int(steps * strength)} with strength={strength}), guidance_scale=0")
+        else:
+            steps = 4  # Schnell is optimized for 4 steps txt2img
+            print(f"Schnell mode: using 4 steps, guidance_scale=0")
+        if guidance_scale is not None and guidance_scale != 0:
+            print(f"Schnell mode: ignoring guidance_scale={guidance_scale}, schnell requires 0")
+        guidance_scale = 0  # Always force 0 for schnell
 
     if guidance_scale is None:
-        # Schnell doesn't need CFG (guidance_scale=0), turbo uses 2.5, others use 4
-        if _schnell_enabled:
-            guidance_scale = 0
-        elif _turbo_enabled:
+        # Turbo uses 2.5, others use 4
+        if _turbo_enabled:
             guidance_scale = 2.5
         else:
             guidance_scale = 4

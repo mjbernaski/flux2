@@ -332,7 +332,7 @@ HTML_PAGE = """
             <div class="form-group">
                 <label for="guidance">Guidance Scale</label>
                 <select id="guidance" name="guidance">
-                    <option value="">Auto (4)</option>
+                    <option value="">Auto</option>
                     <option value="1">1 (high variety)</option>
                     <option value="2">2</option>
                     <option value="3">3</option>
