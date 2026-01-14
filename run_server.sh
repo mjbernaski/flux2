@@ -42,11 +42,12 @@ show_menu() {
     echo -e "${CYAN}║${NC}    ${GREEN}1)${NC} FLUX.1 4-bit BNB      (Low VRAM, remote encoder)      ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}    ${GREEN}2)${NC} FLUX.1 Full           (High VRAM, best quality)       ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}    ${GREEN}3)${NC} FLUX.1 GGUF Q8        (DGX Spark optimized)           ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}    ${GREEN}4)${NC} FLUX.1-schnell        (4-step fast, Apache 2.0)       ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}                                                              ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}FLUX.2 Models:${NC}                                             ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}    ${GREEN}4)${NC} FLUX.2 4-bit BNB      (Low VRAM, local encoder)       ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}    ${GREEN}5)${NC} FLUX.2 Full           (High VRAM, best quality)       ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}    ${GREEN}6)${NC} FLUX.2 Full + Turbo   (8-step fast inference)         ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}    ${GREEN}5)${NC} FLUX.2 4-bit BNB      (Low VRAM, local encoder)       ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}    ${GREEN}6)${NC} FLUX.2 Full           (High VRAM, best quality)       ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}    ${GREEN}7)${NC} FLUX.2 Full + Turbo   (8-step fast inference)         ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}                                                              ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}    ${RED}q)${NC} Quit                                                  ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}                                                              ${CYAN}║${NC}"
@@ -78,14 +79,18 @@ start_server() {
             export CUDA_LAUNCH_BLOCKING=0
             ;;
         4)
+            args="--schnell --local-encoder"
+            desc="FLUX.1-schnell"
+            ;;
+        5)
             args="--flux2"
             desc="FLUX.2 4-bit BNB"
             ;;
-        5)
+        6)
             args="--flux2 --full-model"
             desc="FLUX.2 Full"
             ;;
-        6)
+        7)
             args="--flux2 --full-model --turbo"
             desc="FLUX.2 Full + Turbo"
             ;;
@@ -112,18 +117,18 @@ start_server() {
 # Main loop
 main() {
     # Check if a number was passed as argument
-    if [ -n "$1" ] && [[ "$1" =~ ^[1-6]$ ]]; then
+    if [ -n "$1" ] && [[ "$1" =~ ^[1-7]$ ]]; then
         start_server "$@"
         exit $?
     fi
 
     while true; do
         show_menu
-        echo -ne "${CYAN}Select configuration [1-6, q to quit]: ${NC}"
+        echo -ne "${CYAN}Select configuration [1-7, q to quit]: ${NC}"
         read -r choice
 
         case $choice in
-            [1-6])
+            [1-7])
                 start_server "$choice"
                 exit $?
                 ;;

@@ -38,6 +38,7 @@ import shutil
 # FLUX.1 repos
 FLUX1_REPO_4BIT = "diffusers/FLUX.1-dev-bnb-4bit"
 FLUX1_REPO_FULL = "black-forest-labs/FLUX.1-dev"
+FLUX1_REPO_SCHNELL = "black-forest-labs/FLUX.1-schnell"
 FLUX1_GGUF_MODELS = {
     "bf16": "https://huggingface.co/city96/FLUX.1-dev-gguf/blob/main/flux1-dev-BF16.gguf",
     "q8": "https://huggingface.co/city96/FLUX.1-dev-gguf/blob/main/flux1-dev-Q8_0.gguf",
@@ -57,6 +58,7 @@ pipe_img2img = None  # Img2img pipeline (created on-demand from pipe)
 _model_type = None  # Track which model is loaded
 _flux_version = 1  # Track FLUX version (1 or 2)
 _turbo_enabled = False  # Track if turbo LoRA is loaded
+_schnell_enabled = False  # Track if using schnell (4-step) model
 
 # Pre-shifted custom sigmas for 8-step turbo inference (FLUX.2 only)
 TURBO_SIGMAS = [1.0, 0.6509, 0.4374, 0.2932, 0.1893, 0.1108, 0.0495, 0.00031]
@@ -129,7 +131,7 @@ def _wrap_vae_for_dtype_safety(pipeline):
     vae.decode = wrapped_decode
 
 
-def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=False):
+def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=False, schnell=False):
     """Load the FLUX model components. Call this before generating images.
 
     Args:
@@ -137,12 +139,14 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
         full_model: Use full FLUX model instead of 4-bit quantized
         gguf_quant: GGUF quantization level ('bf16', 'q8', 'q4') - FLUX.1 only
         flux2: Use FLUX.2 model instead of FLUX.1
+        schnell: Use FLUX.1-schnell (fast 4-step model) - FLUX.1 only
     """
-    global transformer, pipe, _model_type, _flux_version
+    global transformer, pipe, _model_type, _flux_version, _schnell_enabled
     if pipe is not None:
         return {}  # Already loaded
 
     _flux_version = 2 if flux2 else 1
+    _schnell_enabled = schnell and not flux2  # Schnell only for FLUX.1
     flux_name = f"FLUX.{_flux_version}"
 
     # Select repos based on version
@@ -152,15 +156,20 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
         if gguf_quant:
             print("Warning: GGUF not available for FLUX.2, using 4-bit instead")
             gguf_quant = None
+        if schnell:
+            print("Warning: Schnell not available for FLUX.2, using standard model")
     else:
         repo_4bit = FLUX1_REPO_4BIT
-        repo_full = FLUX1_REPO_FULL
+        repo_full = FLUX1_REPO_SCHNELL if schnell else FLUX1_REPO_FULL
 
     load_timings = {}
     total_start = time.perf_counter()
 
     # Determine model type
-    if gguf_quant:
+    if schnell and not flux2:
+        _model_type = "schnell"
+        model_desc = f"FLUX.1-schnell (4-step)"
+    elif gguf_quant:
         _model_type = f"gguf-{gguf_quant}"
         model_desc = f"GGUF {gguf_quant.upper()} {flux_name}"
     elif full_model:
@@ -455,8 +464,19 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
         steps = 8  # Turbo uses 8 steps
         print(f"Turbo mode: using 8 steps with custom sigmas")
 
+    # Auto-configure for schnell mode if enabled
+    if _schnell_enabled:
+        steps = 4  # Schnell is optimized for 4 steps
+        print(f"Schnell mode: using 4 steps")
+
     if guidance_scale is None:
-        guidance_scale = 2.5 if _turbo_enabled else 4
+        # Schnell doesn't need CFG (guidance_scale=0), turbo uses 2.5, others use 4
+        if _schnell_enabled:
+            guidance_scale = 0
+        elif _turbo_enabled:
+            guidance_scale = 2.5
+        else:
+            guidance_scale = 4
 
     timings = {}
 
@@ -620,13 +640,14 @@ def main():
     parser.add_argument("--gguf", type=str, choices=["bf16", "q8", "q4"], default=None,
                         help="Use GGUF model (FLUX.1 only, recommended for DGX Spark). Options: bf16 (full quality), q8 (8-bit), q4 (4-bit smallest)")
     parser.add_argument("--flux2", action="store_true", help="Use FLUX.2 model instead of FLUX.1 (requires more VRAM)")
+    parser.add_argument("--schnell", action="store_true", help="Use FLUX.1-schnell (fast 4-step model, Apache 2.0 license)")
     args = parser.parse_args()
 
-    # Full model always uses local encoder
-    use_local_encoder = args.local_encoder or args.full_model
+    # Full model and schnell always use local encoder
+    use_local_encoder = args.local_encoder or args.full_model or args.schnell
 
     # Load the model
-    load_model(local_encoder=use_local_encoder, full_model=args.full_model, gguf_quant=args.gguf, flux2=args.flux2)
+    load_model(local_encoder=use_local_encoder, full_model=args.full_model, gguf_quant=args.gguf, flux2=args.flux2, schnell=args.schnell)
 
     if args.compile:
         compile_pipeline()

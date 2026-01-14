@@ -13,6 +13,7 @@ CONFIGS = [
     {"name": "FLUX.1 4-bit BNB", "args": {"flux2": False, "full_model": False, "gguf_quant": None, "local_encoder": True}},
     {"name": "FLUX.1 Full", "args": {"flux2": False, "full_model": True, "gguf_quant": None, "local_encoder": True}},
     {"name": "FLUX.1 GGUF Q8", "args": {"flux2": False, "full_model": False, "gguf_quant": "q8", "local_encoder": True}},
+    {"name": "FLUX.1-schnell", "args": {"flux2": False, "full_model": False, "gguf_quant": None, "local_encoder": True, "schnell": True}},
     {"name": "FLUX.2 4-bit BNB", "args": {"flux2": True, "full_model": False, "gguf_quant": None, "local_encoder": True}},
     {"name": "FLUX.2 Full", "args": {"flux2": True, "full_model": True, "gguf_quant": None, "local_encoder": True}},
     {"name": "FLUX.2 Full + Turbo", "args": {"flux2": True, "full_model": True, "gguf_quant": None, "local_encoder": True}, "turbo": True},
@@ -32,6 +33,7 @@ def reset_model_state():
     fl24bit._model_type = None
     fl24bit._flux_version = 1
     fl24bit._turbo_enabled = False
+    fl24bit._schnell_enabled = False
     gc.collect()
     torch.cuda.empty_cache()
 

@@ -680,6 +680,7 @@ if __name__ == '__main__':
     parser.add_argument("--gguf", type=str, choices=["bf16", "q8", "q4"], default=None,
                         help="Use GGUF model (FLUX.1 only, recommended for DGX Spark). Options: bf16 (full quality), q8 (8-bit), q4 (4-bit smallest)")
     parser.add_argument("--flux2", action="store_true", help="Use FLUX.2 model instead of FLUX.1 (requires more VRAM)")
+    parser.add_argument("--schnell", action="store_true", help="Use FLUX.1-schnell (fast 4-step model, Apache 2.0 license)")
     parser.add_argument("--turbo", action="store_true", default=None, help="Enable turbo LoRA for faster 8-step inference (FLUX.2 only, default: on for FLUX.2)")
     parser.add_argument("--no-turbo", action="store_true", help="Disable turbo LoRA (use standard inference)")
     parser.add_argument("--port", type=int, default=PORT, help=f"Port to run server on (default: {PORT})")
@@ -688,13 +689,16 @@ if __name__ == '__main__':
     _full_model = args.full_model
     _gguf_quant = args.gguf
     _flux2 = args.flux2
-    # Full model always uses local encoder
-    _local_encoder = args.local_encoder or args.full_model
+    _schnell = args.schnell
+    # Full model and schnell always use local encoder
+    _local_encoder = args.local_encoder or args.full_model or args.schnell
     # Turbo defaults to on for FLUX.2, can be disabled with --no-turbo
     _turbo = (args.turbo or args.flux2) and not args.no_turbo
 
     flux_name = "FLUX.2" if _flux2 else "FLUX.1"
-    if _gguf_quant:
+    if _schnell:
+        model_mode = "schnell (4-step)"
+    elif _gguf_quant:
         model_mode = f"GGUF {_gguf_quant.upper()}"
     elif _full_model:
         model_mode = "full model"
@@ -704,7 +708,7 @@ if __name__ == '__main__':
     turbo_mode = " + Turbo LoRA" if _turbo else ""
 
     print(f"Loading {flux_name} ({model_mode}, {encoder_mode}{turbo_mode})...")
-    load_model(local_encoder=_local_encoder, full_model=_full_model, gguf_quant=_gguf_quant, flux2=_flux2)
+    load_model(local_encoder=_local_encoder, full_model=_full_model, gguf_quant=_gguf_quant, flux2=_flux2, schnell=_schnell)
 
     if _turbo:
         load_turbo_lora()
