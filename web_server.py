@@ -729,7 +729,7 @@ if __name__ == '__main__':
     uncensored_mode = " + Uncensored LoRA" if _uncensored else ""
 
     print(f"Loading {flux_name} ({model_mode}, {encoder_mode}{turbo_mode}{uncensored_mode})...")
-    load_model(local_encoder=_local_encoder, full_model=_full_model, gguf_quant=_gguf_quant, flux2=_flux2, schnell=_schnell)
+    load_model(local_encoder=_local_encoder, full_model=_full_model, gguf_quant=_gguf_quant, flux2=_flux2, schnell=_schnell, for_lora=_uncensored)
 
     if _turbo:
         load_turbo_lora()

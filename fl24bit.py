@@ -131,7 +131,7 @@ def _wrap_vae_for_dtype_safety(pipeline):
     vae.decode = wrapped_decode
 
 
-def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=False, schnell=False):
+def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=False, schnell=False, for_lora=False):
     """Load the FLUX model components. Call this before generating images.
 
     Args:
@@ -140,6 +140,7 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
         gguf_quant: GGUF quantization level ('bf16', 'q8', 'q4') - FLUX.1 only
         flux2: Use FLUX.2 model instead of FLUX.1
         schnell: Use FLUX.1-schnell (fast 4-step model) - FLUX.1 only
+        for_lora: Use simple loading path compatible with LoRA (avoids meta tensor issues)
     """
     global transformer, pipe, _model_type, _flux_version, _schnell_enabled
     if pipe is not None:
@@ -218,6 +219,27 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
         load_timings['pipeline'] = time.perf_counter() - t0
         load_timings['to_device'] = 0  # Already on GPU via device_map
         print(f"  Pipeline loaded in {load_timings['pipeline']:.2f}s")
+
+    elif for_lora and not flux2:
+        # Simple loading path for LoRA compatibility (FLUX.1 only)
+        # Uses DiffusionPipeline directly to avoid meta tensor issues with parallel loading
+        from diffusers import DiffusionPipeline
+
+        repo_id = repo_full
+        print(f"Loading {flux_name} pipeline (LoRA-compatible mode)...")
+        t0 = time.perf_counter()
+        pipe = DiffusionPipeline.from_pretrained(
+            repo_id,
+            torch_dtype=torch_dtype,
+        )
+        load_timings['pipeline'] = time.perf_counter() - t0
+        print(f"  Pipeline loaded in {load_timings['pipeline']:.2f}s")
+
+        print("Moving to GPU...")
+        t0 = time.perf_counter()
+        pipe = pipe.to(device)
+        load_timings['to_device'] = time.perf_counter() - t0
+        print(f"  Moved to GPU in {load_timings['to_device']:.2f}s")
 
     elif full_model:
         # Full model - load transformer and text encoder in parallel for faster startup
