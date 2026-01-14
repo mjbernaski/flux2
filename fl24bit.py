@@ -239,6 +239,7 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
         t0 = time.perf_counter()
         pipe = pipe.to(device)
         load_timings['to_device'] = time.perf_counter() - t0
+        load_timings['transformer'] = 0  # Included in pipeline load
         print(f"  Moved to GPU in {load_timings['to_device']:.2f}s")
 
     elif full_model:
