@@ -443,6 +443,15 @@ HTML_PAGE = """
             .then(r => r.json())
             .then(data => {
                 document.getElementById('modelInfo').textContent = data.description;
+                // Disable steps and guidance for schnell mode (fixed at 4 steps, guidance=0)
+                if (data.schnell) {
+                    const stepsSelect = document.getElementById('steps');
+                    const guidanceSelect = document.getElementById('guidance');
+                    stepsSelect.disabled = true;
+                    stepsSelect.title = 'Schnell uses fixed 4 steps (8 for img2img)';
+                    guidanceSelect.disabled = true;
+                    guidanceSelect.title = 'Schnell requires guidance_scale=0';
+                }
             })
             .catch(() => {
                 document.getElementById('modelInfo').textContent = 'FLUX.1 Image Generator';
@@ -672,6 +681,7 @@ def model_info():
         'model': model_type,
         'encoder': encoder_type,
         'turbo': fl24bit._turbo_enabled,
+        'schnell': _schnell,
         'description': f"{model_type}{turbo_str} with {encoder_type}"
     })
 
