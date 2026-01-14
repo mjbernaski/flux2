@@ -149,6 +149,10 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
     _schnell_enabled = schnell and not flux2  # Schnell only for FLUX.1
     flux_name = f"FLUX.{_flux_version}"
 
+    # Schnell only exists as full model (no 4-bit quantized version available)
+    if schnell and not flux2:
+        full_model = True
+
     # Select repos based on version
     if flux2:
         repo_4bit = FLUX2_REPO_4BIT
