@@ -274,9 +274,11 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
             from transformers import CLIPTextModel, T5EncoderModel
 
             def load_transformer():
+                # Use device_map="auto" instead of "cuda" + low_cpu_mem_usage to avoid
+                # meta tensor errors (especially with schnell model)
                 return FluxTransformer2DModel.from_pretrained(
                     repo_id, subfolder="transformer", torch_dtype=torch_dtype,
-                    device_map="cuda", low_cpu_mem_usage=True, use_safetensors=True
+                    device_map="auto", use_safetensors=True
                 )
 
             def load_text_encoder():
