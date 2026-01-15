@@ -69,7 +69,7 @@ HTML_PAGE = """
         .subtitle { color: #888; margin-bottom: 20px; }
         .form-group { margin-bottom: 15px; }
         label { display: block; margin-bottom: 5px; color: #aaa; }
-        input[type="text"], select {
+        input[type="text"], select, textarea {
             width: 100%;
             padding: 12px;
             border: 1px solid #333;
@@ -77,8 +77,13 @@ HTML_PAGE = """
             background: #16213e;
             color: #fff;
             font-size: 16px;
+            font-family: inherit;
         }
-        input[type="text"]:focus, select:focus {
+        textarea {
+            resize: vertical;
+            min-height: 60px;
+        }
+        input[type="text"]:focus, select:focus, textarea:focus {
             outline: none;
             border-color: #00d4ff;
         }
@@ -276,7 +281,7 @@ HTML_PAGE = """
     <form id="generateForm">
         <div class="form-group">
             <label for="prompt">Prompt</label>
-            <input type="text" id="prompt" name="prompt" placeholder="A majestic mountain landscape at sunset..." required>
+            <textarea id="prompt" name="prompt" rows="3" placeholder="A majestic mountain landscape at sunset..." required></textarea>
         </div>
 
         <div class="form-group">
