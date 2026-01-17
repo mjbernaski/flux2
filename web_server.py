@@ -272,6 +272,59 @@ HTML_PAGE = """
             vertical-align: middle;
         }
         @keyframes spin { to { transform: rotate(360deg); } }
+        .history-section {
+            margin-top: 40px;
+            padding-top: 30px;
+            border-top: 1px solid #333;
+        }
+        .history-section h2 {
+            color: #888;
+            font-size: 18px;
+            margin-bottom: 20px;
+        }
+        .history-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+            gap: 12px;
+        }
+        .history-item {
+            position: relative;
+            aspect-ratio: 1;
+            border-radius: 6px;
+            overflow: hidden;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+        .history-item:hover {
+            transform: scale(1.05);
+        }
+        .history-item img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        .history-item .overlay {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            background: linear-gradient(transparent, rgba(0,0,0,0.8));
+            padding: 8px 6px 6px;
+            opacity: 0;
+            transition: opacity 0.2s;
+        }
+        .history-item:hover .overlay {
+            opacity: 1;
+        }
+        .history-item .time {
+            color: #fff;
+            font-size: 11px;
+        }
+        .history-empty {
+            color: #666;
+            text-align: center;
+            padding: 20px;
+        }
     </style>
 </head>
 <body>
@@ -373,6 +426,11 @@ HTML_PAGE = """
         <p class="generation-info" id="generationInfo"></p>
     </div>
 
+    <div class="history-section" id="historySection">
+        <h2>Today's Generations</h2>
+        <div class="history-grid" id="historyGrid"></div>
+    </div>
+
     <script>
         const form = document.getElementById('generateForm');
         const submitBtn = document.getElementById('submitBtn');
@@ -442,6 +500,16 @@ HTML_PAGE = """
             inputImage.value = '';
             uploadPlaceholder.style.display = 'flex';
             imagePreview.style.display = 'none';
+        });
+
+        // Cmd+Return (Mac) or Ctrl+Return (Windows/Linux) to submit form
+        document.addEventListener('keydown', (e) => {
+            if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+                e.preventDefault();
+                if (!submitBtn.disabled) {
+                    form.dispatchEvent(new Event('submit', { cancelable: true }));
+                }
+            }
         });
 
         // Fetch and display model info on page load
@@ -527,6 +595,8 @@ HTML_PAGE = """
                     });
 
                     generationInfo.textContent = `Generated ${data.images.length} image(s) in ${data.generation_time.toFixed(1)}s`;
+                    // Refresh history after successful generation
+                    loadHistory();
                 } else {
                     status.className = 'status error';
                     statusText.textContent = 'Error: ' + data.error;
@@ -538,6 +608,45 @@ HTML_PAGE = """
 
             submitBtn.disabled = false;
         });
+
+        // History section
+        const historyGrid = document.getElementById('historyGrid');
+
+        async function loadHistory() {
+            try {
+                const response = await fetch('/history');
+                const data = await response.json();
+
+                historyGrid.innerHTML = '';
+
+                if (data.images.length === 0) {
+                    historyGrid.innerHTML = '<p class="history-empty">No images generated today</p>';
+                    return;
+                }
+
+                data.images.forEach(img => {
+                    const item = document.createElement('div');
+                    item.className = 'history-item';
+                    item.innerHTML = `
+                        <img src="/images/${img.filename}" alt="${img.prompt || 'Generated image'}" loading="lazy">
+                        <div class="overlay">
+                            <span class="time">${img.time}</span>
+                        </div>
+                    `;
+                    item.title = img.prompt || img.filename;
+                    item.addEventListener('click', () => {
+                        window.open(`/images/${img.filename}`, '_blank');
+                    });
+                    historyGrid.appendChild(item);
+                });
+            } catch (err) {
+                console.error('Failed to load history:', err);
+                historyGrid.innerHTML = '<p class="history-empty">Failed to load history</p>';
+            }
+        }
+
+        // Load history on page load
+        loadHistory();
     </script>
 </body>
 </html>
@@ -692,6 +801,59 @@ def model_info():
         'uncensored': fl24bit._uncensored_enabled,
         'description': f"{model_type}{turbo_str}{uncensored_str} with {encoder_type}"
     })
+
+
+@app.route('/history')
+def history():
+    """Return today's generated images, newest first."""
+    today = datetime.now().strftime("%Y%m%d")
+    images = []
+
+    try:
+        for filename in os.listdir(OUTPUT_DIR):
+            if not filename.endswith('.png'):
+                continue
+            # Filename format: flux{version}_{YYYYMMDD}_{HHMMSS}_{uuid}.png
+            parts = filename.split('_')
+            if len(parts) >= 3 and parts[1] == today:
+                # Extract time from filename
+                time_str = parts[2]
+                if len(time_str) == 6:
+                    display_time = f"{time_str[:2]}:{time_str[2:4]}:{time_str[4:6]}"
+                else:
+                    display_time = time_str
+
+                # Try to read prompt from .prompt file
+                prompt = None
+                prompt_file = os.path.join(OUTPUT_DIR, filename.rsplit('.', 1)[0] + '.prompt')
+                if os.path.exists(prompt_file):
+                    try:
+                        with open(prompt_file, 'r') as f:
+                            for line in f:
+                                if line.startswith('# Prompt: '):
+                                    prompt = line[10:].strip()
+                                    break
+                    except Exception:
+                        pass
+
+                images.append({
+                    'filename': filename,
+                    'time': display_time,
+                    'prompt': prompt,
+                    'sort_key': parts[2] if len(parts) >= 3 else '000000'
+                })
+
+        # Sort by time, newest first
+        images.sort(key=lambda x: x['sort_key'], reverse=True)
+
+        # Remove sort_key from response
+        for img in images:
+            del img['sort_key']
+
+    except Exception as e:
+        print(f"Error reading history: {e}")
+
+    return jsonify({'images': images})
 
 
 if __name__ == '__main__':
