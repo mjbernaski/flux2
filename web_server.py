@@ -45,7 +45,6 @@ ORIENTATIONS_1K = {
 SIZES = {
     '1mp': 1.0,
     '2mp': 2.0,
-    '4mp': 4.0,
 }
 
 HTML_PAGE = """
@@ -89,8 +88,12 @@ HTML_PAGE = """
         }
         .row { display: flex; gap: 15px; }
         .row .form-group { flex: 1; }
+        .button-row {
+            display: flex;
+            gap: 10px;
+        }
         button {
-            width: 100%;
+            flex: 1;
             padding: 15px;
             background: #00d4ff;
             color: #000;
@@ -107,6 +110,14 @@ HTML_PAGE = """
             color: #888;
             cursor: not-allowed;
         }
+        .reset-btn {
+            flex: 0 0 auto;
+            width: auto;
+            padding: 15px 25px;
+            background: #6c757d;
+            color: #fff;
+        }
+        .reset-btn:hover:not(:disabled) { background: #5a6268; }
         .status {
             text-align: center;
             padding: 15px;
@@ -357,9 +368,9 @@ HTML_PAGE = """
             <div class="form-group">
                 <label for="orientation">Orientation</label>
                 <select id="orientation" name="orientation">
-                    <option value="landscape" selected>Landscape</option>
+                    <option value="square" selected>Square</option>
+                    <option value="landscape">Landscape</option>
                     <option value="portrait">Portrait</option>
-                    <option value="square">Square</option>
                 </select>
             </div>
             <div class="form-group">
@@ -367,7 +378,6 @@ HTML_PAGE = """
                 <select id="size" name="size">
                     <option value="1mp" selected>1 MP</option>
                     <option value="2mp">2 MP</option>
-                    <option value="4mp">4 MP</option>
                 </select>
             </div>
             <div class="form-group">
@@ -413,7 +423,10 @@ HTML_PAGE = """
             </div>
         </div>
 
-        <button type="submit" id="submitBtn">Generate Image</button>
+        <div class="button-row">
+            <button type="submit" id="submitBtn">Generate Image</button>
+            <button type="button" class="reset-btn" id="resetBtn">Reset</button>
+        </div>
     </form>
 
     <div class="status" id="status">
@@ -495,6 +508,23 @@ HTML_PAGE = """
 
         clearImage.addEventListener('click', (e) => {
             e.stopPropagation();
+            currentInputImage = null;
+            previewImg.src = '';
+            inputImage.value = '';
+            uploadPlaceholder.style.display = 'flex';
+            imagePreview.style.display = 'none';
+        });
+
+        // Reset button - clears all fields to defaults
+        document.getElementById('resetBtn').addEventListener('click', () => {
+            document.getElementById('prompt').value = '';
+            document.getElementById('orientation').value = 'square';
+            document.getElementById('size').value = '1mp';
+            document.getElementById('steps').value = '25';
+            document.getElementById('seed').value = '';
+            document.getElementById('guidance').value = '';
+            document.getElementById('batch').value = '1';
+            // Clear input image
             currentInputImage = null;
             previewImg.src = '';
             inputImage.value = '';
