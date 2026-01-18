@@ -726,15 +726,28 @@ def generate():
             print(f"Received input image: {input_image.size}, strength={strength}")
 
         # Calculate dimensions
-        base_w, base_h = ORIENTATIONS_1K.get(orientation, ORIENTATIONS_1K['landscape'])
         scale = SIZES.get(size, 1.0)
-        width, height = int(base_w * scale), int(base_h * scale)
+        if input_image is not None:
+            # For img2img: use input image's aspect ratio, scale to target resolution
+            # Base target is ~1MP, scale multiplies each dimension
+            in_w, in_h = input_image.size
+            target_pixels = 1_000_000 * (scale ** 2)
+            current_pixels = in_w * in_h
+            factor = (target_pixels / current_pixels) ** 0.5
+            width = int(round(in_w * factor / 8) * 8)  # Round to multiple of 8
+            height = int(round(in_h * factor / 8) * 8)
+            print(f"Img2img: scaling {in_w}x{in_h} -> {width}x{height} (preserving aspect ratio)")
+        else:
+            # For txt2img: use orientation preset
+            base_w, base_h = ORIENTATIONS_1K.get(orientation, ORIENTATIONS_1K['landscape'])
+            width, height = int(base_w * scale), int(base_h * scale)
 
         _current_status = {"generating": True, "prompt": prompt, "batch": batch, "current": 0}
 
         img2img_str = f", img2img strength={strength}" if input_image else ""
         guidance_str = f", guidance={guidance_scale}" if guidance_scale else ""
-        print(f"Generating: '{prompt}' ({batch}x, {steps} steps{guidance_str}, {size} {orientation} {width}x{height}{img2img_str})")
+        orientation_str = "" if input_image else f" {orientation}"
+        print(f"Generating: '{prompt}' ({batch}x, {steps} steps{guidance_str}, {size}{orientation_str} {width}x{height}{img2img_str})")
 
         start_time = time.perf_counter()
 
