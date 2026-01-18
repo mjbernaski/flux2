@@ -142,15 +142,19 @@ start_server() {
             # Clean exit (user requested shutdown)
             echo -e "${GREEN}Server exited cleanly.${NC}"
             break
-        elif [ $exit_code -eq 130 ] || [ $exit_code -eq 137 ]; then
-            # SIGINT (Ctrl+C) or SIGKILL - user requested stop
-            echo -e "${YELLOW}Server stopped by user (signal $exit_code).${NC}"
+        elif [ $exit_code -eq 130 ]; then
+            # SIGINT (Ctrl+C) - user requested stop
+            echo -e "${YELLOW}Server stopped by user (Ctrl+C).${NC}"
             break
         else
-            # Process failed
+            # Process failed (includes exit code 137 from OOM killer)
             echo ""
             echo -e "${RED}╔══════════════════════════════════════════════════════════════╗${NC}"
-            echo -e "${RED}║  Server crashed with exit code $exit_code${NC}"
+            if [ $exit_code -eq 137 ]; then
+                echo -e "${RED}║  Server was killed (exit 137 - likely OOM)${NC}"
+            else
+                echo -e "${RED}║  Server crashed with exit code $exit_code${NC}"
+            fi
 
             if [ $attempt -ge $max_retries ]; then
                 echo -e "${RED}║  Maximum retries ($max_retries) reached. Giving up.${NC}"
