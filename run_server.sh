@@ -56,12 +56,14 @@ show_menu() {
     echo ""
 }
 
-# Start server with selected configuration
+# Start server with selected configuration (with auto-restart on failure)
 start_server() {
     local config=$1
     shift  # Remove config number from args
     local args=""
     local desc=""
+    local max_retries=5
+    local retry_delay=3
 
     case $config in
         1)
@@ -108,15 +110,68 @@ start_server() {
     echo ""
     echo -e "${GREEN}Starting ${desc}...${NC}"
     echo -e "${BLUE}Command: python web_server.py $args${NC}"
+    echo -e "${YELLOW}Auto-restart enabled (max $max_retries retries on failure)${NC}"
     echo ""
 
     kill_existing_server
 
     source .venv/bin/activate
 
-    # Save PID and start server
+    # Save parent PID
     echo $$ > server.pid
-    exec python web_server.py $args "$@"
+
+    # Restart loop
+    local attempt=0
+    while true; do
+        attempt=$((attempt + 1))
+
+        if [ $attempt -gt 1 ]; then
+            echo ""
+            echo -e "${YELLOW}═══════════════════════════════════════════════════════════${NC}"
+            echo -e "${YELLOW}Restart attempt $attempt of $max_retries${NC}"
+            echo -e "${YELLOW}═══════════════════════════════════════════════════════════${NC}"
+            echo ""
+        fi
+
+        # Run the server
+        python web_server.py $args "$@"
+        exit_code=$?
+
+        # Check exit code
+        if [ $exit_code -eq 0 ]; then
+            # Clean exit (user requested shutdown)
+            echo -e "${GREEN}Server exited cleanly.${NC}"
+            break
+        elif [ $exit_code -eq 130 ] || [ $exit_code -eq 137 ]; then
+            # SIGINT (Ctrl+C) or SIGKILL - user requested stop
+            echo -e "${YELLOW}Server stopped by user (signal $exit_code).${NC}"
+            break
+        else
+            # Process failed
+            echo ""
+            echo -e "${RED}╔══════════════════════════════════════════════════════════════╗${NC}"
+            echo -e "${RED}║  Server crashed with exit code $exit_code${NC}"
+
+            if [ $attempt -ge $max_retries ]; then
+                echo -e "${RED}║  Maximum retries ($max_retries) reached. Giving up.${NC}"
+                echo -e "${RED}╚══════════════════════════════════════════════════════════════╝${NC}"
+                return 1
+            fi
+
+            echo -e "${RED}║  Restarting in $retry_delay seconds... (attempt $((attempt+1))/$max_retries)${NC}"
+            echo -e "${RED}║  Press Ctrl+C to abort restart${NC}"
+            echo -e "${RED}╚══════════════════════════════════════════════════════════════╝${NC}"
+
+            # Wait with countdown, allowing Ctrl+C to cancel
+            for i in $(seq $retry_delay -1 1); do
+                echo -ne "\r${YELLOW}Restarting in $i...${NC}  "
+                sleep 1
+            done
+            echo ""
+        fi
+    done
+
+    rm -f server.pid
 }
 
 # Main loop

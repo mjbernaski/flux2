@@ -247,37 +247,39 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
         import concurrent.futures
 
         repo_id = repo_full
-        print(f"Loading {flux_name} components in parallel...")
+        if flux2:
+            print(f"Loading {flux_name} components sequentially (memory-optimized)...")
+        else:
+            print(f"Loading {flux_name} components in parallel...")
         t0 = time.perf_counter()
 
         if flux2:
             # FLUX.2 uses Mistral3 text encoder
+            # Load sequentially (not parallel) to reduce peak memory usage on unified memory systems
             from transformers import Mistral3ForConditionalGeneration
 
-            def load_transformer():
-                return Flux2Transformer2DModel.from_pretrained(
-                    repo_id, subfolder="transformer", torch_dtype=torch_dtype,
-                    device_map="cuda", low_cpu_mem_usage=True, use_safetensors=True
-                )
+            print("  Loading transformer (32B params)...")
+            t_trans = time.perf_counter()
+            transformer = Flux2Transformer2DModel.from_pretrained(
+                repo_id, subfolder="transformer", torch_dtype=torch_dtype,
+                device_map="auto", low_cpu_mem_usage=True, use_safetensors=True
+            )
+            load_timings['transformer'] = time.perf_counter() - t_trans
+            print(f"    Transformer loaded in {load_timings['transformer']:.2f}s")
 
-            def load_text_encoder():
-                # Mistral3 doesn't support low_cpu_mem_usage=True with device_map="cuda"
-                # (causes meta tensor dispatch error). Use device_map="auto" instead.
-                return Mistral3ForConditionalGeneration.from_pretrained(
-                    repo_id, subfolder="text_encoder", torch_dtype=torch_dtype,
-                    device_map="auto", use_safetensors=True
-                )
+            print("  Loading text encoder (Mistral3)...")
+            t_enc = time.perf_counter()
+            # Mistral3 doesn't support low_cpu_mem_usage=True with device_map="cuda"
+            # (causes meta tensor dispatch error). Use device_map="auto" instead.
+            text_encoder = Mistral3ForConditionalGeneration.from_pretrained(
+                repo_id, subfolder="text_encoder", torch_dtype=torch_dtype,
+                device_map="auto", use_safetensors=True
+            )
+            load_timings['text_encoder'] = time.perf_counter() - t_enc
+            print(f"    Text encoder loaded in {load_timings['text_encoder']:.2f}s")
 
-            # Load components in parallel
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-                transformer_future = executor.submit(load_transformer)
-                encoder_future = executor.submit(load_text_encoder)
-
-                transformer = transformer_future.result()
-                text_encoder = encoder_future.result()
-
-            load_timings['parallel_load'] = time.perf_counter() - t0
-            print(f"  Components loaded in parallel in {load_timings['parallel_load']:.2f}s")
+            load_timings['sequential_load'] = time.perf_counter() - t0
+            print(f"  Components loaded sequentially in {load_timings['sequential_load']:.2f}s")
 
             # Assemble FLUX.2 pipeline
             # Note: Use device_map="balanced" (not "cuda" + low_cpu_mem_usage) to avoid
