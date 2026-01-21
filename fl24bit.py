@@ -154,6 +154,12 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
     if schnell and not flux2:
         full_model = True
 
+    # FLUX.2 uses Mistral3 text encoder - no remote API available, so local encoder is required
+    # for 4-bit mode (full model always loads encoder anyway)
+    if flux2 and not full_model and not local_encoder:
+        print("Note: FLUX.2 4-bit requires local Mistral3 encoder (no remote API available)")
+        local_encoder = True
+
     # Select repos based on version
     if flux2:
         repo_4bit = FLUX2_REPO_4BIT
