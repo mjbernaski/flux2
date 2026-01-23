@@ -275,12 +275,12 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
 
             print("  Loading text encoder (Mistral3)...")
             t_enc = time.perf_counter()
-            # Mistral3 doesn't support low_cpu_mem_usage=True with device_map="cuda"
-            # (causes meta tensor dispatch error). Use device_map="auto" instead.
+            # Don't use device_map="auto" - it can place embedding layer on CPU causing
+            # index_select device mismatch errors. Load to CPU then move to GPU.
             text_encoder = Mistral3ForConditionalGeneration.from_pretrained(
                 repo_id, subfolder="text_encoder", torch_dtype=torch_dtype,
-                device_map="auto", use_safetensors=True
-            )
+                use_safetensors=True
+            ).to(device)
             load_timings['text_encoder'] = time.perf_counter() - t_enc
             print(f"    Text encoder loaded in {load_timings['text_encoder']:.2f}s")
 
@@ -384,12 +384,14 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
             if local_encoder:
                 # Load Mistral3 encoder separately to avoid meta tensor errors
                 # (device_map="balanced" with from_pretrained doesn't work well for Mistral3)
+                # Note: Don't use device_map="auto" - it can place embedding layer on CPU
+                # causing index_select device mismatch errors. Load to CPU then move to GPU.
                 from transformers import Mistral3ForConditionalGeneration
                 print("Loading local text encoder (Mistral3, requires more VRAM)...")
                 text_encoder = Mistral3ForConditionalGeneration.from_pretrained(
                     repo_id, subfolder="text_encoder", torch_dtype=torch_dtype,
-                    device_map="auto", use_safetensors=True
-                )
+                    use_safetensors=True
+                ).to(device)
                 pipe = Flux2Pipeline.from_pretrained(
                     repo_id, transformer=transformer, text_encoder=text_encoder,
                     torch_dtype=torch_dtype, device_map="balanced"
