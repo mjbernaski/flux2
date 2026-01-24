@@ -271,6 +271,28 @@ HTML_PAGE = """
         .clear-btn:hover {
             background: rgba(255, 0, 0, 1);
         }
+        .strength-control {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        .strength-control label {
+            color: #888;
+            font-size: 14px;
+        }
+        .strength-control input[type="range"] {
+            width: 100%;
+            accent-color: #00d4ff;
+        }
+        .strength-hint {
+            color: #666;
+            font-size: 12px;
+        }
+        #strengthValue {
+            color: #00d4ff;
+            font-weight: bold;
+        }
         .spinner {
             display: inline-block;
             width: 20px;
@@ -360,6 +382,11 @@ HTML_PAGE = """
                         <img id="previewImg" src="">
                         <button type="button" class="clear-btn" id="clearImage">X</button>
                     </div>
+                </div>
+                <div class="strength-control" id="strengthControl" style="display: none;">
+                    <label for="strength">Strength: <span id="strengthValue">0.75</span></label>
+                    <input type="range" id="strength" name="strength" min="0" max="1" step="0.05" value="0.75">
+                    <div class="strength-hint">Lower = closer to original, Higher = more change</div>
                 </div>
             </div>
         </div>
@@ -462,6 +489,14 @@ HTML_PAGE = """
         const clearImage = document.getElementById('clearImage');
 
         let currentInputImage = null;
+        const strengthControl = document.getElementById('strengthControl');
+        const strengthSlider = document.getElementById('strength');
+        const strengthValue = document.getElementById('strengthValue');
+
+        // Update strength display when slider changes
+        strengthSlider.addEventListener('input', () => {
+            strengthValue.textContent = strengthSlider.value;
+        });
 
         function useSeed(seed) {
             document.getElementById('seed').value = seed;
@@ -502,6 +537,7 @@ HTML_PAGE = """
                 previewImg.src = currentInputImage;
                 uploadPlaceholder.style.display = 'none';
                 imagePreview.style.display = 'block';
+                strengthControl.style.display = 'flex';
             };
             reader.readAsDataURL(file);
         }
@@ -513,6 +549,7 @@ HTML_PAGE = """
             inputImage.value = '';
             uploadPlaceholder.style.display = 'flex';
             imagePreview.style.display = 'none';
+            strengthControl.style.display = 'none';
         });
 
         // Reset button - clears all fields to defaults
@@ -524,12 +561,15 @@ HTML_PAGE = """
             document.getElementById('seed').value = '';
             document.getElementById('guidance').value = '';
             document.getElementById('batch').value = '1';
-            // Clear input image
+            // Clear input image and reset strength
             currentInputImage = null;
             previewImg.src = '';
             inputImage.value = '';
             uploadPlaceholder.style.display = 'flex';
             imagePreview.style.display = 'none';
+            strengthSlider.value = '0.75';
+            strengthValue.textContent = '0.75';
+            strengthControl.style.display = 'none';
         });
 
         // Cmd+Return (Mac) or Ctrl+Return (Windows/Linux) to submit form
@@ -578,9 +618,10 @@ HTML_PAGE = """
                 batch: batch
             };
 
-            // Add reference image if present
+            // Add reference image and strength if present
             if (currentInputImage) {
                 formData.input_image = currentInputImage;
+                formData.strength = parseFloat(strengthSlider.value);
             }
 
             submitBtn.disabled = true;
