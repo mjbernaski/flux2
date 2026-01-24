@@ -4,6 +4,7 @@ import threading
 import time
 import base64
 import io
+import socket
 from datetime import datetime
 import uuid
 from flask import Flask, request, jsonify, send_from_directory
@@ -65,6 +66,7 @@ HTML_PAGE = """
             color: #eee;
         }
         h1 { color: #00d4ff; margin-bottom: 5px; }
+        .hostname { color: #666; font-size: 12px; margin-bottom: 5px; text-transform: uppercase; letter-spacing: 1px; }
         .subtitle { color: #888; margin-bottom: 20px; }
         .form-group { margin-bottom: 15px; }
         label { display: block; margin-bottom: 5px; color: #aaa; }
@@ -361,6 +363,7 @@ HTML_PAGE = """
     </style>
 </head>
 <body>
+    <p class="hostname" id="hostname"></p>
     <h1>FLUX.1 Image Generator</h1>
     <p class="subtitle" id="modelInfo">Loading model info...</p>
 
@@ -586,6 +589,7 @@ HTML_PAGE = """
         fetch('/model-info')
             .then(r => r.json())
             .then(data => {
+                document.getElementById('hostname').textContent = data.hostname;
                 document.getElementById('modelInfo').textContent = data.description;
                 // Disable steps and guidance for schnell mode (fixed at 4 steps, guidance=0)
                 if (data.schnell) {
@@ -883,6 +887,7 @@ def model_info():
         'turbo': fl24bit._turbo_enabled,
         'schnell': _schnell,
         'uncensored': fl24bit._uncensored_enabled,
+        'hostname': socket.gethostname(),
         'description': f"{model_type}{turbo_str}{uncensored_str} with {encoder_type}"
     })
 
