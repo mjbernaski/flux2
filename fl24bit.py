@@ -1,6 +1,7 @@
 import argparse
 import torch
 import os
+from PIL import Image
 
 # Performance optimizations for Blackwell/DGX Spark GPUs
 torch.backends.cuda.matmul.allow_tf32 = True  # ~3x faster matmul with minimal precision loss
@@ -691,7 +692,7 @@ def play_completion_sound():
     # Fallback to terminal bell
     print("\a", end="", flush=True)
 
-def save_prompt_file(filepath, raw_prompt, prompt, width, height, seed, steps, timings, guidance_scale=None):
+def save_prompt_file(filepath, raw_prompt, prompt, width, height, seed, steps, timings, guidance_scale=None, strength=None):
     """Save prompt metadata alongside image."""
     prompt_path = filepath.rsplit('.', 1)[0] + '.prompt'
     with open(prompt_path, 'w') as f:
@@ -701,6 +702,8 @@ def save_prompt_file(filepath, raw_prompt, prompt, width, height, seed, steps, t
         f.write(f"# Seed: {seed}\n")
         f.write(f"# Steps: {steps}\n")
         f.write(f"# Guidance: {guidance_scale if guidance_scale else 'auto'}\n")
+        if strength is not None:
+            f.write(f"# Strength: {strength} (img2img)\n")
         f.write(f"# Timings: encoding={timings['encoding']:.2f}s, diffusion={timings['diffusion']:.2f}s, save={timings.get('save', 0):.2f}s\n")
     return prompt_path
 
@@ -716,6 +719,8 @@ def main():
                         help="Use GGUF model (FLUX.1 only, recommended for DGX Spark). Options: bf16 (full quality), q8 (8-bit), q4 (4-bit smallest)")
     parser.add_argument("--flux2", action="store_true", help="Use FLUX.2 model instead of FLUX.1 (requires more VRAM)")
     parser.add_argument("--schnell", action="store_true", help="Use FLUX.1-schnell (fast 4-step model, Apache 2.0 license)")
+    parser.add_argument("--image", type=str, default=None, help="Reference image path for img2img generation")
+    parser.add_argument("--strength", type=float, default=0.75, help="Denoising strength for img2img (0.0-1.0, default: 0.75). Higher = more change from original")
     args = parser.parse_args()
 
     # Full model and schnell always use local encoder
@@ -733,6 +738,15 @@ def main():
 
     steps = args.steps
     guidance_scale = args.guidance  # None means use default (4 for normal, 2.5 for turbo)
+    strength = args.strength  # Denoising strength for img2img
+    input_image = None
+    if args.image:
+        try:
+            input_image = Image.open(args.image).convert("RGB")
+            print(f"Loaded reference image: {args.image} ({input_image.size[0]}x{input_image.size[1]})")
+        except Exception as e:
+            print(f"Warning: Could not load reference image '{args.image}': {e}")
+            input_image = None
 
     # Orientation presets (width, height) at 1K base
     orientations_1k = {
@@ -768,6 +782,8 @@ def main():
     print("  'reseed <number>' - Regenerate with specific seed")
     print("  '/steps <number>' - Change inference steps (current: {})".format(steps))
     print("  '/guidance <number>' - Change guidance scale (current: {}, lower=more variety)".format(guidance_scale if guidance_scale else "auto"))
+    print("  '/image <path>' - Load reference image for img2img (use '/image clear' to remove)")
+    print("  '/strength <number>' - Set img2img denoising strength 0.0-1.0 (current: {})".format(strength))
     print("  '/square' - Set square aspect ratio")
     print("  '/portrait' - Set portrait aspect ratio")
     print("  '/landscape' - Set landscape aspect ratio")
@@ -816,6 +832,31 @@ def main():
                 print(f"Guidance scale set to {guidance_scale}")
             except (ValueError, IndexError):
                 print("Invalid guidance scale. Usage: /guidance 3.5")
+            continue
+
+        if lower_input.startswith('/strength '):
+            try:
+                new_strength = float(user_input.split()[1])
+                if new_strength < 0 or new_strength > 1:
+                    print("Strength must be between 0.0 and 1.0.")
+                    continue
+                strength = new_strength
+                print(f"Img2img strength set to {strength}")
+            except (ValueError, IndexError):
+                print("Invalid strength. Usage: /strength 0.75")
+            continue
+
+        if lower_input.startswith('/image '):
+            image_arg = user_input.split(maxsplit=1)[1] if len(user_input.split()) > 1 else ""
+            if image_arg.lower() == 'clear':
+                input_image = None
+                print("Reference image cleared. Using text-to-image mode.")
+            else:
+                try:
+                    input_image = Image.open(image_arg).convert("RGB")
+                    print(f"Loaded reference image: {image_arg} ({input_image.size[0]}x{input_image.size[1]})")
+                except Exception as e:
+                    print(f"Could not load image '{image_arg}': {e}")
             continue
 
         if lower_input in ('/square', '/portrait', '/landscape', '/16:9'):
@@ -875,9 +916,10 @@ def main():
             last_seed = None
 
         guidance_str = f", guidance={guidance_scale}" if guidance_scale else ""
-        print(f"\nGenerating image ({steps} steps{guidance_str}, {size} {orientation} {width}x{height})...")
+        img2img_str = f", img2img strength={strength}" if input_image else ""
+        print(f"\nGenerating image ({steps} steps{guidance_str}{img2img_str}, {size} {orientation} {width}x{height})...")
         raw_input = user_input  # Save original input before any processing
-        image, last_seed, timings = generate_image(prompt, last_seed if lower_input.startswith('reseed ') else None, steps, width, height, use_local_encoder, guidance_scale=guidance_scale)
+        image, last_seed, timings = generate_image(prompt, last_seed if lower_input.startswith('reseed ') else None, steps, width, height, use_local_encoder, input_image=input_image, strength=strength, guidance_scale=guidance_scale)
 
         image_count += 1
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -889,7 +931,7 @@ def main():
         timings['save'] = time.perf_counter() - t0
 
         # Save prompt file alongside image
-        prompt_file = save_prompt_file(filename, raw_input, prompt, width, height, last_seed, steps, timings, guidance_scale)
+        prompt_file = save_prompt_file(filename, raw_input, prompt, width, height, last_seed, steps, timings, guidance_scale, strength if input_image else None)
 
         print(f"Image saved as: {filename}")
         print(f"Prompt saved as: {prompt_file}")
