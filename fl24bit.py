@@ -1,7 +1,18 @@
 import argparse
 import torch
 import os
+import socket
+import logging
 from PIL import Image
+
+# Suppress verbose logging from HTTP and ML libraries
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("requests").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("transformers").setLevel(logging.WARNING)
+logging.getLogger("diffusers").setLevel(logging.WARNING)
+logging.getLogger("accelerate").setLevel(logging.WARNING)
+logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 
 # Performance optimizations for Blackwell/DGX Spark GPUs
 torch.backends.cuda.matmul.allow_tf32 = True  # ~3x faster matmul with minimal precision loss
@@ -104,10 +115,7 @@ def _wrap_vae_for_dtype_safety(pipeline):
 
     # Only wrap if VAE dtype differs from torch_dtype
     if vae_dtype == torch_dtype:
-        print(f"  VAE dtype: {vae_dtype} (matches torch_dtype, no wrapping needed)")
-        return
-
-    print(f"  VAE dtype: {vae_dtype} (wrapping for dtype safety)")
+        return  # No wrapping needed
 
     # Store original methods
     original_encode = vae.encode
@@ -191,7 +199,8 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
         _model_type = "4bit"
         model_desc = f"4-bit quantized {flux_name}"
 
-    print(f"Loading {model_desc}...")
+    hostname = socket.gethostname()
+    print(f"[{hostname}] Loading {model_desc}...")
 
     if gguf_quant:
         # GGUF models - recommended for DGX Spark unified memory systems (FLUX.1 only)
@@ -420,8 +429,7 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
         print(f"  Pipeline loaded in {load_timings['pipeline']:.2f}s")
 
     load_timings['total'] = time.perf_counter() - total_start
-    print(f"Model loaded successfully in {load_timings['total']:.2f}s")
-    print(f"  Summary: transformer={load_timings['transformer']:.2f}s, pipeline={load_timings['pipeline']:.2f}s, to_gpu={load_timings['to_device']:.2f}s")
+    print(f"[{hostname}] Model ready in {load_timings['total']:.2f}s (transformer={load_timings['transformer']:.2f}s, pipeline={load_timings['pipeline']:.2f}s)")
 
     return load_timings
 
@@ -524,13 +532,11 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
 
     if seed is None:
         seed = torch.randint(0, 2**32, (1,)).item()
-    print(f"Using seed: {seed}")
 
     # Auto-configure for turbo mode if enabled
     if _turbo_enabled and sigmas is None:
         sigmas = TURBO_SIGMAS
         steps = 8  # Turbo uses 8 steps
-        print(f"Turbo mode: using 8 steps with custom sigmas")
 
     # Auto-configure for schnell mode if enabled
     # Schnell is a distilled model that doesn't use CFG - must force guidance_scale=0
@@ -539,12 +545,8 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
         # to ensure enough denoising. With 8 steps and 0.75 strength = 6 effective steps.
         if input_image is not None:
             steps = 8  # More steps for img2img to compensate for strength reduction
-            print(f"Schnell mode (img2img): using 8 steps (effective ~{int(steps * strength)} with strength={strength}), guidance_scale=0")
         else:
             steps = 4  # Schnell is optimized for 4 steps txt2img
-            print(f"Schnell mode: using 4 steps, guidance_scale=0")
-        if guidance_scale is not None and guidance_scale != 0:
-            print(f"Schnell mode: ignoring guidance_scale={guidance_scale}, schnell requires 0")
         guidance_scale = 0  # Always force 0 for schnell
 
     if guidance_scale is None:
@@ -564,7 +566,6 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
                 # FLUX.2 has image conditioning built into the main pipeline
                 # (no strength parameter - image is used as reference/conditioning)
                 input_image = input_image.resize((width, height))
-                print(f"Using image as reference for generation")
 
                 t0 = time.perf_counter()
                 pipe_kwargs = {
@@ -584,7 +585,6 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
             else:
                 # FLUX.1 needs separate img2img pipeline
                 if pipe_img2img is None:
-                    print("Creating img2img pipeline (first use)...")
                     # For GGUF models, from_pipe() fails because it tries to cast dtype
                     # on quantized models. Create the pipeline directly instead.
                     if _model_type and _model_type.startswith('gguf'):
@@ -597,14 +597,12 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
                             tokenizer_2=pipe.tokenizer_2,
                             transformer=pipe.transformer,
                         )
-                        print("  Created img2img pipeline directly (GGUF mode)")
                     else:
                         pipe_img2img = FluxImg2ImgPipeline.from_pipe(pipe)
                     # Wrap VAE for dtype safety (handles 4-bit/GGUF dtype mismatches)
                     _wrap_vae_for_dtype_safety(pipe_img2img)
 
                 input_image = input_image.resize((width, height))
-                print(f"Using img2img with strength={strength}")
 
                 t0 = time.perf_counter()
                 image = pipe_img2img(
@@ -651,8 +649,6 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
             timings['diffusion'] = time.perf_counter() - t0
 
     timings['total'] = timings['encoding'] + timings['diffusion']
-
-    print(f"Timing: encoding={timings['encoding']:.2f}s, diffusion={timings['diffusion']:.2f}s, total={timings['total']:.2f}s")
     return image, seed, timings
 
 def compile_pipeline():
@@ -767,7 +763,8 @@ def main():
     width, height = int(base_w * sizes[size]), int(base_h * sizes[size])
 
     flux_name = f"FLUX.{_flux_version}"
-    print(f"\n=== {flux_name} Image Generator ===")
+    hostname = socket.gethostname()
+    print(f"\n=== {flux_name} Image Generator on {hostname} ===")
     if args.gguf:
         model_mode = f"GGUF {args.gguf.upper()}"
     elif args.full_model:
@@ -775,7 +772,9 @@ def main():
     else:
         model_mode = "4-bit BNB"
     encoder_mode = "local encoder" if use_local_encoder else "remote encoder"
-    print(f"Using {flux_name} {model_mode}, {encoder_mode}, {steps} steps, {size} {orientation} ({width}x{height})" + (" (compiled)" if args.compile else ""))
+    compiled_str = " (compiled)" if args.compile else ""
+    print(f"Model: {flux_name} {model_mode}, {encoder_mode}{compiled_str}")
+    print(f"Output: {size} {orientation} ({width}x{height}), {steps} steps")
     print("Commands:")
     print("  'quit' or 'q' - Exit the program")
     print("  'same' or 's' - Regenerate with same prompt (uses cached embeddings)")
@@ -915,9 +914,15 @@ def main():
             current_prompt = prompt
             last_seed = None
 
-        guidance_str = f", guidance={guidance_scale}" if guidance_scale else ""
-        img2img_str = f", img2img strength={strength}" if input_image else ""
-        print(f"\nGenerating image ({steps} steps{guidance_str}{img2img_str}, {size} {orientation} {width}x{height})...")
+        # Build generation info string
+        gen_info_parts = [f"{steps} steps", f"{width}x{height}"]
+        if guidance_scale:
+            gen_info_parts.append(f"guidance={guidance_scale}")
+        if input_image:
+            gen_info_parts.append(f"img2img strength={strength}")
+        gen_info = ", ".join(gen_info_parts)
+
+        print(f"\n[{hostname}] Generating: {gen_info}")
         raw_input = user_input  # Save original input before any processing
         image, last_seed, timings = generate_image(prompt, last_seed if lower_input.startswith('reseed ') else None, steps, width, height, use_local_encoder, input_image=input_image, strength=strength, guidance_scale=guidance_scale)
 
@@ -931,11 +936,12 @@ def main():
         timings['save'] = time.perf_counter() - t0
 
         # Save prompt file alongside image
-        prompt_file = save_prompt_file(filename, raw_input, prompt, width, height, last_seed, steps, timings, guidance_scale, strength if input_image else None)
+        save_prompt_file(filename, raw_input, prompt, width, height, last_seed, steps, timings, guidance_scale, strength if input_image else None)
 
-        print(f"Image saved as: {filename}")
-        print(f"Prompt saved as: {prompt_file}")
-        print(f"  Steps breakdown: encoding={timings['encoding']:.2f}s, diffusion={timings['diffusion']:.2f}s, save={timings['save']:.2f}s")
+        # Clean summary output
+        total_time = timings['total'] + timings['save']
+        print(f"[{hostname}] Saved: {filename}")
+        print(f"  seed={last_seed}, {total_time:.2f}s total (encode={timings['encoding']:.2f}s, diffuse={timings['diffusion']:.2f}s, save={timings['save']:.2f}s)")
         play_completion_sound()
 
 if __name__ == "__main__":
