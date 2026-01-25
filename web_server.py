@@ -10,6 +10,9 @@ import uuid
 from flask import Flask, request, jsonify, send_from_directory
 from PIL import Image
 
+# Version number - update this when releasing new versions
+VERSION = "1.0.0"
+
 # Import model components from fl24bit
 import fl24bit
 from fl24bit import load_model, generate_image, device, save_prompt_file, load_turbo_lora, load_uncensored_lora
@@ -66,7 +69,9 @@ HTML_PAGE = """
             color: #eee;
         }
         h1 { color: #00d4ff; margin-bottom: 5px; }
-        .hostname { color: #666; font-size: 12px; margin-bottom: 5px; text-transform: uppercase; letter-spacing: 1px; }
+        .header-info { display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px; }
+        .hostname { color: #666; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; }
+        .version { color: #666; font-size: 12px; }
         .subtitle { color: #888; margin-bottom: 20px; }
         .form-group { margin-bottom: 15px; }
         label { display: block; margin-bottom: 5px; color: #aaa; }
@@ -363,7 +368,10 @@ HTML_PAGE = """
     </style>
 </head>
 <body>
-    <p class="hostname" id="hostname"></p>
+    <div class="header-info">
+        <span class="hostname" id="hostname"></span>
+        <span class="version" id="version"></span>
+    </div>
     <h1>FLUX.1 Image Generator</h1>
     <p class="subtitle" id="modelInfo">Loading model info...</p>
 
@@ -590,6 +598,7 @@ HTML_PAGE = """
             .then(r => r.json())
             .then(data => {
                 document.getElementById('hostname').textContent = data.hostname;
+                document.getElementById('version').textContent = 'v' + data.version;
                 document.getElementById('modelInfo').textContent = data.description;
                 // Disable steps and guidance for schnell mode (fixed at 4 steps, guidance=0)
                 if (data.schnell) {
@@ -888,6 +897,7 @@ def model_info():
         'schnell': _schnell,
         'uncensored': fl24bit._uncensored_enabled,
         'hostname': socket.gethostname(),
+        'version': VERSION,
         'description': f"{model_type}{turbo_str}{uncensored_str} with {encoder_type}"
     })
 
