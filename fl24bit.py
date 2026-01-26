@@ -753,6 +753,7 @@ def main():
     }
     # Size presets
     sizes = {
+        '0.75': 0.75,
         '1k': 1.0,
         '2k': 2.0,
         '4k': 4.0,
@@ -787,6 +788,7 @@ def main():
     print("  '/portrait' - Set portrait aspect ratio")
     print("  '/landscape' - Set landscape aspect ratio")
     print("  '/16:9' - Set 16:9 widescreen aspect ratio")
+    print("  '/0.75' - Set 0.75K resolution (smaller/faster)")
     print("  '/1k' - Set 1K resolution (default)")
     print("  '/2k' - Set 2K resolution")
     print("  '/4k' - Set 4K resolution")
@@ -865,7 +867,7 @@ def main():
             print(f"Orientation set to {orientation} ({width}x{height})")
             continue
 
-        if lower_input in ('/1k', '/2k', '/4k'):
+        if lower_input in ('/0.75', '/1k', '/2k', '/4k'):
             size = lower_input[1:]  # Remove the leading /
             base_w, base_h = orientations_1k[orientation]
             width, height = int(base_w * sizes[size]), int(base_h * sizes[size])
@@ -878,7 +880,7 @@ def main():
         prompt_words = []
         for word in words:
             lower_word = word.lower()
-            if lower_word in ('/1k', '/2k', '/4k'):
+            if lower_word in ('/0.75', '/1k', '/2k', '/4k'):
                 size = lower_word[1:]
                 modifiers_found.append(f"size={size}")
             elif lower_word in ('/square', '/portrait', '/landscape', '/16:9'):
