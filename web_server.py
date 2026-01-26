@@ -47,6 +47,7 @@ ORIENTATIONS_1K = {
 }
 
 SIZES = {
+    '0.75mp': 0.75,
     '1mp': 1.0,
     '2mp': 2.0,
 }
@@ -414,6 +415,7 @@ HTML_PAGE = """
             <div class="form-group">
                 <label for="size">Size</label>
                 <select id="size" name="size">
+                    <option value="0.75mp">0.75 MP</option>
                     <option value="1mp" selected>1 MP</option>
                     <option value="2mp">2 MP</option>
                 </select>
