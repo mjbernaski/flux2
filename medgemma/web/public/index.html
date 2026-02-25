@@ -25,7 +25,19 @@
     gap: 10px;
   }
   header h1 { font-size: 18px; font-weight: 600; color: #7aa2f7; }
-  header span { font-size: 13px; color: #565f89; }
+  header span { font-size: 13px; color: #565f89; flex: 1; }
+
+  header button {
+    background: #283457;
+    border: none;
+    color: #c0caf5;
+    font-size: 13px;
+    padding: 6px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  header button:hover { background: #2a3a5c; }
 
   #chat {
     flex: 1;
@@ -180,6 +192,38 @@
   #send-btn:disabled { opacity: 0.4; cursor: default; }
 
   #file-input { display: none; }
+
+  .thinking-toggle {
+    display: inline-block;
+    font-size: 12px;
+    color: #565f89;
+    cursor: pointer;
+    margin-bottom: 8px;
+    user-select: none;
+  }
+  .thinking-toggle:hover { color: #7aa2f7; }
+  .thinking-toggle::before {
+    content: "\25B6";
+    display: inline-block;
+    margin-right: 5px;
+    font-size: 10px;
+    transition: transform 0.2s;
+  }
+  .thinking-toggle.open::before { transform: rotate(90deg); }
+
+  .thinking-content {
+    display: none;
+    background: #16161e;
+    border-left: 2px solid #2a2b3d;
+    padding: 8px 12px;
+    margin-bottom: 8px;
+    border-radius: 4px;
+    font-size: 13px;
+    color: #565f89;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+  }
+  .thinking-content.open { display: block; }
 </style>
 </head>
 <body>
@@ -187,6 +231,8 @@
 <header>
   <h1>MedGemma Chat</h1>
   <span>Medical image analysis</span>
+  <button id="save-btn" title="Save chat to text file">Save</button>
+  <button id="new-chat-btn" title="Start a new chat">New Chat</button>
 </header>
 
 <div id="chat"></div>
@@ -289,6 +335,12 @@ document.body.addEventListener("drop", (e) => {
 
 // -- Chat --
 
+function parseThinking(text) {
+  const match = text.match(/^<think>([\s\S]*?)<\/think>\s*([\s\S]*)$/);
+  if (match) return { thinking: match[1].trim(), answer: match[2].trim() };
+  return { thinking: null, answer: text };
+}
+
 function addMessage(role, text, imageDataUrl) {
   const div = document.createElement("div");
   div.className = "msg " + role;
@@ -298,7 +350,29 @@ function addMessage(role, text, imageDataUrl) {
     img.className = "thumb";
     div.appendChild(img);
   }
-  div.appendChild(document.createTextNode(text));
+
+  if (role === "assistant") {
+    const { thinking, answer } = parseThinking(text);
+    if (thinking) {
+      const toggle = document.createElement("span");
+      toggle.className = "thinking-toggle";
+      toggle.textContent = "Show thinking";
+      const content = document.createElement("div");
+      content.className = "thinking-content";
+      content.textContent = thinking;
+      toggle.addEventListener("click", () => {
+        const open = toggle.classList.toggle("open");
+        content.classList.toggle("open");
+        toggle.textContent = open ? "Hide thinking" : "Show thinking";
+      });
+      div.appendChild(toggle);
+      div.appendChild(content);
+    }
+    div.appendChild(document.createTextNode(answer));
+  } else {
+    div.appendChild(document.createTextNode(text));
+  }
+
   chatEl.appendChild(div);
   chatEl.scrollTop = chatEl.scrollHeight;
 }
@@ -358,6 +432,32 @@ async function send() {
     msgInput.focus();
   }
 }
+
+// -- New Chat --
+document.getElementById("new-chat-btn").addEventListener("click", () => {
+  messages = [];
+  chatEl.innerHTML = "";
+  clearImage();
+  msgInput.value = "";
+  msgInput.focus();
+});
+
+// -- Save Dialog --
+document.getElementById("save-btn").addEventListener("click", () => {
+  if (messages.length === 0) return;
+  const lines = messages.map(m => {
+    const label = m.role === "user" ? "You" : "MedGemma";
+    return label + ":\n" + m.content + "\n";
+  });
+  const text = "MedGemma Chat — " + new Date().toLocaleString() + "\n" +
+    "=".repeat(40) + "\n\n" + lines.join("\n");
+  const blob = new Blob([text], { type: "text/plain" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "medgemma-chat-" + new Date().toISOString().slice(0, 19).replace(/:/g, "-") + ".txt";
+  a.click();
+  URL.revokeObjectURL(a.href);
+});
 
 sendBtn.addEventListener("click", send);
 msgInput.addEventListener("keydown", (e) => {
