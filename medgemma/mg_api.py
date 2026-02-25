@@ -3,6 +3,7 @@ from pydantic import BaseModel
 from PIL import Image
 import base64
 import io
+import re
 import torch
 
 MODEL_ID = "google/medgemma-1.5-4b-it"
@@ -20,6 +21,20 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     response: str
+    thinking: str | None = None
+
+
+THINKING_RE = re.compile(
+    r"<unused94>\s*thought\s*([\s\S]*?)<unused95>\s*([\s\S]*)",
+    re.IGNORECASE,
+)
+
+
+def split_thinking(text: str) -> tuple[str | None, str]:
+    m = THINKING_RE.search(text)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    return None, text.strip()
 
 
 def load_model():
@@ -79,8 +94,9 @@ async def chat(req: ChatRequest):
         generation = model.generate(**inputs, max_new_tokens=2000, do_sample=False)
         generation = generation[0][input_len:]
 
-    decoded = processor.decode(generation, skip_special_tokens=True)
-    return ChatResponse(response=decoded)
+    decoded = processor.decode(generation, skip_special_tokens=False)
+    thinking, answer = split_thinking(decoded)
+    return ChatResponse(response=answer, thinking=thinking)
 
 
 if __name__ == "__main__":

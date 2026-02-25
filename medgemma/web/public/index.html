@@ -194,11 +194,13 @@
   #file-input { display: none; }
 
   .thinking-toggle {
-    display: inline-block;
+    display: block;
     font-size: 12px;
     color: #565f89;
     cursor: pointer;
     margin-bottom: 8px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid #2a2b3d;
     user-select: none;
   }
   .thinking-toggle:hover { color: #7aa2f7; }
@@ -335,13 +337,7 @@ document.body.addEventListener("drop", (e) => {
 
 // -- Chat --
 
-function parseThinking(text) {
-  const match = text.match(/^<think>([\s\S]*?)<\/think>\s*([\s\S]*)$/);
-  if (match) return { thinking: match[1].trim(), answer: match[2].trim() };
-  return { thinking: null, answer: text };
-}
-
-function addMessage(role, text, imageDataUrl) {
+function addMessage(role, text, imageDataUrl, thinking) {
   const div = document.createElement("div");
   div.className = "msg " + role;
   if (imageDataUrl) {
@@ -351,28 +347,23 @@ function addMessage(role, text, imageDataUrl) {
     div.appendChild(img);
   }
 
-  if (role === "assistant") {
-    const { thinking, answer } = parseThinking(text);
-    if (thinking) {
-      const toggle = document.createElement("span");
-      toggle.className = "thinking-toggle";
-      toggle.textContent = "Show thinking";
-      const content = document.createElement("div");
-      content.className = "thinking-content";
-      content.textContent = thinking;
-      toggle.addEventListener("click", () => {
-        const open = toggle.classList.toggle("open");
-        content.classList.toggle("open");
-        toggle.textContent = open ? "Hide thinking" : "Show thinking";
-      });
-      div.appendChild(toggle);
-      div.appendChild(content);
-    }
-    div.appendChild(document.createTextNode(answer));
-  } else {
-    div.appendChild(document.createTextNode(text));
+  if (thinking) {
+    const toggle = document.createElement("span");
+    toggle.className = "thinking-toggle";
+    toggle.textContent = "Show thinking";
+    const content = document.createElement("div");
+    content.className = "thinking-content";
+    content.textContent = thinking;
+    toggle.addEventListener("click", () => {
+      const open = toggle.classList.toggle("open");
+      content.classList.toggle("open");
+      toggle.textContent = open ? "Hide thinking" : "Show thinking";
+    });
+    div.appendChild(toggle);
+    div.appendChild(content);
   }
 
+  div.appendChild(document.createTextNode(text));
   chatEl.appendChild(div);
   chatEl.scrollTop = chatEl.scrollHeight;
 }
@@ -422,7 +413,7 @@ async function send() {
     const data = await res.json();
     messages.push({ role: "assistant", content: data.response });
     hideSpinner();
-    addMessage("assistant", data.response);
+    addMessage("assistant", data.response, null, data.thinking);
   } catch (e) {
     hideSpinner();
     addMessage("assistant", "Error: " + e.message);
