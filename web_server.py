@@ -5,6 +5,7 @@ import time
 import base64
 import io
 import socket
+import shutil
 from datetime import datetime
 import uuid
 from flask import Flask, request, jsonify, send_from_directory
@@ -318,11 +319,27 @@ HTML_PAGE = """
             padding-top: 30px;
             border-top: 1px solid #333;
         }
+        .history-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
         .history-section h2 {
             color: #888;
             font-size: 18px;
-            margin-bottom: 20px;
+            margin: 0;
         }
+        .archive-btn {
+            flex: 0 0 auto;
+            padding: 8px 16px;
+            background: #e67e22;
+            color: #fff;
+            font-size: 13px;
+            font-weight: bold;
+            border-radius: 6px;
+        }
+        .archive-btn:hover:not(:disabled) { background: #d35400; }
         .history-grid {
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
@@ -480,7 +497,10 @@ HTML_PAGE = """
     </div>
 
     <div class="history-section" id="historySection">
-        <h2>Today's Generations</h2>
+        <div class="history-header">
+            <h2>Today's Generations</h2>
+            <button type="button" class="archive-btn" id="archiveBtn" style="display: none;">Archive Today</button>
+        </div>
         <div class="history-grid" id="historyGrid"></div>
     </div>
 
@@ -705,6 +725,8 @@ HTML_PAGE = """
 
                 historyGrid.innerHTML = '';
 
+                archiveBtn.style.display = data.images.length > 0 ? 'block' : 'none';
+
                 if (data.images.length === 0) {
                     historyGrid.innerHTML = '<p class="history-empty">No images generated today</p>';
                     return;
@@ -730,6 +752,27 @@ HTML_PAGE = """
                 historyGrid.innerHTML = '<p class="history-empty">Failed to load history</p>';
             }
         }
+
+        // Archive button
+        const archiveBtn = document.getElementById('archiveBtn');
+        archiveBtn.addEventListener('click', async () => {
+            if (!confirm('Move all of today\\'s images to the archive folder?')) return;
+            archiveBtn.disabled = true;
+            archiveBtn.textContent = 'Archiving...';
+            try {
+                const response = await fetch('/archive', { method: 'POST' });
+                const data = await response.json();
+                if (data.success) {
+                    loadHistory();
+                } else {
+                    alert('Archive failed: ' + data.error);
+                }
+            } catch (err) {
+                alert('Archive failed: ' + err.message);
+            }
+            archiveBtn.disabled = false;
+            archiveBtn.textContent = 'Archive Today';
+        });
 
         // Load history on page load
         loadHistory();
@@ -955,6 +998,31 @@ def history():
         print(f"Error reading history: {e}")
 
     return jsonify({'images': images})
+
+
+@app.route('/archive', methods=['POST'])
+def archive_today():
+    """Move today's images and prompt files to the archive folder."""
+    today = datetime.now().strftime("%Y%m%d")
+    archive_dir = os.path.join(OUTPUT_DIR, "archive")
+    os.makedirs(archive_dir, exist_ok=True)
+
+    moved = 0
+    try:
+        for filename in os.listdir(OUTPUT_DIR):
+            # Only process files (not directories)
+            filepath = os.path.join(OUTPUT_DIR, filename)
+            if not os.path.isfile(filepath):
+                continue
+            # Match today's images and their prompt files
+            parts = filename.split('_')
+            if len(parts) >= 3 and parts[1] == today:
+                shutil.move(filepath, os.path.join(archive_dir, filename))
+                moved += 1
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+    return jsonify({'success': True, 'moved': moved})
 
 
 if __name__ == '__main__':
