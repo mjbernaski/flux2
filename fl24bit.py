@@ -576,6 +576,7 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
                     "guidance_scale": guidance_scale,
                     "height": height,
                     "width": width,
+                    "max_sequence_length": 512,
                 }
                 if sigmas is not None:
                     pipe_kwargs["sigmas"] = sigmas
@@ -612,6 +613,7 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
                     generator=torch.Generator(device=device).manual_seed(seed),
                     num_inference_steps=steps,
                     guidance_scale=guidance_scale,
+                    max_sequence_length=512,
                 ).images[0]
                 timings['diffusion'] = time.perf_counter() - t0
                 timings['encoding'] = 0
@@ -625,6 +627,7 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
                 "guidance_scale": guidance_scale,
                 "width": width,
                 "height": height,
+                "max_sequence_length": 512,
             }
             if sigmas is not None:
                 pipe_kwargs["sigmas"] = sigmas
