@@ -298,6 +298,12 @@ HTML_PAGE = """
             color: #666;
             font-size: 12px;
         }
+        .spectrum-option .checkbox-label { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+        .spectrum-option input[type="checkbox"] { width: auto; }
+        .spectrum-hint { color: #666; font-size: 12px; margin-top: 4px; }
+        .composite-card { grid-column: 1 / -1; }
+        .composite-label { font-size: 12px; color: #00d4ff; margin-bottom: 8px; }
+        .composite-img { max-width: 100%; height: auto; }
         #strengthValue {
             color: #00d4ff;
             font-weight: bold;
@@ -413,9 +419,9 @@ HTML_PAGE = """
                     </div>
                 </div>
                 <div class="strength-control" id="strengthControl" style="display: none;">
-                    <label for="strength">Strength: <span id="strengthValue">0.75</span></label>
-                    <input type="range" id="strength" name="strength" min="0" max="1" step="0.05" value="0.75">
-                    <div class="strength-hint">Lower = closer to original, Higher = more change</div>
+                    <label for="strength">Reference following (strength): <span id="strengthValue">0.5</span></label>
+                    <input type="range" id="strength" name="strength" min="0" max="1" step="0.5" value="0.5">
+                    <div class="strength-hint">0 = closest to original, 0.5 = default, 1 = most change</div>
                 </div>
             </div>
         </div>
@@ -460,13 +466,19 @@ HTML_PAGE = """
                 <label for="guidance">Guidance Scale</label>
                 <select id="guidance" name="guidance">
                     <option value="">Auto</option>
-                    <option value="1">1 (high variety)</option>
-                    <option value="2">2</option>
-                    <option value="3">3</option>
-                    <option value="4">4 (default)</option>
-                    <option value="5">5</option>
-                    <option value="6">6</option>
-                    <option value="7">7 (strict)</option>
+                    <option value="1">1.0 (high variety)</option>
+                    <option value="1.5">1.5</option>
+                    <option value="2">2.0</option>
+                    <option value="2.5">2.5</option>
+                    <option value="3">3.0</option>
+                    <option value="3.5">3.5</option>
+                    <option value="4" selected>4.0 (default)</option>
+                    <option value="4.5">4.5</option>
+                    <option value="5">5.0</option>
+                    <option value="5.5">5.5</option>
+                    <option value="6">6.0</option>
+                    <option value="6.5">6.5</option>
+                    <option value="7">7.0 (strict)</option>
                 </select>
             </div>
             <div class="form-group">
@@ -477,6 +489,16 @@ HTML_PAGE = """
                     <option value="3">3 images</option>
                     <option value="4">4 images</option>
                 </select>
+            </div>
+        </div>
+
+        <div class="row">
+            <div class="form-group spectrum-option">
+                <label class="checkbox-label">
+                    <input type="checkbox" id="spectrumGrid" name="spectrum_grid" value="1">
+                    Generate spectrum grid
+                </label>
+                <div class="spectrum-hint" id="spectrumHint">Generates every guidance × reference-following combination (0.5 step) and a matrix composite. Add a reference image to include the strength axis (rows).</div>
             </div>
         </div>
 
@@ -600,9 +622,10 @@ HTML_PAGE = """
             inputImage.value = '';
             uploadPlaceholder.style.display = 'flex';
             imagePreview.style.display = 'none';
-            strengthSlider.value = '0.75';
-            strengthValue.textContent = '0.75';
+            strengthSlider.value = '0.5';
+            strengthValue.textContent = '0.5';
             strengthControl.style.display = 'none';
+            document.getElementById('spectrumGrid').checked = false;
         });
 
         // Cmd+Return (Mac) or Ctrl+Return (Windows/Linux) to submit form
@@ -643,6 +666,7 @@ HTML_PAGE = """
             const guidanceValue = document.getElementById('guidance').value;
             const batch = parseInt(document.getElementById('batch').value);
 
+            const spectrumGrid = document.getElementById('spectrumGrid').checked;
             const formData = {
                 prompt: document.getElementById('prompt').value,
                 orientation: document.getElementById('orientation').value,
@@ -650,7 +674,8 @@ HTML_PAGE = """
                 steps: parseInt(document.getElementById('steps').value),
                 seed: seedValue ? parseInt(seedValue) : null,
                 guidance: guidanceValue ? parseFloat(guidanceValue) : null,
-                batch: batch
+                batch: batch,
+                spectrum_grid: spectrumGrid
             };
 
             // Add reference image and strength if present
@@ -661,7 +686,7 @@ HTML_PAGE = """
 
             submitBtn.disabled = true;
             status.className = 'status generating';
-            statusText.textContent = batch > 1 ? `Generating ${batch} images...` : 'Generating image...';
+            statusText.textContent = spectrumGrid ? 'Generating spectrum grid (all combinations)...' : (batch > 1 ? `Generating ${batch} images...` : 'Generating image...');
             result.className = 'result';
             imageGrid.innerHTML = '';
 
@@ -679,17 +704,30 @@ HTML_PAGE = """
                     result.className = 'result visible';
 
                     const t = Date.now();
+                    if (data.composite_filename) {
+                        const compositeCard = document.createElement('div');
+                        compositeCard.className = 'image-card composite-card';
+                        compositeCard.innerHTML = `
+                            <p class="composite-label">Matrix composite (guidance → columns, reference following → rows)</p>
+                            <img src="/images/${data.composite_filename}?t=${t}" alt="Spectrum grid composite" class="composite-img">
+                            <div class="actions">
+                                <a href="/images/${data.composite_filename}" download="${data.composite_filename}">Download composite</a>
+                            </div>
+                        `;
+                        imageGrid.appendChild(compositeCard);
+                    }
                     data.images.forEach((img, i) => {
                         const card = document.createElement('div');
                         card.className = 'image-card';
                         const timings = img.timings;
+                        const meta = img.guidance != null ? `Guidance: ${img.guidance}${img.strength != null ? ', Strength: ' + img.strength : ''}` : '';
                         card.innerHTML = `
                             <img src="/images/${img.filename}?t=${t}" alt="Generated image ${i+1}">
                             <div class="actions">
                                 <a href="/images/${img.filename}" download="${img.filename}">Download</a>
                                 <a href="#" class="seed-btn" onclick="useSeed(${img.seed}); return false;">Use Seed</a>
                             </div>
-                            <p class="info">Seed: ${img.seed}</p>
+                            <p class="info">${meta ? meta + ' · Seed: ' + img.seed : 'Seed: ' + img.seed}</p>
                             <div class="timings">
                                 <span class="timing-item"><span class="timing-label">Encode:</span> ${timings.encoding}s</span>
                                 <span class="timing-item"><span class="timing-label">Diffuse:</span> ${timings.diffusion}s</span>
@@ -700,7 +738,9 @@ HTML_PAGE = """
                         imageGrid.appendChild(card);
                     });
 
-                    generationInfo.textContent = `Generated ${data.images.length} image(s) in ${data.generation_time.toFixed(1)}s`;
+                    generationInfo.textContent = data.composite_filename
+                        ? `Generated ${data.images.length} images + 1 composite in ${data.generation_time.toFixed(1)}s`
+                        : `Generated ${data.images.length} image(s) in ${data.generation_time.toFixed(1)}s`;
                     // Refresh history after successful generation
                     loadHistory();
                 } else {
@@ -813,7 +853,7 @@ def generate():
 
         # Handle optional input image for img2img
         input_image = None
-        strength = float(data.get('strength', 0.75))
+        strength = float(data.get('strength', 0.5))
         input_image_b64 = data.get('input_image')
         if input_image_b64:
             # Decode base64 image
@@ -841,7 +881,22 @@ def generate():
             base_w, base_h = ORIENTATIONS_1K.get(orientation, ORIENTATIONS_1K['landscape'])
             width, height = int(base_w * scale), int(base_h * scale)
 
-        _current_status = {"generating": True, "prompt": prompt, "batch": batch, "current": 0}
+        spectrum_grid = data.get('spectrum_grid', False)
+
+        # Guidance 1..7 step 0.5; schnell uses 0 only
+        if spectrum_grid and _schnell:
+            guidance_values = [0]
+        else:
+            guidance_values = [round(1 + i * 0.5, 1) for i in range(13)]  # 1.0 .. 7.0
+        # Reference following (strength) 0, 0.5, 1.0 when reference image present
+        strength_values = [0, 0.5, 1.0] if input_image else [None]
+
+        if spectrum_grid:
+            total_combos = len(strength_values) * len(guidance_values)
+            _current_status = {"generating": True, "prompt": prompt, "batch": total_combos, "current": 0}
+            print(f"Spectrum grid: {len(guidance_values)} guidance × {len(strength_values)} strength = {total_combos} images")
+        else:
+            _current_status = {"generating": True, "prompt": prompt, "batch": batch, "current": 0}
 
         img2img_str = f", img2img strength={strength}" if input_image else ""
         guidance_str = f", guidance={guidance_scale}" if guidance_scale else ""
@@ -849,8 +904,75 @@ def generate():
         print(f"Generating: '{prompt}' ({batch}x, {steps} steps{guidance_str}, {size}{orientation_str} {width}x{height}{img2img_str})")
 
         start_time = time.perf_counter()
-
         images_data = []
+        grid_cells = []  # rows (strength) of cols (guidance) - each cell is (filename, Image) for composite
+
+        if spectrum_grid:
+            combo_idx = 0
+            for s_val in strength_values:
+                row_filenames = []
+                row_images = []
+                for g_val in guidance_values:
+                    combo_idx += 1
+                    _current_status["current"] = combo_idx
+                    print(f"  Spectrum {combo_idx}/{total_combos}: guidance={g_val}, strength={s_val}...")
+                    current_seed = (seed + combo_idx) if seed is not None else None
+                    image, used_seed, timings = generate_image(
+                        prompt, seed=current_seed, steps=steps, width=width, height=height,
+                        local_encoder=_local_encoder, input_image=input_image, strength=(s_val if s_val is not None else 0.5),
+                        guidance_scale=g_val
+                    )
+                    t_save = time.perf_counter()
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    unique_id = uuid.uuid4().hex[:8]
+                    g_str = str(g_val).replace('.', '_')
+                    s_str = f"str_{s_val}" if s_val is not None else "txt2img"
+                    output_filename = f"flux{fl24bit._flux_version}_{timestamp}_g{g_str}_{s_str}_{unique_id}.png"
+                    output_path = os.path.join(OUTPUT_DIR, output_filename)
+                    image.save(output_path)
+                    timings['save'] = time.perf_counter() - t_save
+                    save_prompt_file(output_path, prompt, prompt, width, height, used_seed, steps, timings, g_val, s_val if input_image else None)
+                    images_data.append({
+                        'filename': output_filename,
+                        'seed': used_seed,
+                        'guidance': g_val,
+                        'strength': s_val,
+                        'timings': {
+                            'encoding': round(timings['encoding'], 2),
+                            'diffusion': round(timings['diffusion'], 2),
+                            'save': round(timings['save'], 2),
+                            'total': round(timings['encoding'] + timings['diffusion'] + timings['save'], 2)
+                        }
+                    })
+                    row_filenames.append(output_filename)
+                    row_images.append(image.copy())
+                grid_cells.append((row_filenames, row_images))
+
+            # Build matrix composite: rows = strength, cols = guidance
+            cell_size = 256
+            n_rows = len(grid_cells)
+            n_cols = len(grid_cells[0][0])
+            comp_w = n_cols * cell_size
+            comp_h = n_rows * cell_size
+            composite = Image.new('RGB', (comp_w, comp_h), (32, 32, 32))
+            for row_idx, (_, row_images) in enumerate(grid_cells):
+                for col_idx, img in enumerate(row_images):
+                    img_small = img.resize((cell_size, cell_size), Image.Resampling.LANCZOS)
+                    composite.paste(img_small, (col_idx * cell_size, row_idx * cell_size))
+            comp_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            comp_filename = f"flux{fl24bit._flux_version}_{comp_timestamp}_spectrum_grid.png"
+            comp_path = os.path.join(OUTPUT_DIR, comp_filename)
+            composite.save(comp_path)
+            print(f"  Saved composite: {comp_path}")
+            generation_time = time.perf_counter() - start_time
+            _current_status = {"generating": False, "prompt": None}
+            return jsonify({
+                'success': True,
+                'images': images_data,
+                'composite_filename': comp_filename,
+                'generation_time': generation_time
+            })
+
         for i in range(batch):
             _current_status["current"] = i + 1
             print(f"  Image {i+1}/{batch}...")
@@ -875,7 +997,7 @@ def generate():
             timings['save'] = time.perf_counter() - t_save
 
             # Save prompt file alongside image
-            prompt_file = save_prompt_file(output_path, prompt, prompt, width, height, used_seed, steps, timings, guidance_scale)
+            prompt_file = save_prompt_file(output_path, prompt, prompt, width, height, used_seed, steps, timings, guidance_scale, strength if input_image else None)
 
             print(f"  Saved: {output_path} (seed: {used_seed})")
             print(f"  Prompt: {prompt_file}")
