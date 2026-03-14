@@ -3,7 +3,11 @@ import torch
 import os
 import socket
 import logging
+import warnings
 from PIL import Image
+
+# Suppress CLIP tokenizer truncation warning - expected for long prompts since T5 handles full text
+warnings.filterwarnings("ignore", message="Token indices sequence length is longer than the specified maximum sequence length")
 
 # Suppress verbose logging from HTTP and ML libraries
 logging.getLogger("urllib3").setLevel(logging.WARNING)
@@ -549,6 +553,13 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
             steps = 4  # Schnell is optimized for 4 steps txt2img
         guidance_scale = 0  # Always force 0 for schnell
 
+    # Ensure strength won't result in zero pipeline steps for img2img
+    if input_image is not None and strength is not None:
+        min_strength = 1.0 / steps
+        if strength < min_strength:
+            print(f"Warning: strength {strength} too low for {steps} steps (minimum {min_strength:.2f}). Using {min_strength:.2f}.")
+            strength = min_strength
+
     if guidance_scale is None:
         # Turbo uses 2.5, others use 4
         if _turbo_enabled:
@@ -841,8 +852,8 @@ def main():
         if lower_input.startswith('/strength '):
             try:
                 new_strength = float(user_input.split()[1])
-                if new_strength < 0 or new_strength > 1:
-                    print("Strength must be between 0.0 and 1.0.")
+                if new_strength <= 0 or new_strength > 1:
+                    print("Strength must be between 0.01 and 1.0 (0.0 would result in zero pipeline steps).")
                     continue
                 strength = new_strength
                 print(f"Img2img strength set to {strength}")
