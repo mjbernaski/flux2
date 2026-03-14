@@ -8,6 +8,7 @@ import io
 import socket
 import shutil
 from datetime import datetime
+import random
 import uuid
 from flask import Flask, request, jsonify, send_from_directory, Response, stream_with_context
 from PIL import Image
@@ -404,7 +405,7 @@ HTML_PAGE = """
     <h1>FLUX.1 Image Generator</h1>
     <p class="subtitle" id="modelInfo">Loading model info...</p>
 
-    <form id="generateForm" action="#" onsubmit="event.preventDefault(); return false;">
+    <form id="generateForm" action="#">
         <div class="form-group">
             <label for="prompt">Prompt</label>
             <textarea id="prompt" name="prompt" rows="3" placeholder="A majestic mountain landscape at sunset..." required></textarea>
@@ -639,16 +640,14 @@ HTML_PAGE = """
             if (strengthControl) strengthControl.style.display = 'none';
             var sg = document.getElementById('spectrumGrid'); if (sg) sg.checked = false;
         });
-        document.addEventListener('keydown', function(e) {
-            if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
-                e.preventDefault();
-                if (form && submitBtn && !submitBtn.disabled) form.dispatchEvent(new Event('submit', { cancelable: true }));
+        // Generation logic as a standalone function - not dependent on form submit events
+        // This avoids fragility from inline onsubmit handlers or event cancellation
+        async function doGenerate() {
+            if (!submitBtn || !status || !statusText || !result || !imageGrid || !generationInfo) {
+                console.error('doGenerate: missing DOM elements', {submitBtn, status, statusText, result, imageGrid, generationInfo});
+                return;
             }
-        });
-
-        if (form) form.addEventListener('submit', async (e) => {
-            e.preventDefault();
-            if (!submitBtn || !status || !statusText || !result || !imageGrid || !generationInfo) return;
+            if (submitBtn.disabled) return;  // Already generating
 
             const seedEl = document.getElementById('seed');
             const seedValue = seedEl ? seedEl.value.trim() : '';
@@ -719,7 +718,7 @@ HTML_PAGE = """
                         const { value, done } = await reader.read();
                         if (done) break;
                         buffer += decoder.decode(value, { stream: true });
-                        const lines = buffer.split('\n');
+                        const lines = buffer.split("\\n");
                         buffer = lines.pop() || '';
                         for (const line of lines) {
                             if (!line.trim()) continue;
@@ -846,6 +845,25 @@ HTML_PAGE = """
             }
 
             submitBtn.disabled = false;
+        }
+
+        // Wire up all entry points to doGenerate directly
+        // 1. Button click - primary, bypasses form submit entirely
+        if (submitBtn) submitBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            doGenerate();
+        });
+        // 2. Form submit - fallback for browser-native submit (e.g. Enter in text input)
+        if (form) form.addEventListener('submit', function(e) {
+            e.preventDefault();
+            doGenerate();
+        });
+        // 3. Keyboard shortcut
+        document.addEventListener('keydown', function(e) {
+            if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+                e.preventDefault();
+                doGenerate();
+            }
         });
 
         // History section
@@ -889,7 +907,7 @@ HTML_PAGE = """
         // Archive button
         const archiveBtn = document.getElementById('archiveBtn');
         archiveBtn.addEventListener('click', async () => {
-            if (!confirm('Move all of today\\'s images to the archive folder?')) return;
+            if (!confirm("Move all of today's images to the archive folder?")) return;
             archiveBtn.disabled = true;
             archiveBtn.textContent = 'Archiving...';
             try {
@@ -976,11 +994,11 @@ def generate():
 
         spectrum_grid = data.get('spectrum_grid', False)
 
-        # Guidance 1..7 step 0.25; schnell uses 0 only
+        # Guidance 1..7 step 1.0; schnell uses 0 only
         if spectrum_grid and _schnell:
             guidance_values = [0]
         else:
-            guidance_values = [round(1 + i * 0.25, 2) for i in range(25)]  # 1.0 .. 7.0
+            guidance_values = [round(1 + i * 1.0, 2) for i in range(7)]  # 1.0 .. 7.0
         # Reference following (strength) 0..1 step 0.25 when reference image present
         strength_values = [round(i * 0.25, 2) for i in range(5)] if input_image else [None]  # 0, 0.25, 0.5, 0.75, 1.0
 
@@ -1003,6 +1021,7 @@ def generate():
 
             def spectrum_stream():
                 try:
+                    grid_seed = seed if seed is not None else random.randint(0, 2**32 - 1)
                     yield json.dumps({"type": "start", "total": total_combos}) + "\n"
                     grid_cells = []
                     for s_val in strength_values:
@@ -1011,7 +1030,7 @@ def generate():
                             combo_idx = len(grid_cells) * len(guidance_values) + len(row_images) + 1
                             _current_status["current"] = combo_idx
                             print(f"  Spectrum {combo_idx}/{total_combos}: guidance={g_val}, strength={s_val}...")
-                            current_seed = (seed + combo_idx) if seed is not None else None
+                            current_seed = grid_seed
                             image, used_seed, timings = generate_image(
                                 prompt, seed=current_seed, steps=steps, width=width, height=height,
                                 local_encoder=_local_encoder, input_image=input_image, strength=(s_val if s_val is not None else 0.5),
