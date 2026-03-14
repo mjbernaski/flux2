@@ -1,5 +1,6 @@
 import os
 import argparse
+import json
 import threading
 import time
 import base64
@@ -8,7 +9,7 @@ import socket
 import shutil
 from datetime import datetime
 import uuid
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, Response, stream_with_context
 from PIL import Image
 
 # Version number - update this when releasing new versions
@@ -304,6 +305,10 @@ HTML_PAGE = """
         .composite-card { grid-column: 1 / -1; }
         .composite-label { font-size: 12px; color: #00d4ff; margin-bottom: 8px; }
         .composite-img { max-width: 100%; height: auto; }
+        .progress-tracker { margin-top: 10px; }
+        .progress-bar-wrap { height: 8px; background: #333; border-radius: 4px; overflow: hidden; margin-bottom: 6px; }
+        .progress-bar { height: 100%; background: #00d4ff; border-radius: 4px; transition: width 0.2s; }
+        .progress-text { font-size: 13px; color: #888; }
         #strengthValue {
             color: #00d4ff;
             font-weight: bold;
@@ -498,7 +503,7 @@ HTML_PAGE = """
                     <input type="checkbox" id="spectrumGrid" name="spectrum_grid" value="1">
                     Generate spectrum grid
                 </label>
-                <div class="spectrum-hint" id="spectrumHint">Generates every guidance × reference-following combination (0.5 step) and a matrix composite. Add a reference image to include the strength axis (rows).</div>
+                <div class="spectrum-hint" id="spectrumHint">Generates every guidance × reference-following combination (0.25 step) and a matrix composite. Add a reference image to include the strength axis (rows).</div>
             </div>
         </div>
 
@@ -511,6 +516,12 @@ HTML_PAGE = """
     <div class="status" id="status">
         <span class="spinner"></span>
         <span id="statusText">Generating...</span>
+        <div class="progress-tracker" id="progressTracker" style="display: none;">
+            <div class="progress-bar-wrap">
+                <div class="progress-bar" id="progressBar" style="width: 0%;"></div>
+            </div>
+            <span class="progress-text" id="progressText">0 / 0</span>
+        </div>
     </div>
 
     <div class="result" id="result">
@@ -690,6 +701,17 @@ HTML_PAGE = """
             result.className = 'result';
             imageGrid.innerHTML = '';
 
+            const progressTracker = document.getElementById('progressTracker');
+            const progressBar = document.getElementById('progressBar');
+            const progressText = document.getElementById('progressText');
+            if (spectrumGrid) {
+                progressTracker.style.display = 'block';
+                progressBar.style.width = '0%';
+                progressText.textContent = '0 / 0';
+            } else {
+                progressTracker.style.display = 'none';
+            }
+
             try {
                 const response = await fetch('/generate', {
                     method: 'POST',
@@ -697,59 +719,149 @@ HTML_PAGE = """
                     body: JSON.stringify(formData)
                 });
 
-                const data = await response.json();
-
-                if (data.success) {
-                    status.className = 'status';
-                    result.className = 'result visible';
-
-                    const t = Date.now();
-                    if (data.composite_filename) {
-                        const compositeCard = document.createElement('div');
-                        compositeCard.className = 'image-card composite-card';
-                        compositeCard.innerHTML = `
-                            <p class="composite-label">Matrix composite (guidance → columns, reference following → rows)</p>
-                            <img src="/images/${data.composite_filename}?t=${t}" alt="Spectrum grid composite" class="composite-img">
-                            <div class="actions">
-                                <a href="/images/${data.composite_filename}" download="${data.composite_filename}">Download composite</a>
-                            </div>
-                        `;
-                        imageGrid.appendChild(compositeCard);
-                    }
-                    data.images.forEach((img, i) => {
-                        const card = document.createElement('div');
-                        card.className = 'image-card';
-                        const timings = img.timings;
-                        const meta = img.guidance != null ? `Guidance: ${img.guidance}${img.strength != null ? ', Strength: ' + img.strength : ''}` : '';
-                        card.innerHTML = `
-                            <img src="/images/${img.filename}?t=${t}" alt="Generated image ${i+1}">
-                            <div class="actions">
-                                <a href="/images/${img.filename}" download="${img.filename}">Download</a>
-                                <a href="#" class="seed-btn" onclick="useSeed(${img.seed}); return false;">Use Seed</a>
-                            </div>
-                            <p class="info">${meta ? meta + ' · Seed: ' + img.seed : 'Seed: ' + img.seed}</p>
-                            <div class="timings">
-                                <span class="timing-item"><span class="timing-label">Encode:</span> ${timings.encoding}s</span>
-                                <span class="timing-item"><span class="timing-label">Diffuse:</span> ${timings.diffusion}s</span>
-                                <span class="timing-item"><span class="timing-label">Save:</span> ${timings.save}s</span>
-                                <span class="timing-item timing-total"><span class="timing-label">Total:</span> ${timings.total}s</span>
-                            </div>
-                        `;
-                        imageGrid.appendChild(card);
-                    });
-
-                    generationInfo.textContent = data.composite_filename
-                        ? `Generated ${data.images.length} images + 1 composite in ${data.generation_time.toFixed(1)}s`
-                        : `Generated ${data.images.length} image(s) in ${data.generation_time.toFixed(1)}s`;
-                    // Refresh history after successful generation
-                    loadHistory();
-                } else {
+                if (spectrumGrid && !response.ok) {
+                    const errData = await response.json().catch(() => ({}));
                     status.className = 'status error';
-                    statusText.textContent = 'Error: ' + data.error;
+                    statusText.textContent = 'Error: ' + (errData.error || response.statusText);
+                    progressTracker.style.display = 'none';
+                } else if (spectrumGrid && response.ok && response.headers.get('Content-Type')?.includes('ndjson')) {
+                    result.className = 'result visible';
+                    const t = Date.now();
+                    const reader = response.body.getReader();
+                    const decoder = new TextDecoder();
+                    let buffer = '';
+                    let total = 0;
+                    let imageCount = 0;
+                    let generationTime = 0;
+                    let compositeFilename = null;
+                    while (true) {
+                        const { value, done } = await reader.read();
+                        if (done) break;
+                        buffer += decoder.decode(value, { stream: true });
+                        const lines = buffer.split('\n');
+                        buffer = lines.pop() || '';
+                        for (const line of lines) {
+                            if (!line.trim()) continue;
+                            let data;
+                            try { data = JSON.parse(line); } catch (_) { continue; }
+                            if (data.type === 'start') {
+                                total = data.total;
+                                progressText.textContent = `0 / ${total}`;
+                            } else if (data.type === 'image') {
+                                imageCount++;
+                                progressBar.style.width = `${(imageCount / total) * 100}%`;
+                                progressText.textContent = `${imageCount} / ${total}`;
+                                const img = data;
+                                const meta = img.guidance != null ? `Guidance: ${img.guidance}${img.strength != null ? ', Strength: ' + img.strength : ''}` : '';
+                                const card = document.createElement('div');
+                                card.className = 'image-card';
+                                card.innerHTML = `
+                                    <img src="/images/${img.filename}?t=${t}" alt="Generated image ${imageCount}" loading="lazy">
+                                    <div class="actions">
+                                        <a href="/images/${img.filename}" download="${img.filename}">Download</a>
+                                        <a href="#" class="seed-btn" onclick="useSeed(${img.seed}); return false;">Use Seed</a>
+                                    </div>
+                                    <p class="info">${meta ? meta + ' · Seed: ' + img.seed : 'Seed: ' + img.seed}</p>
+                                    <div class="timings">
+                                        <span class="timing-item"><span class="timing-label">Encode:</span> ${img.timings.encoding}s</span>
+                                        <span class="timing-item"><span class="timing-label">Diffuse:</span> ${img.timings.diffusion}s</span>
+                                        <span class="timing-item"><span class="timing-label">Save:</span> ${img.timings.save}s</span>
+                                        <span class="timing-item timing-total"><span class="timing-label">Total:</span> ${img.timings.total}s</span>
+                                    </div>
+                                `;
+                                imageGrid.appendChild(card);
+                            } else if (data.type === 'composite') {
+                                compositeFilename = data.filename;
+                                const compositeCard = document.createElement('div');
+                                compositeCard.className = 'image-card composite-card';
+                                compositeCard.innerHTML = `
+                                    <p class="composite-label">Matrix composite (guidance → columns, reference following → rows)</p>
+                                    <img src="/images/${compositeFilename}?t=${t}" alt="Spectrum grid composite" class="composite-img">
+                                    <div class="actions">
+                                        <a href="/images/${compositeFilename}" download="${compositeFilename}">Download composite</a>
+                                    </div>
+                                `;
+                                imageGrid.insertBefore(compositeCard, imageGrid.firstChild);
+                            } else if (data.type === 'done') {
+                                generationTime = data.generation_time;
+                                status.className = 'status';
+                                progressTracker.style.display = 'none';
+                                generationInfo.textContent = compositeFilename
+                                    ? `Generated ${imageCount} images + 1 composite in ${generationTime.toFixed(1)}s`
+                                    : `Generated ${imageCount} image(s) in ${generationTime.toFixed(1)}s`;
+                                loadHistory();
+                            } else if (data.type === 'error') {
+                                status.className = 'status error';
+                                statusText.textContent = 'Error: ' + data.error;
+                                progressTracker.style.display = 'none';
+                            }
+                        }
+                    }
+                    if (buffer.trim()) {
+                        try {
+                            const data = JSON.parse(buffer);
+                            if (data.type === 'error') {
+                                status.className = 'status error';
+                                statusText.textContent = 'Error: ' + data.error;
+                            }
+                        } catch (_) {}
+                    }
+                } else {
+                    const data = await response.json();
+                    if (data.success) {
+                        status.className = 'status';
+                        result.className = 'result visible';
+                        progressTracker.style.display = 'none';
+
+                        const t = Date.now();
+                        if (data.composite_filename) {
+                            const compositeCard = document.createElement('div');
+                            compositeCard.className = 'image-card composite-card';
+                            compositeCard.innerHTML = `
+                                <p class="composite-label">Matrix composite (guidance → columns, reference following → rows)</p>
+                                <img src="/images/${data.composite_filename}?t=${t}" alt="Spectrum grid composite" class="composite-img">
+                                <div class="actions">
+                                    <a href="/images/${data.composite_filename}" download="${data.composite_filename}">Download composite</a>
+                                </div>
+                            `;
+                            imageGrid.appendChild(compositeCard);
+                        }
+                        data.images.forEach((img, i) => {
+                            const card = document.createElement('div');
+                            card.className = 'image-card';
+                            const timings = img.timings;
+                            const meta = img.guidance != null ? `Guidance: ${img.guidance}${img.strength != null ? ', Strength: ' + img.strength : ''}` : '';
+                            card.innerHTML = `
+                                <img src="/images/${img.filename}?t=${t}" alt="Generated image ${i+1}">
+                                <div class="actions">
+                                    <a href="/images/${img.filename}" download="${img.filename}">Download</a>
+                                    <a href="#" class="seed-btn" onclick="useSeed(${img.seed}); return false;">Use Seed</a>
+                                </div>
+                                <p class="info">${meta ? meta + ' · Seed: ' + img.seed : 'Seed: ' + img.seed}</p>
+                                <div class="timings">
+                                    <span class="timing-item"><span class="timing-label">Encode:</span> ${timings.encoding}s</span>
+                                    <span class="timing-item"><span class="timing-label">Diffuse:</span> ${timings.diffusion}s</span>
+                                    <span class="timing-item"><span class="timing-label">Save:</span> ${timings.save}s</span>
+                                    <span class="timing-item timing-total"><span class="timing-label">Total:</span> ${timings.total}s</span>
+                                </div>
+                            `;
+                            imageGrid.appendChild(card);
+                        });
+
+                        generationInfo.textContent = data.composite_filename
+                            ? `Generated ${data.images.length} images + 1 composite in ${data.generation_time.toFixed(1)}s`
+                            : `Generated ${data.images.length} image(s) in ${data.generation_time.toFixed(1)}s`;
+                        loadHistory();
+                    } else {
+                        status.className = 'status error';
+                        statusText.textContent = 'Error: ' + data.error;
+                        progressTracker.style.display = 'none';
+                    }
                 }
             } catch (err) {
                 status.className = 'status error';
                 statusText.textContent = 'Error: ' + err.message;
+                progressTracker.style.display = 'none';
             }
 
             submitBtn.disabled = false;
@@ -883,13 +995,13 @@ def generate():
 
         spectrum_grid = data.get('spectrum_grid', False)
 
-        # Guidance 1..7 step 0.5; schnell uses 0 only
+        # Guidance 1..7 step 0.25; schnell uses 0 only
         if spectrum_grid and _schnell:
             guidance_values = [0]
         else:
-            guidance_values = [round(1 + i * 0.5, 1) for i in range(13)]  # 1.0 .. 7.0
-        # Reference following (strength) 0, 0.5, 1.0 when reference image present
-        strength_values = [0, 0.5, 1.0] if input_image else [None]
+            guidance_values = [round(1 + i * 0.25, 2) for i in range(25)]  # 1.0 .. 7.0
+        # Reference following (strength) 0..1 step 0.25 when reference image present
+        strength_values = [round(i * 0.25, 2) for i in range(5)] if input_image else [None]  # 0, 0.25, 0.5, 0.75, 1.0
 
         if spectrum_grid:
             total_combos = len(strength_values) * len(guidance_values)
@@ -904,75 +1016,85 @@ def generate():
         print(f"Generating: '{prompt}' ({batch}x, {steps} steps{guidance_str}, {size}{orientation_str} {width}x{height}{img2img_str})")
 
         start_time = time.perf_counter()
-        images_data = []
-        grid_cells = []  # rows (strength) of cols (guidance) - each cell is (filename, Image) for composite
 
         if spectrum_grid:
-            combo_idx = 0
-            for s_val in strength_values:
-                row_filenames = []
-                row_images = []
-                for g_val in guidance_values:
-                    combo_idx += 1
-                    _current_status["current"] = combo_idx
-                    print(f"  Spectrum {combo_idx}/{total_combos}: guidance={g_val}, strength={s_val}...")
-                    current_seed = (seed + combo_idx) if seed is not None else None
-                    image, used_seed, timings = generate_image(
-                        prompt, seed=current_seed, steps=steps, width=width, height=height,
-                        local_encoder=_local_encoder, input_image=input_image, strength=(s_val if s_val is not None else 0.5),
-                        guidance_scale=g_val
-                    )
-                    t_save = time.perf_counter()
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    unique_id = uuid.uuid4().hex[:8]
-                    g_str = str(g_val).replace('.', '_')
-                    s_str = f"str_{s_val}" if s_val is not None else "txt2img"
-                    output_filename = f"flux{fl24bit._flux_version}_{timestamp}_g{g_str}_{s_str}_{unique_id}.png"
-                    output_path = os.path.join(OUTPUT_DIR, output_filename)
-                    image.save(output_path)
-                    timings['save'] = time.perf_counter() - t_save
-                    save_prompt_file(output_path, prompt, prompt, width, height, used_seed, steps, timings, g_val, s_val if input_image else None)
-                    images_data.append({
-                        'filename': output_filename,
-                        'seed': used_seed,
-                        'guidance': g_val,
-                        'strength': s_val,
-                        'timings': {
-                            'encoding': round(timings['encoding'], 2),
-                            'diffusion': round(timings['diffusion'], 2),
-                            'save': round(timings['save'], 2),
-                            'total': round(timings['encoding'] + timings['diffusion'] + timings['save'], 2)
-                        }
-                    })
-                    row_filenames.append(output_filename)
-                    row_images.append(image.copy())
-                grid_cells.append((row_filenames, row_images))
+            total_combos = len(strength_values) * len(guidance_values)
 
-            # Build matrix composite: rows = strength, cols = guidance
-            cell_size = 256
-            n_rows = len(grid_cells)
-            n_cols = len(grid_cells[0][0])
-            comp_w = n_cols * cell_size
-            comp_h = n_rows * cell_size
-            composite = Image.new('RGB', (comp_w, comp_h), (32, 32, 32))
-            for row_idx, (_, row_images) in enumerate(grid_cells):
-                for col_idx, img in enumerate(row_images):
-                    img_small = img.resize((cell_size, cell_size), Image.Resampling.LANCZOS)
-                    composite.paste(img_small, (col_idx * cell_size, row_idx * cell_size))
-            comp_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            comp_filename = f"flux{fl24bit._flux_version}_{comp_timestamp}_spectrum_grid.png"
-            comp_path = os.path.join(OUTPUT_DIR, comp_filename)
-            composite.save(comp_path)
-            print(f"  Saved composite: {comp_path}")
-            generation_time = time.perf_counter() - start_time
-            _current_status = {"generating": False, "prompt": None}
-            return jsonify({
-                'success': True,
-                'images': images_data,
-                'composite_filename': comp_filename,
-                'generation_time': generation_time
-            })
+            def spectrum_stream():
+                try:
+                    yield json.dumps({"type": "start", "total": total_combos}) + "\n"
+                    grid_cells = []
+                    for s_val in strength_values:
+                        row_images = []
+                        for g_val in guidance_values:
+                            combo_idx = len(grid_cells) * len(guidance_values) + len(row_images) + 1
+                            _current_status["current"] = combo_idx
+                            print(f"  Spectrum {combo_idx}/{total_combos}: guidance={g_val}, strength={s_val}...")
+                            current_seed = (seed + combo_idx) if seed is not None else None
+                            image, used_seed, timings = generate_image(
+                                prompt, seed=current_seed, steps=steps, width=width, height=height,
+                                local_encoder=_local_encoder, input_image=input_image, strength=(s_val if s_val is not None else 0.5),
+                                guidance_scale=g_val
+                            )
+                            t_save = time.perf_counter()
+                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            unique_id = uuid.uuid4().hex[:8]
+                            g_str = str(g_val).replace('.', '_')
+                            s_str = f"str_{s_val}" if s_val is not None else "txt2img"
+                            output_filename = f"flux{fl24bit._flux_version}_{timestamp}_g{g_str}_{s_str}_{unique_id}.png"
+                            output_path = os.path.join(OUTPUT_DIR, output_filename)
+                            image.save(output_path)
+                            timings['save'] = time.perf_counter() - t_save
+                            save_prompt_file(output_path, prompt, prompt, width, height, used_seed, steps, timings, g_val, s_val if input_image else None)
+                            timings_round = {
+                                'encoding': round(timings['encoding'], 2),
+                                'diffusion': round(timings['diffusion'], 2),
+                                'save': round(timings['save'], 2),
+                                'total': round(timings['encoding'] + timings['diffusion'] + timings['save'], 2)
+                            }
+                            yield json.dumps({
+                                "type": "image",
+                                "filename": output_filename,
+                                "seed": used_seed,
+                                "guidance": g_val,
+                                "strength": s_val,
+                                "current": combo_idx,
+                                "timings": timings_round
+                            }) + "\n"
+                            row_images.append(image.copy())
+                        grid_cells.append(row_images)
 
+                    cell_size = 256
+                    n_rows = len(grid_cells)
+                    n_cols = len(grid_cells[0])
+                    comp_w = n_cols * cell_size
+                    comp_h = n_rows * cell_size
+                    composite = Image.new('RGB', (comp_w, comp_h), (32, 32, 32))
+                    for row_idx, row_images in enumerate(grid_cells):
+                        for col_idx, img in enumerate(row_images):
+                            img_small = img.resize((cell_size, cell_size), Image.Resampling.LANCZOS)
+                            composite.paste(img_small, (col_idx * cell_size, row_idx * cell_size))
+                    comp_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    comp_filename = f"flux{fl24bit._flux_version}_{comp_timestamp}_spectrum_grid.png"
+                    comp_path = os.path.join(OUTPUT_DIR, comp_filename)
+                    composite.save(comp_path)
+                    print(f"  Saved composite: {comp_path}")
+                    generation_time = time.perf_counter() - start_time
+                    yield json.dumps({"type": "composite", "filename": comp_filename}) + "\n"
+                    yield json.dumps({"type": "done", "generation_time": generation_time, "success": True}) + "\n"
+                except Exception as e:
+                    yield json.dumps({"type": "error", "error": str(e), "success": False}) + "\n"
+                finally:
+                    _current_status["generating"] = False
+                    _current_status["prompt"] = None
+
+            return Response(
+                stream_with_context(spectrum_stream()),
+                mimetype='application/x-ndjson',
+                headers={'X-Content-Type-Options': 'nosniff'}
+            )
+
+        images_data = []
         for i in range(batch):
             _current_status["current"] = i + 1
             print(f"  Image {i+1}/{batch}...")
