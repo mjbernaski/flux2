@@ -404,7 +404,7 @@ HTML_PAGE = """
     <h1>FLUX.1 Image Generator</h1>
     <p class="subtitle" id="modelInfo">Loading model info...</p>
 
-    <form id="generateForm">
+    <form id="generateForm" action="#" onsubmit="event.preventDefault(); return false;">
         <div class="form-group">
             <label for="prompt">Prompt</label>
             <textarea id="prompt" name="prompt" rows="3" placeholder="A majestic mountain landscape at sunset..." required></textarea>
@@ -538,6 +538,30 @@ HTML_PAGE = """
     </div>
 
     <script>
+        // Run model-info fetch first, before any other code that might throw (so UI always updates)
+        (function() {
+            var el = document.getElementById('modelInfo');
+            if (!el) return;
+            var timeout = setTimeout(function() {
+                if (el.textContent === 'Loading model info...') el.textContent = 'Model info unavailable (use server URL, e.g. http://localhost:2222)';
+            }, 5000);
+            var ac = new AbortController();
+            setTimeout(function() { ac.abort(); }, 8000);
+            fetch('/model-info', { signal: ac.signal })
+                .then(function(r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+                .then(function(data) {
+                    clearTimeout(timeout);
+                    el.textContent = data.description || 'FLUX Image Generator';
+                    var h = document.getElementById('hostname'); if (h) h.textContent = data.hostname || '';
+                    var v = document.getElementById('version'); if (v) v.textContent = 'v' + (data.version || '');
+                    if (data.schnell) {
+                        var s = document.getElementById('steps'); if (s) { s.disabled = true; s.title = 'Schnell uses fixed 4 steps'; }
+                        var g = document.getElementById('guidance'); if (g) { g.disabled = true; g.title = 'Schnell requires guidance_scale=0'; }
+                    }
+                })
+                .catch(function() { clearTimeout(timeout); el.textContent = 'Model info unavailable (use server URL, e.g. http://localhost:2222)'; });
+        })();
+
         const form = document.getElementById('generateForm');
         const submitBtn = document.getElementById('submitBtn');
         const status = document.getElementById('status');
@@ -546,7 +570,6 @@ HTML_PAGE = """
         const imageGrid = document.getElementById('imageGrid');
         const generationInfo = document.getElementById('generationInfo');
 
-        // Image upload elements
         const uploadArea = document.getElementById('uploadArea');
         const inputImage = document.getElementById('inputImage');
         const uploadPlaceholder = document.getElementById('uploadPlaceholder');
@@ -559,145 +582,103 @@ HTML_PAGE = """
         const strengthSlider = document.getElementById('strength');
         const strengthValue = document.getElementById('strengthValue');
 
-        // Update strength display when slider changes
-        strengthSlider.addEventListener('input', () => {
-            strengthValue.textContent = strengthSlider.value;
-        });
+        if (strengthSlider) strengthSlider.addEventListener('input', function() { if (strengthValue) strengthValue.textContent = strengthSlider.value; });
 
         function useSeed(seed) {
-            document.getElementById('seed').value = seed;
+            var el = document.getElementById('seed'); if (el) el.value = seed;
         }
 
-        // Image upload handling
-        uploadArea.addEventListener('click', () => inputImage.click());
-
-        uploadArea.addEventListener('dragover', (e) => {
-            e.preventDefault();
-            uploadArea.classList.add('dragover');
-        });
-
-        uploadArea.addEventListener('dragleave', () => {
-            uploadArea.classList.remove('dragover');
-        });
-
-        uploadArea.addEventListener('drop', (e) => {
-            e.preventDefault();
-            uploadArea.classList.remove('dragover');
-            const file = e.dataTransfer.files[0];
-            if (file && file.type.startsWith('image/')) {
-                handleImageFile(file);
-            }
-        });
-
-        inputImage.addEventListener('change', (e) => {
-            const file = e.target.files[0];
-            if (file) {
-                handleImageFile(file);
-            }
-        });
-
         function handleImageFile(file) {
-            const reader = new FileReader();
-            reader.onload = (e) => {
+            var reader = new FileReader();
+            reader.onload = function(e) {
                 currentInputImage = e.target.result;
-                previewImg.src = currentInputImage;
-                uploadPlaceholder.style.display = 'none';
-                imagePreview.style.display = 'block';
-                strengthControl.style.display = 'flex';
+                if (previewImg) previewImg.src = currentInputImage;
+                if (uploadPlaceholder) uploadPlaceholder.style.display = 'none';
+                if (imagePreview) imagePreview.style.display = 'block';
+                if (strengthControl) strengthControl.style.display = 'flex';
             };
             reader.readAsDataURL(file);
         }
-
-        clearImage.addEventListener('click', (e) => {
+        if (uploadArea) {
+            uploadArea.addEventListener('click', function() { if (inputImage) inputImage.click(); });
+            uploadArea.addEventListener('dragover', function(e) { e.preventDefault(); uploadArea.classList.add('dragover'); });
+            uploadArea.addEventListener('dragleave', function() { uploadArea.classList.remove('dragover'); });
+            uploadArea.addEventListener('drop', function(e) {
+                e.preventDefault();
+                uploadArea.classList.remove('dragover');
+                var file = e.dataTransfer.files[0];
+                if (file && file.type.indexOf('image/') === 0) handleImageFile(file);
+            });
+        }
+        if (inputImage) inputImage.addEventListener('change', function(e) { var f = e.target.files[0]; if (f) handleImageFile(f); });
+        if (clearImage) clearImage.addEventListener('click', function(e) {
             e.stopPropagation();
             currentInputImage = null;
-            previewImg.src = '';
-            inputImage.value = '';
-            uploadPlaceholder.style.display = 'flex';
-            imagePreview.style.display = 'none';
-            strengthControl.style.display = 'none';
+            if (previewImg) previewImg.src = '';
+            if (inputImage) inputImage.value = '';
+            if (uploadPlaceholder) uploadPlaceholder.style.display = 'flex';
+            if (imagePreview) imagePreview.style.display = 'none';
+            if (strengthControl) strengthControl.style.display = 'none';
         });
-
-        // Reset button - clears all fields to defaults
-        document.getElementById('resetBtn').addEventListener('click', () => {
-            document.getElementById('prompt').value = '';
-            document.getElementById('orientation').value = 'square';
-            document.getElementById('size').value = '1mp';
-            document.getElementById('steps').value = '25';
-            document.getElementById('seed').value = '';
-            document.getElementById('guidance').value = '';
-            document.getElementById('batch').value = '1';
-            // Clear input image and reset strength
+        var resetBtn = document.getElementById('resetBtn');
+        if (resetBtn) resetBtn.addEventListener('click', function() {
+            var p = document.getElementById('prompt'); if (p) p.value = '';
+            var o = document.getElementById('orientation'); if (o) o.value = 'square';
+            var s = document.getElementById('size'); if (s) s.value = '1mp';
+            var st = document.getElementById('steps'); if (st) st.value = '25';
+            var sd = document.getElementById('seed'); if (sd) sd.value = '';
+            var gu = document.getElementById('guidance'); if (gu) gu.value = '';
+            var b = document.getElementById('batch'); if (b) b.value = '1';
             currentInputImage = null;
-            previewImg.src = '';
-            inputImage.value = '';
-            uploadPlaceholder.style.display = 'flex';
-            imagePreview.style.display = 'none';
-            strengthSlider.value = '0.5';
-            strengthValue.textContent = '0.5';
-            strengthControl.style.display = 'none';
-            document.getElementById('spectrumGrid').checked = false;
+            if (previewImg) previewImg.src = '';
+            if (inputImage) inputImage.value = '';
+            if (uploadPlaceholder) uploadPlaceholder.style.display = 'flex';
+            if (imagePreview) imagePreview.style.display = 'none';
+            if (strengthSlider) strengthSlider.value = '0.5';
+            if (strengthValue) strengthValue.textContent = '0.5';
+            if (strengthControl) strengthControl.style.display = 'none';
+            var sg = document.getElementById('spectrumGrid'); if (sg) sg.checked = false;
         });
-
-        // Cmd+Return (Mac) or Ctrl+Return (Windows/Linux) to submit form
-        document.addEventListener('keydown', (e) => {
+        document.addEventListener('keydown', function(e) {
             if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
                 e.preventDefault();
-                if (!submitBtn.disabled) {
-                    form.dispatchEvent(new Event('submit', { cancelable: true }));
-                }
+                if (form && submitBtn && !submitBtn.disabled) form.dispatchEvent(new Event('submit', { cancelable: true }));
             }
         });
 
-        // Fetch and display model info on page load
-        fetch('/model-info')
-            .then(r => r.json())
-            .then(data => {
-                document.getElementById('hostname').textContent = data.hostname;
-                document.getElementById('version').textContent = 'v' + data.version;
-                document.getElementById('modelInfo').textContent = data.description;
-                // Disable steps and guidance for schnell mode (fixed at 4 steps, guidance=0)
-                if (data.schnell) {
-                    const stepsSelect = document.getElementById('steps');
-                    const guidanceSelect = document.getElementById('guidance');
-                    stepsSelect.disabled = true;
-                    stepsSelect.title = 'Schnell uses fixed 4 steps (8 for img2img)';
-                    guidanceSelect.disabled = true;
-                    guidanceSelect.title = 'Schnell requires guidance_scale=0';
-                }
-            })
-            .catch(() => {
-                document.getElementById('modelInfo').textContent = 'FLUX.1 Image Generator';
-            });
-
-        form.addEventListener('submit', async (e) => {
+        if (form) form.addEventListener('submit', async (e) => {
             e.preventDefault();
+            if (!submitBtn || !status || !statusText || !result || !imageGrid || !generationInfo) return;
 
-            const seedValue = document.getElementById('seed').value.trim();
-            const guidanceValue = document.getElementById('guidance').value;
-            const batch = parseInt(document.getElementById('batch').value);
+            const seedEl = document.getElementById('seed');
+            const seedValue = seedEl ? seedEl.value.trim() : '';
 
-            const spectrumGrid = document.getElementById('spectrumGrid').checked;
+            const promptEl = document.getElementById('prompt');
+            const guidanceEl = document.getElementById('guidance');
+            const batchEl = document.getElementById('batch');
+            const orientationEl = document.getElementById('orientation');
+            const sizeEl = document.getElementById('size');
+            const stepsEl = document.getElementById('steps');
+            const spectrumGridEl = document.getElementById('spectrumGrid');
+            const spectrumGrid = spectrumGridEl ? spectrumGridEl.checked : false;
             const formData = {
-                prompt: document.getElementById('prompt').value,
-                orientation: document.getElementById('orientation').value,
-                size: document.getElementById('size').value,
-                steps: parseInt(document.getElementById('steps').value),
-                seed: seedValue ? parseInt(seedValue) : null,
-                guidance: guidanceValue ? parseFloat(guidanceValue) : null,
-                batch: batch,
+                prompt: promptEl ? promptEl.value : '',
+                orientation: orientationEl ? orientationEl.value : 'square',
+                size: sizeEl ? sizeEl.value : '1mp',
+                steps: stepsEl ? parseInt(stepsEl.value, 10) : 25,
+                seed: seedValue ? parseInt(seedValue, 10) : null,
+                guidance: guidanceEl && guidanceEl.value ? parseFloat(guidanceEl.value) : null,
+                batch: batchEl ? parseInt(batchEl.value, 10) : 1,
                 spectrum_grid: spectrumGrid
             };
-
-            // Add reference image and strength if present
-            if (currentInputImage) {
+            if (currentInputImage && strengthSlider) {
                 formData.input_image = currentInputImage;
-                formData.strength = parseFloat(strengthSlider.value);
+                formData.strength = parseFloat(strengthSlider.value, 10);
             }
 
             submitBtn.disabled = true;
             status.className = 'status generating';
-            statusText.textContent = spectrumGrid ? 'Generating spectrum grid (all combinations)...' : (batch > 1 ? `Generating ${batch} images...` : 'Generating image...');
+            statusText.textContent = spectrumGrid ? 'Generating spectrum grid (all combinations)...' : (formData.batch > 1 ? 'Generating ' + formData.batch + ' images...' : 'Generating image...');
             result.className = 'result';
             imageGrid.innerHTML = '';
 
