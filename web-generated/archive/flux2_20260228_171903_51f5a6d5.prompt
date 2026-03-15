@@ -1,0 +1,7 @@
+# Raw input: "it was the best of times, it was the worst of times"
+# Prompt: "it was the best of times, it was the worst of times"
+# Dimensions: 1320x760
+# Seed: 92845152
+# Steps: 25
+# Guidance: auto
+# Timings: encoding=0.00s, diffusion=90.97s, save=0.25s

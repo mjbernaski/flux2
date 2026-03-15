@@ -1,0 +1,7 @@
+# Raw input: His boots were under the table.
+# Prompt: His boots were under the table.
+# Dimensions: 1024x1024
+# Seed: 3846705901
+# Steps: 25
+# Guidance: auto
+# Timings: encoding=0.00s, diffusion=55.74s, save=0.24s

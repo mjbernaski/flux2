@@ -49,3 +49,5 @@ wheels/
 # OS
 .DS_Store
 Thumbs.db
+nohup.out
+nohup.out

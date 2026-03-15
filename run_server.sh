@@ -49,6 +49,7 @@ show_menu() {
     echo -e "${CYAN}║${NC}    ${GREEN}5)${NC} FLUX.2 4-bit BNB      (Low VRAM, local encoder)       ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}    ${GREEN}6)${NC} FLUX.2 Full           (High VRAM, best quality)       ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}    ${GREEN}7)${NC} FLUX.2 Full + Turbo   (8-step fast inference)         ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}    ${GREEN}9)${NC} FLUX.2 Full (no Turbo) (Max quality, slower)          ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}                                                              ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}    ${RED}q)${NC} Quit                                                  ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}                                                              ${CYAN}║${NC}"
@@ -100,6 +101,10 @@ start_server() {
         8)
             args="--uncensored"
             desc="FLUX.1 + Uncensored LoRA"
+            ;;
+        9)
+            args="--flux2 --full-model --no-turbo"
+            desc="FLUX.2 Full (no Turbo)"
             ;;
         *)
             echo -e "${RED}Invalid selection${NC}"
@@ -181,18 +186,18 @@ start_server() {
 # Main loop
 main() {
     # Check if a number was passed as argument
-    if [ -n "$1" ] && [[ "$1" =~ ^[1-8]$ ]]; then
+    if [ -n "$1" ] && [[ "$1" =~ ^[1-9]$ ]]; then
         start_server "$@"
         exit $?
     fi
 
     while true; do
         show_menu
-        echo -ne "${CYAN}Select configuration [1-8, q to quit]: ${NC}"
+        echo -ne "${CYAN}Select configuration [1-9, q to quit]: ${NC}"
         read -r choice
 
         case $choice in
-            [1-8])
+            [1-9])
                 start_server "$choice"
                 exit $?
                 ;;

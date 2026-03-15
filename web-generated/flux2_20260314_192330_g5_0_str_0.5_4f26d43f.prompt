@@ -1,0 +1,8 @@
+# Raw input: X-ray
+# Prompt: X-ray
+# Dimensions: 992x568
+# Seed: 4083009389
+# Steps: 10
+# Guidance: 5.0
+# Strength: 0.5 (img2img)
+# Timings: encoding=0.00s, diffusion=119.62s, save=0.34s
