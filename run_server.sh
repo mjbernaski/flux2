@@ -65,6 +65,7 @@ start_server() {
     local desc=""
     local max_retries=5
     local retry_delay=3
+    local log_file="server.log"
 
     case $config in
         1)
@@ -116,6 +117,7 @@ start_server() {
     echo -e "${GREEN}Starting ${desc}...${NC}"
     echo -e "${BLUE}Command: python web_server.py $args${NC}"
     echo -e "${YELLOW}Auto-restart enabled (max $max_retries retries on failure)${NC}"
+    echo -e "${CYAN}Logging to: $log_file${NC}"
     echo ""
 
     kill_existing_server
@@ -129,47 +131,62 @@ start_server() {
     local attempt=0
     while true; do
         attempt=$((attempt + 1))
+        local start_time=$(date +%s)
 
         if [ $attempt -gt 1 ]; then
-            echo ""
-            echo -e "${YELLOW}═══════════════════════════════════════════════════════════${NC}"
-            echo -e "${YELLOW}Restart attempt $attempt of $max_retries${NC}"
-            echo -e "${YELLOW}═══════════════════════════════════════════════════════════${NC}"
-            echo ""
+            echo "" | tee -a "$log_file"
+            echo -e "${YELLOW}═══════════════════════════════════════════════════════════${NC}" | tee -a "$log_file"
+            echo -e "${YELLOW}[$(date '+%Y-%m-%d %H:%M:%S')] Restart attempt $attempt of $max_retries${NC}" | tee -a "$log_file"
+            echo -e "${YELLOW}═══════════════════════════════════════════════════════════${NC}" | tee -a "$log_file"
+            echo "" | tee -a "$log_file"
+        else
+            echo -e "${GREEN}[$(date '+%Y-%m-%d %H:%M:%S')] Initial server start${NC}" | tee -a "$log_file"
         fi
 
-        # Run the server
-        python web_server.py $args "$@"
-        exit_code=$?
+        # Run the server and append output to log
+        # We use 'tee -a' for the script's own messages, but we want the python output 
+        # to go to the log file. We also want to see it in the terminal.
+        python web_server.py $args "$@" 2>&1 | tee -a "$log_file"
+        exit_code=${PIPESTATUS[0]}
+
+        local end_time=$(date +%s)
+        local duration=$((end_time - start_time))
 
         # Check exit code
         if [ $exit_code -eq 0 ]; then
             # Clean exit (user requested shutdown)
-            echo -e "${GREEN}Server exited cleanly.${NC}"
+            echo -e "${GREEN}[$(date '+%Y-%m-%d %H:%M:%S')] Server exited cleanly.${NC}" | tee -a "$log_file"
             break
         elif [ $exit_code -eq 130 ]; then
             # SIGINT (Ctrl+C) - user requested stop
-            echo -e "${YELLOW}Server stopped by user (Ctrl+C).${NC}"
+            echo -e "${YELLOW}[$(date '+%Y-%m-%d %H:%M:%S')] Server stopped by user (Ctrl+C).${NC}" | tee -a "$log_file"
             break
         else
             # Process failed (includes exit code 137 from OOM killer)
-            echo ""
-            echo -e "${RED}╔══════════════════════════════════════════════════════════════╗${NC}"
+            echo "" | tee -a "$log_file"
+            echo -e "${RED}╔══════════════════════════════════════════════════════════════╗${NC}" | tee -a "$log_file"
             if [ $exit_code -eq 137 ]; then
-                echo -e "${RED}║  Server was killed (exit 137 - likely OOM)${NC}"
+                echo -e "${RED}║  [$(date '+%Y-%m-%d %H:%M:%S')] Server was killed (exit 137 - likely OOM)${NC}" | tee -a "$log_file"
             else
-                echo -e "${RED}║  Server crashed with exit code $exit_code${NC}"
+                echo -e "${RED}║  [$(date '+%Y-%m-%d %H:%M:%S')] Server crashed with exit code $exit_code${NC}" | tee -a "$log_file"
             fi
 
-            if [ $attempt -ge $max_retries ]; then
-                echo -e "${RED}║  Maximum retries ($max_retries) reached. Giving up.${NC}"
-                echo -e "${RED}╚══════════════════════════════════════════════════════════════╝${NC}"
+            # If the server was running for more than 60 seconds, reset the attempt counter
+            if [ $duration -gt 60 ]; then
+                echo -e "${GREEN}║  Server ran for $duration seconds. Resetting retry counter.${NC}" | tee -a "$log_file"
+                attempt=0
+            fi
+
+            if [ $attempt -ge $max_retries ] && [ $attempt -ne 0 ]; then
+                echo -e "${RED}║  Maximum retries ($max_retries) reached. Giving up.${NC}" | tee -a "$log_file"
+                echo -e "${RED}╚══════════════════════════════════════════════════════════════╝${NC}" | tee -a "$log_file"
                 return 1
             fi
 
-            echo -e "${RED}║  Restarting in $retry_delay seconds... (attempt $((attempt+1))/$max_retries)${NC}"
-            echo -e "${RED}║  Press Ctrl+C to abort restart${NC}"
-            echo -e "${RED}╚══════════════════════════════════════════════════════════════╝${NC}"
+            local next_attempt=$((attempt + 1))
+            echo -e "${RED}║  Restarting in $retry_delay seconds... (attempt $next_attempt/$max_retries)${NC}" | tee -a "$log_file"
+            echo -e "${RED}║  Press Ctrl+C to abort restart${NC}" | tee -a "$log_file"
+            echo -e "${RED}╚══════════════════════════════════════════════════════════════╝${NC}" | tee -a "$log_file"
 
             # Wait with countdown, allowing Ctrl+C to cancel
             for i in $(seq $retry_delay -1 1); do

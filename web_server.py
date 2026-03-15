@@ -14,13 +14,33 @@ from flask import Flask, request, jsonify, send_from_directory, Response, stream
 from PIL import Image
 
 # Version number - update this when releasing new versions
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 # Import model components from fl24bit
 import fl24bit
 from fl24bit import load_model, generate_image, device, save_prompt_file, load_turbo_lora, load_uncensored_lora
 
 app = Flask(__name__)
+
+# Security: Load API key from environment if it exists
+API_KEY = os.environ.get("FLUX_API_KEY")
+
+def check_auth():
+    if not API_KEY:
+        return True
+    
+    # Check header or query param
+    provided_key = request.headers.get("X-API-Key") or request.args.get("api_key")
+    return provided_key == API_KEY
+
+@app.before_request
+def require_auth():
+    # Allow the main page to load, but it will need the key for API calls
+    if request.endpoint == 'index' or request.endpoint == 'static':
+        return
+        
+    if not check_auth():
+        return jsonify({"success": False, "error": "Unauthorized. Please provide a valid X-API-Key header."}), 401
 
 # Will be set by command-line args
 _local_encoder = False
@@ -405,6 +425,39 @@ HTML_PAGE = """
             text-align: center;
             padding: 20px;
         }
+
+        /* Security CSS */
+        .security-section {
+            margin-bottom: 20px;
+            padding: 15px;
+            background: #2d2d44;
+            border-radius: 8px;
+            border: 1px solid #3d3d5c;
+        }
+        .security-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            cursor: pointer;
+        }
+        .security-title {
+            color: #00d4ff;
+            font-size: 14px;
+            font-weight: bold;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        #apiKeyInput {
+            margin-top: 10px;
+            padding: 8px;
+            font-size: 14px;
+            background: #16213e;
+            border: 1px solid #444;
+            border-radius: 4px;
+            color: #fff;
+            width: 100%;
+        }
     </style>
 </head>
 <body>
@@ -412,8 +465,23 @@ HTML_PAGE = """
         <span class="hostname" id="hostname"></span>
         <span class="version" id="version"></span>
     </div>
-    <h1>FLUX.1 Image Generator</h1>
+    <h1>FLUX Image Generator</h1>
     <p class="subtitle" id="modelInfo">Loading model info...</p>
+
+    <!-- Security UI -->
+    <div class="security-section">
+        <div class="security-header" onclick="document.getElementById('securityContent').style.display = document.getElementById('securityContent').style.display === 'none' ? 'block' : 'none'">
+            <div class="security-title">
+                <span>🔒 Security Settings</span>
+            </div>
+            <span style="font-size: 12px; color: #888;">Click to toggle</span>
+        </div>
+        <div id="securityContent" style="display: none; padding-top: 10px;">
+            <label for="apiKey">API Access Key:</label>
+            <input type="password" id="apiKeyInput" placeholder="Enter API Key if required..." onchange="localStorage.setItem('flux_api_key', this.value)">
+            <p style="font-size: 11px; color: #666; margin-top: 5px;">Stored in browser local storage. Only needed if server-side authentication is enabled.</p>
+        </div>
+    </div>
 
     <form id="generateForm" action="#">
         <div class="form-group">
@@ -553,6 +621,22 @@ HTML_PAGE = """
     </div>
 
     <script>
+        // Security helpers
+        function getAuthHeaders(extraHeaders = {}) {
+            const apiKey = localStorage.getItem('flux_api_key');
+            const headers = { ...extraHeaders };
+            if (apiKey) {
+                headers['X-API-Key'] = apiKey;
+            }
+            return headers;
+        }
+
+        // Initialize API key input
+        const apiKeyInput = document.getElementById('apiKeyInput');
+        if (apiKeyInput) {
+            apiKeyInput.value = localStorage.getItem('flux_api_key') || '';
+        }
+
         // Run model-info fetch first, before any other code that might throw (so UI always updates)
         (function() {
             var el = document.getElementById('modelInfo');
@@ -562,7 +646,10 @@ HTML_PAGE = """
             }, 5000);
             var ac = new AbortController();
             setTimeout(function() { ac.abort(); }, 8000);
-            fetch('/model-info', { signal: ac.signal })
+            fetch('/model-info', { 
+                signal: ac.signal,
+                headers: getAuthHeaders()
+            })
                 .then(function(r) { if (!r.ok) throw new Error(r.status); return r.json(); })
                 .then(function(data) {
                     clearTimeout(timeout);
@@ -660,7 +747,7 @@ HTML_PAGE = """
 
         async function pollStatus() {
             try {
-                const response = await fetch('/status');
+                const response = await fetch('/status', { headers: getAuthHeaders() });
                 const data = await response.json();
                 
                 if (data.generating) {
@@ -814,7 +901,7 @@ HTML_PAGE = """
             try {
                 const response = await fetch('/generate', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
                     body: JSON.stringify(formData)
                 });
                 const data = await response.json();
@@ -864,7 +951,7 @@ HTML_PAGE = """
         const historyGrid = document.getElementById('historyGrid');
         async function loadHistory() {
             try {
-                const response = await fetch('/history');
+                const response = await fetch('/history', { headers: getAuthHeaders() });
                 const data = await response.json();
                 historyGrid.innerHTML = '';
                 archiveBtn.style.display = data.images.length > 0 ? 'block' : 'none';
@@ -882,7 +969,7 @@ HTML_PAGE = """
                         </div>
                     `;
                     item.title = img.prompt || img.filename;
-                    item.addEventListener('click', () => { window.open(`/images/${img.filename}`, '_blank'); });
+                    item.addEventListener('click', () => { window.open(`/images/${img.filename}?api_key=${localStorage.getItem('flux_api_key') || ''}`, '_blank'); });
                     historyGrid.appendChild(item);
                 });
             } catch (err) {
@@ -897,7 +984,10 @@ HTML_PAGE = """
             archiveBtn.disabled = true;
             archiveBtn.textContent = 'Archiving...';
             try {
-                const response = await fetch('/archive', { method: 'POST' });
+                const response = await fetch('/archive', { 
+                    method: 'POST',
+                    headers: getAuthHeaders()
+                });
                 const data = await response.json();
                 if (data.success) { loadHistory(); } else { alert('Archive failed: ' + data.error); }
             } catch (err) { alert('Archive failed: ' + err.message); }
@@ -916,20 +1006,6 @@ def background_generation_task(data):
     """Background task for image generation, ensuring it continues if client disconnects."""
     global _current_status
     
-    # Initialize status for new run
-    with _generation_lock:
-        _current_status = {
-            "generating": True,
-            "prompt": data.get('prompt', ''),
-            "current": 0,
-            "batch": 0,
-            "images": [],
-            "composite": None,
-            "done": False,
-            "error": None,
-            "generation_time": 0
-        }
-
     try:
         prompt = data.get('prompt', '').strip()
         orientation = data.get('orientation', 'landscape')
@@ -973,6 +1049,7 @@ def background_generation_task(data):
             total_batch = batch
 
         _current_status["batch"] = total_batch
+            
         start_time = time.perf_counter()
 
         if spectrum_grid:
@@ -981,7 +1058,7 @@ def background_generation_task(data):
             for s_val in strength_values:
                 row_images = []
                 for g_val in guidance_values:
-                    combo_idx = len(grid_cells) * len(guidance_values) + len(row_images) + 1
+                    combo_idx = (len(grid_cells) * len(guidance_values)) + len(row_images) + 1
                     _current_status["current"] = combo_idx
                     current_seed = grid_seed if spectrum_same_seed else random.randint(0, 2**32 - 1)
                     
@@ -1051,6 +1128,8 @@ def background_generation_task(data):
                 img_data = {
                     'filename': output_filename,
                     'seed': used_seed,
+                    'guidance': guidance_scale,
+                    'strength': strength if input_image else None,
                     'timings': {
                         'encoding': round(timings['encoding'], 2),
                         'diffusion': round(timings['diffusion'], 2),
@@ -1081,9 +1160,29 @@ def generate():
     if not _generation_lock.acquire(blocking=False):
         return jsonify({'success': False, 'error': 'Generation in progress'}), 503
     
-    # Logic is moved to thread, release is handled by thread finally
-    threading.Thread(target=background_generation_task, args=(request.json,)).start()
-    return jsonify({'success': True})
+    try:
+        # Initialize status for new run BEFORE starting thread to avoid race conditions
+        global _current_status
+        data = request.json
+        _current_status = {
+            "generating": True,
+            "prompt": data.get('prompt', ''),
+            "current": 0,
+            "batch": 0,
+            "images": [],
+            "composite": None,
+            "done": False,
+            "error": None,
+            "generation_time": 0
+        }
+        
+        # Logic is moved to thread, release is handled by thread finally
+        threading.Thread(target=background_generation_task, args=(data,)).start()
+        return jsonify({'success': True})
+    except Exception as e:
+        if _generation_lock.locked():
+            _generation_lock.release()
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/images/<filename>')

@@ -51,3 +51,4 @@ wheels/
 Thumbs.db
 nohup.out
 nohup.out
+.env
