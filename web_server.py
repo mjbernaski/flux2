@@ -436,19 +436,25 @@ HTML_PAGE = """
         }
         .history-item {
             position: relative;
-            aspect-ratio: 1;
+            background: #0a0a15;
             border-radius: 6px;
             overflow: hidden;
             cursor: pointer;
             transition: transform 0.2s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 150px;
         }
         .history-item:hover {
             transform: scale(1.05);
         }
         .history-item img {
-            width: 100%;
-            height: 100%;
-            object-fit: cover;
+            max-width: 100%;
+            max-height: 200px;
+            width: auto;
+            height: auto;
+            object-fit: contain;
         }
         .history-item .overlay {
             position: absolute;
@@ -833,7 +839,7 @@ HTML_PAGE = """
             var s = document.getElementById('size'); if (s) s.value = '1mp';
             var st = document.getElementById('steps'); if (st) st.value = '25';
             var sd = document.getElementById('seed'); if (sd) sd.value = '';
-            var gu = document.getElementById('guidance'); if (gu) gu.value = '';
+            var gu = document.getElementById('guidance'); if (gu) gu.value = '4';
             var b = document.getElementById('batch'); if (b) b.value = '1';
             currentInputImage = null;
             if (previewImg) previewImg.src = '';
@@ -846,6 +852,7 @@ HTML_PAGE = """
             if (aspectModeControl) aspectModeControl.style.display = 'none';
             if (aspectModeEl) aspectModeEl.value = 'keep';
             var sg = document.getElementById('spectrumGrid'); if (sg) sg.checked = false;
+            var sss = document.getElementById('spectrumSameSeed'); if (sss) sss.checked = true;
             if (gridContainer) gridContainer.style.display = 'none';
             selectedCells.clear();
             if (gridSelector) {
@@ -860,6 +867,17 @@ HTML_PAGE = """
                     }
                 });
             }
+            // Clear results and status
+            if (imageGrid) imageGrid.innerHTML = '';
+            if (generationInfo) generationInfo.textContent = '';
+            if (result) result.className = 'result';
+            if (status) {
+                status.className = 'status';
+                if (statusText) statusText.textContent = 'Generating...';
+            }
+            if (knownImageFilenames) knownImageFilenames.clear();
+            const pt = document.getElementById('progressTracker'); if (pt) pt.style.display = 'none';
+            const pb = document.getElementById('progressBar'); if (pb) pb.style.width = '0%';
         });
 
         async function pollStatus() {
@@ -1291,14 +1309,22 @@ def background_generation_task(data):
                 grid_cells.append(row_images)
 
             # Create composite
-            cell_size = 256
+            # Calculate cell size based on aspect ratio
+            aspect_ratio = width / height
+            if width >= height:
+                cell_width = 256
+                cell_height = int(round(cell_width / aspect_ratio))
+            else:
+                cell_height = 256
+                cell_width = int(round(cell_height * aspect_ratio))
+
             n_rows, n_cols = len(grid_cells), len(grid_cells[0])
-            composite = Image.new('RGB', (n_cols * cell_size, n_rows * cell_size), (32, 32, 32))
+            composite = Image.new('RGB', (n_cols * cell_width, n_rows * cell_height), (32, 32, 32))
             for row_idx, row_images in enumerate(grid_cells):
                 for col_idx, img in enumerate(row_images):
                     if img is None: continue # Skip empty diagonal cells
-                    img_small = img.resize((cell_size, cell_size), Image.Resampling.LANCZOS)
-                    composite.paste(img_small, (col_idx * cell_size, row_idx * cell_size))
+                    img_small = img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
+                    composite.paste(img_small, (col_idx * cell_width, row_idx * cell_height))
             
             comp_filename = f"flux{fl24bit._flux_version}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_spectrum_grid.png"
             composite.save(os.path.join(OUTPUT_DIR, comp_filename))
