@@ -12,3 +12,4 @@ sentencepiece
 protobuf
 flask
 pillow
+python-dotenv

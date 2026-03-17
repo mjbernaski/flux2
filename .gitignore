@@ -52,3 +52,6 @@ Thumbs.db
 nohup.out
 nohup.out
 .env
+server.log
+server.pid
+._.DS_Store
