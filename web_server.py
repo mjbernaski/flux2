@@ -12,6 +12,10 @@ import random
 import uuid
 from flask import Flask, request, jsonify, send_from_directory, Response, stream_with_context
 from PIL import Image
+from dotenv import load_dotenv
+
+# Load .env file if it exists
+load_dotenv()
 
 # Version number - update this when releasing new versions
 VERSION = "1.1.1"
@@ -22,25 +26,38 @@ from fl24bit import load_model, generate_image, device, save_prompt_file, load_t
 
 app = Flask(__name__)
 
-# Security: Load API key from environment if it exists
+# Security: Load API key from environment
 API_KEY = os.environ.get("FLUX_API_KEY")
+if API_KEY:
+    API_KEY = API_KEY.strip()
+
+if not API_KEY:
+    print("\n" + "="*60)
+    print("CRITICAL ERROR: FLUX_API_KEY environment variable is not set.")
+    print("="*60)
+    print("For security, this server now requires an API key to be set.")
+    print("\nPlease set it before running the server:")
+    print("  export FLUX_API_KEY=your_secret_key")
+    print("\nOr create a .env file with:")
+    print("  FLUX_API_KEY=your_secret_key")
+    print("="*60 + "\n")
+    import sys
+    sys.exit(1)
 
 def check_auth():
-    if not API_KEY:
-        return True
-    
     # Check header or query param
     provided_key = request.headers.get("X-API-Key") or request.args.get("api_key")
     return provided_key == API_KEY
 
 @app.before_request
 def require_auth():
-    # Allow the main page to load, but it will need the key for API calls
-    if request.endpoint == 'index' or request.endpoint == 'static':
+    # Allow the main page and images to load without authentication
+    # Images are served with random filenames which provides basic security
+    if request.endpoint in ['index', 'static', 'serve_image']:
         return
         
     if not check_auth():
-        return jsonify({"success": False, "error": "Unauthorized. Please provide a valid X-API-Key header."}), 401
+        return jsonify({"success": False, "error": "Unauthorized. Please provide a valid X-API-Key header or api_key parameter."}), 401
 
 # Will be set by command-line args
 _local_encoder = False
@@ -333,6 +350,36 @@ HTML_PAGE = """
         .spectrum-option .checkbox-label { display: flex; align-items: center; gap: 8px; cursor: pointer; }
         .spectrum-option input[type="checkbox"] { width: auto; }
         .spectrum-hint { color: #666; font-size: 12px; margin-top: 4px; }
+        .spectrum-grid-selector {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 4px;
+            margin-top: 10px;
+            max-width: 200px;
+        }
+        .grid-cell {
+            aspect-ratio: 1;
+            background: #222;
+            border: 1px solid #444;
+            cursor: pointer;
+            border-radius: 2px;
+            transition: all 0.2s;
+        }
+        .grid-cell:hover {
+            border-color: #00d4ff;
+        }
+        .grid-cell.selected {
+            background: #00d4ff;
+            box-shadow: 0 0 8px rgba(0, 212, 255, 0.5);
+        }
+        .grid-labels {
+            display: flex;
+            justify-content: space-between;
+            font-size: 10px;
+            color: #666;
+            margin-top: 4px;
+            max-width: 200px;
+        }
         .composite-card { grid-column: 1 / -1; }
         .composite-label { font-size: 12px; color: #00d4ff; margin-bottom: 8px; }
         .composite-img { max-width: 100%; height: auto; }
@@ -478,8 +525,9 @@ HTML_PAGE = """
         </div>
         <div id="securityContent" style="display: none; padding-top: 10px;">
             <label for="apiKey">API Access Key:</label>
-            <input type="password" id="apiKeyInput" placeholder="Enter API Key if required..." onchange="localStorage.setItem('flux_api_key', this.value)">
-            <p style="font-size: 11px; color: #666; margin-top: 5px;">Stored in browser local storage. Only needed if server-side authentication is enabled.</p>
+            <input type="password" id="apiKeyInput" placeholder="Enter API Key (REQUIRED)..." oninput="localStorage.setItem('flux_api_key', this.value)">
+            <p style="font-size: 11px; color: #666; margin-top: 5px;">Stored in browser local storage for convenience. Always required to use this server.</p>
+            <button type="button" id="resetLockBtn" style="margin-top: 10px; background: #944; border: none; padding: 4px 8px; font-size: 11px;">Emergency Reset Server Lock</button>
         </div>
     </div>
 
@@ -504,8 +552,15 @@ HTML_PAGE = """
                 </div>
                 <div class="strength-control" id="strengthControl" style="display: none;">
                     <label for="strength">Reference following (strength): <span id="strengthValue">0.5</span></label>
-                    <input type="range" id="strength" name="strength" min="0" max="1" step="0.5" value="0.5">
+                    <input type="range" id="strength" name="strength" min="0" max="1" step="0.1" value="0.5">
                     <div class="strength-hint">0 = closest to original, 0.5 = default, 1 = most change</div>
+                </div>
+                <div class="aspect-mode-control" id="aspectModeControl" style="display: none; margin-top: 10px;">
+                    <label for="aspectMode">Image aspect ratio mode:</label>
+                    <select id="aspectMode" name="aspectMode">
+                        <option value="keep" selected>Keep original aspect ratio (auto-scale)</option>
+                        <option value="stretch">Stretch/Squash to match Orientation selection</option>
+                    </select>
                 </div>
             </div>
         </div>
@@ -514,8 +569,8 @@ HTML_PAGE = """
             <div class="form-group">
                 <label for="orientation">Orientation</label>
                 <select id="orientation" name="orientation">
-                    <option value="square" selected>Square</option>
-                    <option value="landscape">Landscape</option>
+                    <option value="square">Square</option>
+                    <option value="landscape" selected>Landscape</option>
                     <option value="portrait">Portrait</option>
                 </select>
             </div>
@@ -580,9 +635,19 @@ HTML_PAGE = """
             <div class="form-group spectrum-option">
                 <label class="checkbox-label">
                     <input type="checkbox" id="spectrumGrid" name="spectrum_grid" value="1">
-                    Generate spectrum grid (4×4)
+                    Generate spectrum grid (interactive 4×4 matrix)
                 </label>
-                <div class="spectrum-hint" id="spectrumHint">Generates a 4×4 guidance × strength grid and a matrix composite. Guidance: 1, 3, 5, 7. Strength (img2img): 0.2, 0.4, 0.6, 0.8.</div>
+                <div id="gridContainer" style="display: none; margin-top: 10px;">
+                    <div style="font-size: 11px; color: #888; margin-bottom: 4px;">Select combinations (Guidance →, Strength ↓)</div>
+                    <div class="spectrum-grid-selector" id="gridSelector">
+                        <!-- 16 cells added via JS -->
+                    </div>
+                    <div class="grid-labels">
+                        <span>Min G/S</span>
+                        <span>Max G/S</span>
+                    </div>
+                </div>
+                <div class="spectrum-hint" id="spectrumHint">Guidance: 1, 3, 5, 7. Strength (img2img): 0.2, 0.4, 0.6, 0.8.</div>
                 <label class="checkbox-label" style="margin-top: 6px;">
                     <input type="checkbox" id="spectrumSameSeed" checked>
                     Use same seed for all grid images
@@ -681,6 +746,8 @@ HTML_PAGE = """
 
         let currentInputImage = null;
         const strengthControl = document.getElementById('strengthControl');
+        const aspectModeControl = document.getElementById('aspectModeControl');
+        const aspectModeEl = document.getElementById('aspectMode');
         const strengthSlider = document.getElementById('strength');
         const strengthValue = document.getElementById('strengthValue');
         
@@ -701,9 +768,9 @@ HTML_PAGE = """
                 if (uploadPlaceholder) uploadPlaceholder.style.display = 'none';
                 if (imagePreview) imagePreview.style.display = 'block';
                 if (strengthControl) strengthControl.style.display = 'flex';
-            };
-            reader.readAsDataURL(file);
-        }
+                if (aspectModeControl) aspectModeControl.style.display = 'block';
+                };
+                reader.readAsDataURL(file);        }
         if (uploadArea) {
             uploadArea.addEventListener('click', function() { if (inputImage) inputImage.click(); });
             uploadArea.addEventListener('dragover', function(e) { e.preventDefault(); uploadArea.classList.add('dragover'); });
@@ -724,11 +791,45 @@ HTML_PAGE = """
             if (uploadPlaceholder) uploadPlaceholder.style.display = 'flex';
             if (imagePreview) imagePreview.style.display = 'none';
             if (strengthControl) strengthControl.style.display = 'none';
+            if (aspectModeControl) aspectModeControl.style.display = 'none';
         });
         var resetBtn = document.getElementById('resetBtn');
+        const spectrumGridEl = document.getElementById('spectrumGrid');
+        const gridContainer = document.getElementById('gridContainer');
+        const gridSelector = document.getElementById('gridSelector');
+        const selectedCells = new Set();
+
+        // Initialize grid
+        if (gridSelector) {
+            for (let i = 0; i < 16; i++) {
+                const cell = document.createElement('div');
+                cell.className = 'grid-cell';
+                // Default to diagonals as before if user just turns it on
+                const r = Math.floor(i / 4);
+                const c = i % 4;
+                if (r === c || r === (3 - c)) {
+                    cell.classList.add('selected');
+                    selectedCells.add(i);
+                }
+                cell.onclick = () => {
+                    cell.classList.toggle('selected');
+                    if (cell.classList.contains('selected')) {
+                        selectedCells.add(i);
+                    } else {
+                        selectedCells.delete(i);
+                    }
+                };
+                gridSelector.appendChild(cell);
+            }
+        }
+
+        if (spectrumGridEl) spectrumGridEl.addEventListener('change', () => {
+            gridContainer.style.display = spectrumGridEl.checked ? 'block' : 'none';
+        });
+
         if (resetBtn) resetBtn.addEventListener('click', function() {
             var p = document.getElementById('prompt'); if (p) p.value = '';
-            var o = document.getElementById('orientation'); if (o) o.value = 'square';
+            var o = document.getElementById('orientation'); if (o) o.value = 'landscape';
             var s = document.getElementById('size'); if (s) s.value = '1mp';
             var st = document.getElementById('steps'); if (st) st.value = '25';
             var sd = document.getElementById('seed'); if (sd) sd.value = '';
@@ -742,12 +843,42 @@ HTML_PAGE = """
             if (strengthSlider) strengthSlider.value = '0.5';
             if (strengthValue) strengthValue.textContent = '0.5';
             if (strengthControl) strengthControl.style.display = 'none';
+            if (aspectModeControl) aspectModeControl.style.display = 'none';
+            if (aspectModeEl) aspectModeEl.value = 'keep';
             var sg = document.getElementById('spectrumGrid'); if (sg) sg.checked = false;
+            if (gridContainer) gridContainer.style.display = 'none';
+            selectedCells.clear();
+            if (gridSelector) {
+                Array.from(gridSelector.children).forEach((cell, i) => {
+                    const r = Math.floor(i / 4);
+                    const c = i % 4;
+                    if (r === c || r === (3 - c)) {
+                        cell.classList.add('selected');
+                        selectedCells.add(i);
+                    } else {
+                        cell.classList.remove('selected');
+                    }
+                });
+            }
         });
 
         async function pollStatus() {
             try {
                 const response = await fetch('/status', { headers: getAuthHeaders() });
+                
+                if (response.status === 401) {
+                    clearInterval(pollInterval);
+                    pollInterval = null;
+                    submitBtn.disabled = false;
+                    status.className = 'status error';
+                    statusText.textContent = 'Error: Unauthorized. Please check your API Key.';
+                    return;
+                }
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                
                 const data = await response.json();
                 
                 if (data.generating) {
@@ -819,6 +950,7 @@ HTML_PAGE = """
                 }
             } catch (err) {
                 console.error('Polling error:', err);
+                // Don't clear interval here, server might be briefly down or network issue
             }
         }
 
@@ -877,18 +1009,20 @@ HTML_PAGE = """
 
             const formData = {
                 prompt: promptEl ? promptEl.value : '',
-                orientation: orientationEl ? orientationEl.value : 'square',
+                orientation: orientationEl ? orientationEl.value : 'landscape',
                 size: sizeEl ? sizeEl.value : '1mp',
                 steps: stepsEl ? parseInt(stepsEl.value, 10) : 25,
                 seed: seedValue ? parseInt(seedValue, 10) : null,
                 guidance: guidanceEl && guidanceEl.value ? parseFloat(guidanceEl.value) : null,
                 batch: batchEl ? parseInt(batchEl.value, 10) : 1,
                 spectrum_grid: spectrumGrid,
-                spectrum_same_seed: spectrumSameSeed
+                spectrum_same_seed: spectrumSameSeed,
+                selected_cells: Array.from(selectedCells)
             };
             if (currentInputImage && strengthSlider) {
                 formData.input_image = currentInputImage;
-                formData.strength = parseFloat(strengthSlider.value, 10);
+                formData.strength = parseFloat(strengthSlider.value);
+                formData.aspect_mode = aspectModeEl ? aspectModeEl.value : 'keep';
             }
 
             knownImageFilenames.clear();
@@ -904,6 +1038,14 @@ HTML_PAGE = """
                     headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
                     body: JSON.stringify(formData)
                 });
+                
+                if (response.status === 503) {
+                    statusText.textContent = 'Generation already in progress... joining session.';
+                    if (pollInterval) clearInterval(pollInterval);
+                    pollInterval = setInterval(pollStatus, 1500);
+                    return;
+                }
+                
                 const data = await response.json();
                 
                 if (data.success) {
@@ -911,7 +1053,7 @@ HTML_PAGE = """
                     pollInterval = setInterval(pollStatus, 1500);
                 } else {
                     status.className = 'status error';
-                    statusText.textContent = 'Error: ' + data.error;
+                    statusText.textContent = 'Error: ' + (data.error || 'Unknown error');
                     submitBtn.disabled = false;
                 }
             } catch (err) {
@@ -969,7 +1111,7 @@ HTML_PAGE = """
                         </div>
                     `;
                     item.title = img.prompt || img.filename;
-                    item.addEventListener('click', () => { window.open(`/images/${img.filename}?api_key=${localStorage.getItem('flux_api_key') || ''}`, '_blank'); });
+                    item.addEventListener('click', () => { window.open(`/images/${img.filename}`, '_blank'); });
                     historyGrid.appendChild(item);
                 });
             } catch (err) {
@@ -979,6 +1121,25 @@ HTML_PAGE = """
         }
 
         const archiveBtn = document.getElementById('archiveBtn');
+        const resetLockBtn = document.getElementById('resetLockBtn');
+
+        if (resetLockBtn) {
+            resetLockBtn.addEventListener('click', async () => {
+                if (!confirm("This will FORCE unlock the server. Only do this if you are certain no image is actually generating!")) return;
+                try {
+                    const response = await fetch('/reset-lock', { 
+                        method: 'POST',
+                        headers: getAuthHeaders()
+                    });
+                    const data = await response.json();
+                    if (data.success) {
+                        alert("Server lock released.");
+                        pollStatus();
+                    }
+                } catch (err) { alert("Failed to reset lock: " + err.message); }
+            });
+        }
+
         archiveBtn.addEventListener('click', async () => {
             if (!confirm("Move all of today's images to the archive folder?")) return;
             archiveBtn.disabled = true;
@@ -1027,7 +1188,9 @@ def background_generation_task(data):
 
         # Dimensions
         scale = SIZES.get(size, 1.0)
-        if input_image is not None:
+        aspect_mode = data.get('aspect_mode', 'keep')
+
+        if input_image is not None and aspect_mode == 'keep':
             in_w, in_h = input_image.size
             target_pixels = 1_000_000 * (scale ** 2)
             current_pixels = in_w * in_h
@@ -1040,35 +1203,66 @@ def background_generation_task(data):
 
         spectrum_grid = data.get('spectrum_grid', False)
         spectrum_same_seed = data.get('spectrum_same_seed', True)
-        
+        selected_cells = data.get('selected_cells', []) # Indices 0-15
+
         if spectrum_grid:
             guidance_values = [0] if _schnell else [1.0, 3.0, 5.0, 7.0]
-            strength_values = [0.2, 0.4, 0.6, 0.8] if input_image else [None]
-            total_batch = len(strength_values) * len(guidance_values)
+            strength_values = [0.2, 0.4, 0.6, 0.8] if input_image else [0.0, 0.0, 0.0, 0.0] # Dummy if no image
+
+            if selected_cells:
+                total_batch = len(selected_cells)
+            elif input_image and not _schnell:
+                # Fallback to diagonals if nothing selected but somehow grid is on
+                total_batch = 8
+            else:
+                total_batch = len(strength_values) * len(guidance_values)
         else:
             total_batch = batch
 
         _current_status["batch"] = total_batch
-            
+
         start_time = time.perf_counter()
 
         if spectrum_grid:
             grid_seed = seed if seed is not None else random.randint(0, 2**32 - 1)
             grid_cells = []
-            for s_val in strength_values:
+
+            # We still want to build a full 4x4 grid for the composite, but only generate selected
+            guidance_values = [0] if _schnell else [1.0, 3.0, 5.0, 7.0]
+            strength_values = [0.2, 0.4, 0.6, 0.8] if input_image else [0.0, 0.2, 0.4, 0.6] # Use some defaults if no image for grid
+
+            generated_count = 0
+            for r_idx, s_val in enumerate(strength_values):
                 row_images = []
-                for g_val in guidance_values:
-                    combo_idx = (len(grid_cells) * len(guidance_values)) + len(row_images) + 1
-                    _current_status["current"] = combo_idx
+                for c_idx, g_val in enumerate(guidance_values):
+                    cell_idx = r_idx * 4 + c_idx
+
+                    # Check if this cell should be generated
+                    should_gen = False
+                    if selected_cells:
+                        should_gen = cell_idx in selected_cells
+                    elif input_image and not _schnell:
+                        # Legacy diagonal logic
+                        is_main_diag = (r_idx == c_idx)
+                        is_anti_diag = (r_idx == len(guidance_values) - 1 - c_idx)
+                        should_gen = is_main_diag or is_anti_diag
+                    else:
+                        should_gen = True
+
+                    if not should_gen:
+                        row_images.append(None)
+                        continue
+
+                    generated_count += 1
+                    _current_status["current"] = generated_count
                     current_seed = grid_seed if spectrum_same_seed else random.randint(0, 2**32 - 1)
-                    
+
                     image, used_seed, timings = generate_image(
                         prompt, seed=current_seed, steps=steps, width=width, height=height,
-                        local_encoder=_local_encoder, input_image=input_image, 
-                        strength=(s_val if s_val is not None else 0.5),
+                        local_encoder=_local_encoder, input_image=input_image,
+                        strength=(s_val if input_image else 0.5),
                         guidance_scale=g_val
-                    )
-                    
+                    )                    
                     t_save = time.perf_counter()
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     unique_id = uuid.uuid4().hex[:8]
@@ -1102,6 +1296,7 @@ def background_generation_task(data):
             composite = Image.new('RGB', (n_cols * cell_size, n_rows * cell_size), (32, 32, 32))
             for row_idx, row_images in enumerate(grid_cells):
                 for col_idx, img in enumerate(row_images):
+                    if img is None: continue # Skip empty diagonal cells
                     img_small = img.resize((cell_size, cell_size), Image.Resampling.LANCZOS)
                     composite.paste(img_small, (col_idx * cell_size, row_idx * cell_size))
             
@@ -1193,6 +1388,21 @@ def serve_image(filename):
 @app.route('/status')
 def status():
     return jsonify(_current_status)
+
+
+@app.route('/reset-lock', methods=['POST'])
+def reset_lock():
+    if not check_auth():
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+        
+    global _current_status
+    if _generation_lock.locked():
+        _generation_lock.release()
+        
+    _current_status["generating"] = False
+    _current_status["done"] = False
+    _current_status["error"] = "Lock reset by user."
+    return jsonify({"success": True, "message": "Server lock has been manually released."})
 
 
 @app.route('/model-info')
