@@ -67,6 +67,7 @@ _flux2 = False
 _schnell = False
 _turbo = False
 _uncensored = False
+_klein = False
 
 # Configuration
 OUTPUT_DIR = "web-generated"
@@ -82,6 +83,8 @@ _current_status = {
     "prompt": None,
     "current": 0,
     "batch": 0,
+    "step": 0,
+    "total_steps": 0,
     "images": [],
     "composite": None,
     "done": False,
@@ -631,8 +634,12 @@ HTML_PAGE = """
                 <select id="batch" name="batch">
                     <option value="1" selected>1 image</option>
                     <option value="2">2 images</option>
-                    <option value="3">3 images</option>
                     <option value="4">4 images</option>
+                    <option value="8">8 images</option>
+                    <option value="16">16 images</option>
+                    <option value="32">32 images</option>
+                    <option value="64">64 images</option>
+                    <option value="128">128 images</option>
                 </select>
             </div>
         </div>
@@ -902,16 +909,38 @@ HTML_PAGE = """
                 if (data.generating) {
                     submitBtn.disabled = true;
                     status.className = 'status generating';
-                    statusText.textContent = `Generating: ${data.current} / ${data.batch}...`;
-                    
+
+                    // Build status text with step progress
+                    let stepInfo = '';
+                    if (data.total_steps > 0 && data.step > 0) {
+                        stepInfo = ` (step ${data.step} of ${data.total_steps})`;
+                    }
+                    if (data.batch > 1) {
+                        statusText.textContent = `Generating: ${data.current} / ${data.batch}${stepInfo}...`;
+                    } else {
+                        statusText.textContent = data.step > 0
+                            ? `Generating: step ${data.step} of ${data.total_steps}...`
+                            : 'Generating...';
+                    }
+
                     const progressTracker = document.getElementById('progressTracker');
                     const progressBar = document.getElementById('progressBar');
                     const progressText = document.getElementById('progressText');
-                    
-                    if (data.batch > 1) {
+
+                    // Show progress bar based on steps (always) or batch progress
+                    if (data.total_steps > 0) {
                         progressTracker.style.display = 'block';
-                        progressBar.style.width = `${(data.current / data.batch) * 100}%`;
-                        progressText.textContent = `${data.current} / ${data.batch}`;
+                        const batch = Math.max(1, data.batch || 1);
+                        const totalStepsAll = data.total_steps * batch;
+                        const stepsDone = (data.current - 1) * data.total_steps + data.step;
+                        if (batch > 1) {
+                            progressBar.style.width = `${(stepsDone / totalStepsAll) * 100}%`;
+                        } else {
+                            progressBar.style.width = `${(data.step / data.total_steps) * 100}%`;
+                        }
+
+                        const pct = Math.min(100, Math.round((stepsDone / totalStepsAll) * 100));
+                        progressText.textContent = `${pct}% complete`;
                     } else {
                         progressTracker.style.display = 'none';
                     }
@@ -931,7 +960,7 @@ HTML_PAGE = """
                     clearInterval(pollInterval);
                     pollInterval = null;
                     submitBtn.disabled = false;
-                    
+
                     if (data.done) {
                         status.className = 'status';
                         result.className = 'result visible';
@@ -1192,7 +1221,7 @@ def background_generation_task(data):
         steps = int(data.get('steps', 25))
         seed = data.get('seed')
         guidance_scale = data.get('guidance')
-        batch = min(max(int(data.get('batch', 1)), 1), 4)
+        batch = min(max(int(data.get('batch', 1)), 1), 128)
         
         # Handle input image
         input_image = None
@@ -1238,6 +1267,11 @@ def background_generation_task(data):
             total_batch = batch
 
         _current_status["batch"] = total_batch
+        _current_status["total_steps"] = steps
+
+        def _step_callback(pipe, step_index, timestep, callback_kwargs):
+            _current_status["step"] = step_index + 1
+            return callback_kwargs
 
         start_time = time.perf_counter()
 
@@ -1273,13 +1307,15 @@ def background_generation_task(data):
 
                     generated_count += 1
                     _current_status["current"] = generated_count
+                    _current_status["step"] = 0
                     current_seed = grid_seed if spectrum_same_seed else random.randint(0, 2**32 - 1)
 
                     image, used_seed, timings = generate_image(
                         prompt, seed=current_seed, steps=steps, width=width, height=height,
                         local_encoder=_local_encoder, input_image=input_image,
                         strength=(s_val if input_image else 0.5),
-                        guidance_scale=g_val
+                        guidance_scale=g_val,
+                        callback_on_step_end=_step_callback
                     )                    
                     t_save = time.perf_counter()
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1332,11 +1368,13 @@ def background_generation_task(data):
         else:
             for i in range(batch):
                 _current_status["current"] = i + 1
+                _current_status["step"] = 0
                 current_seed = (seed + i) if seed is not None else None
                 image, used_seed, timings = generate_image(
                     prompt, seed=current_seed, steps=steps, width=width, height=height,
                     local_encoder=_local_encoder, input_image=input_image, strength=strength,
-                    guidance_scale=guidance_scale
+                    guidance_scale=guidance_scale,
+                    callback_on_step_end=_step_callback
                 )
                 
                 t_save = time.perf_counter()
@@ -1390,6 +1428,8 @@ def generate():
             "prompt": data.get('prompt', ''),
             "current": 0,
             "batch": 0,
+            "step": 0,
+            "total_steps": 0,
             "images": [],
             "composite": None,
             "done": False,
@@ -1434,12 +1474,13 @@ def reset_lock():
 @app.route('/model-info')
 def model_info():
     flux_name = f"FLUX.{fl24bit._flux_version}"
+    variant = "-klein" if _klein else "-dev"
     if _schnell:
         model_type = f"{flux_name}-schnell (4-step)"
     elif _gguf_quant:
         model_type = f"{flux_name}-dev GGUF {_gguf_quant.upper()}"
     elif _full_model:
-        model_type = f"{flux_name}-dev (full)"
+        model_type = f"{flux_name}{variant} (full)"
     else:
         model_type = f"{flux_name}-dev-bnb-4bit"
     encoder_type = "local encoder" if _local_encoder else "remote encoder"
@@ -1513,19 +1554,24 @@ if __name__ == '__main__':
     parser.add_argument("--gguf", type=str, choices=["bf16", "q8", "q4"], default=None, help="Use GGUF model")
     parser.add_argument("--flux2", action="store_true", help="Use FLUX.2 model")
     parser.add_argument("--schnell", action="store_true", help="Use FLUX.1-schnell")
+    parser.add_argument("--klein", action="store_true", help="Use FLUX.2-klein (9B) instead of FLUX.2-dev (32B). Implies --flux2 --full-model")
     parser.add_argument("--turbo", action="store_true", default=None, help="Enable turbo LoRA")
     parser.add_argument("--no-turbo", action="store_true", help="Disable turbo LoRA")
     parser.add_argument("--uncensored", action="store_true", help="Load Flux-Uncensored-V2 LoRA")
     parser.add_argument("--port", type=int, default=PORT, help=f"Port (default: {PORT})")
     args = parser.parse_args()
 
-    _full_model, _gguf_quant, _flux2, _schnell, _uncensored = args.full_model, args.gguf, args.flux2, args.schnell, args.uncensored
+    if args.klein:
+        args.flux2 = True
+        args.full_model = True
+    _full_model, _gguf_quant, _flux2, _schnell, _uncensored, _klein = args.full_model, args.gguf, args.flux2, args.schnell, args.uncensored, args.klein
     _local_encoder = args.local_encoder or args.full_model or args.schnell or args.uncensored
     if args.uncensored and not args.full_model: _full_model = True
-    _turbo = (args.turbo or args.flux2) and not args.no_turbo
+    # Turbo LoRA is a FLUX.2-dev LoRA — don't auto-enable for klein (different architecture)
+    _turbo = (args.turbo or (args.flux2 and not _klein)) and not args.no_turbo
 
     print(f"Loading {'FLUX.2' if _flux2 else 'FLUX.1'}...")
-    load_model(local_encoder=_local_encoder, full_model=_full_model, gguf_quant=_gguf_quant, flux2=_flux2, schnell=_schnell, for_lora=_uncensored)
+    load_model(local_encoder=_local_encoder, full_model=_full_model, gguf_quant=_gguf_quant, flux2=_flux2, schnell=_schnell, for_lora=_uncensored, klein=_klein)
     if _turbo: load_turbo_lora()
     if _uncensored: load_uncensored_lora()
     print(f"\nStarting web server on http://0.0.0.0:{args.port}")
