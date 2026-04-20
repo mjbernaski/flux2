@@ -7,7 +7,9 @@ import base64
 import io
 import socket
 import shutil
+from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Optional
 import random
 import uuid
 from flask import Flask, request, jsonify, send_from_directory, Response, stream_with_context
@@ -84,27 +86,86 @@ PORT = 2222
 # Ensure output directory exists
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Global state for background generation
-_generation_lock = threading.Lock()
-_current_status = {
-    "generating": False,
-    "prompt": None,
-    "current": 0,
-    "batch": 0,
-    "step": 0,
-    "total_steps": 0,
-    "images": [],
-    "composite": None,
-    "done": False,
-    "error": None,
-    "generation_time": 0,
-    "preview": None,
-    "preview_step": 0,
-    "preview_ts": 0
-}
+# Queue configuration
+QUEUE_MAX_SIZE = 10
+RECENT_DONE_MAX = 10
 
 PREVIEW_FILENAME = "_preview_current.png"
 PREVIEW_MIN_INTERVAL_S = 0.75  # throttle: skip decode if last preview was this recent
+
+
+@dataclass
+class Job:
+    id: str
+    params: dict
+    state: str = 'queued'  # queued | running | done | failed | canceled
+    submitted_at: float = 0.0
+    started_at: float = 0.0
+    finished_at: float = 0.0
+    error: Optional[str] = None
+    current: int = 0
+    batch: int = 0
+    step: int = 0
+    total_steps: int = 0
+    images: list = field(default_factory=list)
+    composite: Optional[str] = None
+    preview: Optional[str] = None
+    preview_step: int = 0
+    preview_ts: int = 0
+    generation_time: float = 0.0
+
+    @property
+    def prompt(self) -> str:
+        return (self.params.get('prompt') or '').strip()
+
+    def summary(self) -> dict:
+        p = self.prompt
+        snippet = (p[:120] + '…') if len(p) > 120 else p
+        return {
+            'id': self.id,
+            'state': self.state,
+            'prompt': snippet,
+            'submitted_at': self.submitted_at,
+            'orientation': self.params.get('orientation'),
+            'size': self.params.get('size'),
+            'steps': self.params.get('steps'),
+            'batch': self.params.get('batch', 1),
+            'seed': self.params.get('seed'),
+            'spectrum_grid': bool(self.params.get('spectrum_grid', False)),
+        }
+
+    def full(self) -> dict:
+        d = self.summary()
+        d.update({
+            'prompt': self.prompt,
+            'started_at': self.started_at,
+            'finished_at': self.finished_at,
+            'current': self.current,
+            'step': self.step,
+            'total_steps': self.total_steps,
+            # Copy to avoid the worker mutating this list while jsonify iterates it
+            # after /status releases the queue lock.
+            'images': list(self.images),
+            'composite': self.composite,
+            'preview': self.preview,
+            'preview_step': self.preview_step,
+            'preview_ts': self.preview_ts,
+            'generation_time': self.generation_time,
+            'error': self.error,
+        })
+        # summary's "batch" is the *requested* batch param; callers watching
+        # progress want the actual total (may differ for spectrum grid).
+        if self.batch:
+            d['batch'] = self.batch
+        return d
+
+
+_queue_lock = threading.Lock()
+_queue_cv = threading.Condition(_queue_lock)
+_pending: list = []          # list[Job], front = next to run
+_running_job: Optional[Job] = None
+_recent_done: list = []      # list[Job], newest first, bounded by RECENT_DONE_MAX
+_queue_worker_thread: Optional[threading.Thread] = None
 
 # Orientation presets (width, height) at 1K base
 ORIENTATIONS_1K = {
@@ -211,6 +272,74 @@ HTML_PAGE = """
             display: block;
             background: #442d2d;
             color: #ff6b6b;
+        }
+        .queue-panel {
+            margin: 15px 0;
+            padding: 12px 16px;
+            background: #16213e;
+            border-radius: 6px;
+            border: 1px solid #2a3a5a;
+        }
+        .queue-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            margin-bottom: 8px;
+        }
+        .queue-header h3 {
+            margin: 0;
+            font-size: 15px;
+            color: #00d4ff;
+        }
+        .queue-count {
+            color: #888;
+            font-size: 13px;
+        }
+        .queue-list {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        .queue-item {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            padding: 8px 10px;
+            background: #1a1a2e;
+            border-radius: 4px;
+            font-size: 13px;
+        }
+        .queue-item .pos {
+            color: #00d4ff;
+            font-weight: bold;
+            min-width: 24px;
+            text-align: right;
+        }
+        .queue-item .prompt {
+            flex: 1;
+            color: #ddd;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .queue-item .meta {
+            color: #888;
+            font-size: 12px;
+            white-space: nowrap;
+        }
+        .queue-item .cancel {
+            background: transparent;
+            border: 1px solid #553;
+            color: #c88;
+            padding: 3px 10px;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        .queue-item .cancel:hover {
+            background: #442d2d;
+            color: #ff6b6b;
+            border-color: #ff6b6b;
         }
         .result {
             margin-top: 20px;
@@ -626,7 +755,6 @@ HTML_PAGE = """
             <label for="apiKey">API Access Key:</label>
             <input type="password" id="apiKeyInput" placeholder="Enter API Key (REQUIRED)..." oninput="localStorage.setItem('flux_api_key', this.value)">
             <p style="font-size: 11px; color: #666; margin-top: 5px;">Stored in browser local storage for convenience. Always required to use this server.</p>
-            <button type="button" id="resetLockBtn" style="margin-top: 10px; background: #944; border: none; padding: 4px 8px; font-size: 11px;">Emergency Reset Server Lock</button>
         </div>
     </div>
 
@@ -787,6 +915,14 @@ HTML_PAGE = """
         <div class="preview-wrap" id="previewWrap" style="display: none; margin-top: 12px;">
             <img id="previewImgLive" alt="Live preview" style="max-width: 512px; width: 100%; border-radius: 6px; display: block;">
         </div>
+    </div>
+
+    <div class="queue-panel" id="queuePanel" style="display: none;">
+        <div class="queue-header">
+            <h3>Queue</h3>
+            <span class="queue-count" id="queueCount"></span>
+        </div>
+        <div class="queue-list" id="queueList"></div>
     </div>
 
     <div class="result" id="result">
@@ -1034,134 +1170,185 @@ HTML_PAGE = """
             const pb = document.getElementById('progressBar'); if (pb) pb.style.width = '0%';
         });
 
+        let lastCompletedJobId = null;
+        let seenDoneJobIds = new Set();
+
+        function renderQueueItem(job, position) {
+            const safePrompt = (job.prompt || '(empty prompt)').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            const metaParts = [];
+            if (job.orientation) metaParts.push(job.orientation);
+            if (job.size) metaParts.push(job.size);
+            if (job.steps) metaParts.push(`${job.steps} steps`);
+            if (job.batch && job.batch > 1) metaParts.push(`×${job.batch}`);
+            if (job.spectrum_grid) metaParts.push('spectrum');
+            const meta = metaParts.join(' · ');
+            const el = document.createElement('div');
+            el.className = 'queue-item';
+            el.innerHTML = `
+                <span class="pos">#${position}</span>
+                <span class="prompt" title="${safePrompt}">${safePrompt}</span>
+                <span class="meta">${meta}</span>
+                <button class="cancel" data-job-id="${job.id}">Cancel</button>
+            `;
+            el.querySelector('.cancel').addEventListener('click', () => cancelQueuedJob(job.id));
+            return el;
+        }
+
+        function renderQueue(queued) {
+            const panel = document.getElementById('queuePanel');
+            const list = document.getElementById('queueList');
+            const count = document.getElementById('queueCount');
+            if (!panel || !list || !count) return;
+            if (!queued || queued.length === 0) {
+                panel.style.display = 'none';
+                list.innerHTML = '';
+                return;
+            }
+            panel.style.display = 'block';
+            count.textContent = `${queued.length} waiting`;
+            list.innerHTML = '';
+            queued.forEach((job, i) => list.appendChild(renderQueueItem(job, i + 1)));
+        }
+
+        async function cancelQueuedJob(jobId) {
+            try {
+                const res = await fetch(`/jobs/${jobId}/cancel`, {
+                    method: 'POST',
+                    headers: getAuthHeaders(),
+                });
+                if (!res.ok) {
+                    const err = await res.json().catch(() => ({}));
+                    console.warn('Cancel failed:', err.error || res.status);
+                }
+                pollStatus();
+            } catch (e) {
+                console.error('Cancel error:', e);
+            }
+        }
+
+        function renderRunning(running) {
+            const progressTracker = document.getElementById('progressTracker');
+            const progressBar = document.getElementById('progressBar');
+            const progressText = document.getElementById('progressText');
+            const pwrap = document.getElementById('previewWrap');
+
+            if (!running) {
+                status.className = 'status';
+                if (progressTracker) progressTracker.style.display = 'none';
+                if (pwrap) pwrap.style.display = 'none';
+                return;
+            }
+
+            status.className = 'status generating';
+
+            let stepInfo = '';
+            if (running.total_steps > 0 && running.step > 0) {
+                stepInfo = ` (step ${running.step} of ${running.total_steps})`;
+            }
+            const runBatch = Math.max(1, running.batch || 1);
+            if (runBatch > 1) {
+                statusText.textContent = `Generating: ${running.current} / ${runBatch}${stepInfo}...`;
+            } else {
+                statusText.textContent = running.step > 0
+                    ? `Generating: step ${running.step} of ${running.total_steps}...`
+                    : 'Generating...';
+            }
+
+            if (running.total_steps > 0 && progressTracker && progressBar && progressText) {
+                progressTracker.style.display = 'block';
+                const totalStepsAll = running.total_steps * runBatch;
+                const stepsDone = Math.max(0, (running.current - 1)) * running.total_steps + running.step;
+                progressBar.style.width = `${Math.min(100, (stepsDone / Math.max(1, totalStepsAll)) * 100)}%`;
+                const pct = Math.min(100, Math.round((stepsDone / Math.max(1, totalStepsAll)) * 100));
+                progressText.textContent = `${pct}% complete`;
+            } else if (progressTracker) {
+                progressTracker.style.display = 'none';
+            }
+
+            if (running.preview && running.preview_ts && running.preview_ts !== lastPreviewStep) {
+                const pimg = document.getElementById('previewImgLive');
+                if (pwrap && pimg) {
+                    pimg.src = `/images/${running.preview}?t=${running.preview_ts}`;
+                    pwrap.style.display = 'block';
+                }
+                lastPreviewStep = running.preview_ts;
+            }
+
+            if (running.images && running.images.length > 0) {
+                result.className = 'result visible';
+                running.images.forEach((img, i) => {
+                    if (!knownImageFilenames.has(img.filename)) {
+                        addImageToGrid(img, i + 1);
+                        knownImageFilenames.add(img.filename);
+                    }
+                });
+            }
+        }
+
+        function renderRecentDone(recent) {
+            if (!recent || recent.length === 0) return;
+            const latest = recent[0];
+            // Append images from completed jobs we haven't rendered yet, oldest first
+            // so the grid reads chronologically.
+            for (let i = recent.length - 1; i >= 0; i--) {
+                const job = recent[i];
+                if (seenDoneJobIds.has(job.id)) continue;
+                seenDoneJobIds.add(job.id);
+                if (job.state !== 'done') continue;
+                if (job.images) {
+                    job.images.forEach((img, idx) => {
+                        if (!knownImageFilenames.has(img.filename)) {
+                            addImageToGrid(img, idx + 1);
+                            knownImageFilenames.add(img.filename);
+                            result.className = 'result visible';
+                        }
+                    });
+                }
+                if (job.composite && !knownImageFilenames.has(job.composite)) {
+                    addCompositeToGrid(job.composite);
+                    knownImageFilenames.add(job.composite);
+                    result.className = 'result visible';
+                }
+            }
+
+            if (latest.id !== lastCompletedJobId) {
+                lastCompletedJobId = latest.id;
+                if (latest.state === 'done') {
+                    const info = latest.composite
+                        ? `Generated ${(latest.images || []).length} images + 1 composite in ${(latest.generation_time || 0).toFixed(1)}s`
+                        : `Generated ${(latest.images || []).length} image(s) in ${(latest.generation_time || 0).toFixed(1)}s`;
+                    generationInfo.textContent = info;
+                    loadHistory();
+                } else if (latest.state === 'failed') {
+                    status.className = 'status error';
+                    statusText.textContent = 'Error: ' + (latest.error || 'Unknown error');
+                } else if (latest.state === 'canceled') {
+                    generationInfo.textContent = 'Job canceled';
+                }
+            }
+        }
+
         async function pollStatus() {
             try {
                 const response = await fetch('/status', { headers: getAuthHeaders() });
-                
+
                 if (response.status === 401) {
-                    clearInterval(pollInterval);
-                    pollInterval = null;
-                    submitBtn.disabled = false;
+                    if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
                     status.className = 'status error';
                     statusText.textContent = 'Error: Unauthorized. Please check your API Key.';
                     return;
                 }
-                
+
                 if (!response.ok) {
                     throw new Error(`HTTP error! status: ${response.status}`);
                 }
-                
+
                 const data = await response.json();
-                
-                if (data.generating) {
-                    submitBtn.disabled = true;
-                    status.className = 'status generating';
-
-                    // Build status text with step progress
-                    let stepInfo = '';
-                    if (data.total_steps > 0 && data.step > 0) {
-                        stepInfo = ` (step ${data.step} of ${data.total_steps})`;
-                    }
-                    if (data.batch > 1) {
-                        statusText.textContent = `Generating: ${data.current} / ${data.batch}${stepInfo}...`;
-                    } else {
-                        statusText.textContent = data.step > 0
-                            ? `Generating: step ${data.step} of ${data.total_steps}...`
-                            : 'Generating...';
-                    }
-
-                    const progressTracker = document.getElementById('progressTracker');
-                    const progressBar = document.getElementById('progressBar');
-                    const progressText = document.getElementById('progressText');
-
-                    // Show progress bar based on steps (always) or batch progress
-                    if (data.total_steps > 0) {
-                        progressTracker.style.display = 'block';
-                        const batch = Math.max(1, data.batch || 1);
-                        const totalStepsAll = data.total_steps * batch;
-                        const stepsDone = (data.current - 1) * data.total_steps + data.step;
-                        if (batch > 1) {
-                            progressBar.style.width = `${(stepsDone / totalStepsAll) * 100}%`;
-                        } else {
-                            progressBar.style.width = `${(data.step / data.total_steps) * 100}%`;
-                        }
-
-                        const pct = Math.min(100, Math.round((stepsDone / totalStepsAll) * 100));
-                        progressText.textContent = `${pct}% complete`;
-                    } else {
-                        progressTracker.style.display = 'none';
-                    }
-                    
-                    // Live preview (only when user enabled it; server emits preview_step > 0).
-                    // Use preview_ts as the cache buster so new generations don't collide
-                    // with cached step-N images from previous generations.
-                    if (data.preview && data.preview_ts && data.preview_ts !== lastPreviewStep) {
-                        const pwrap = document.getElementById('previewWrap');
-                        const pimg = document.getElementById('previewImgLive');
-                        if (pwrap && pimg) {
-                            pimg.src = `/images/${data.preview}?t=${data.preview_ts}`;
-                            pwrap.style.display = 'block';
-                        }
-                        lastPreviewStep = data.preview_ts;
-                    }
-
-                    // Show images as they arrive
-                    if (data.images && data.images.length > 0) {
-                        result.className = 'result visible';
-                        data.images.forEach((img, i) => {
-                            if (!knownImageFilenames.has(img.filename)) {
-                                addImageToGrid(img, i + 1);
-                                knownImageFilenames.add(img.filename);
-                            }
-                        });
-                    }
-                } else {
-                    // Generation finished
-                    clearInterval(pollInterval);
-                    pollInterval = null;
-                    submitBtn.disabled = false;
-
-                    if (data.done) {
-                        status.className = 'status';
-                        result.className = 'result visible';
-                        document.getElementById('progressTracker').style.display = 'none';
-                        const pwrapDone = document.getElementById('previewWrap');
-                        if (pwrapDone) pwrapDone.style.display = 'none';
-                        
-                        // Add any remaining images
-                        if (data.images) {
-                            data.images.forEach((img, i) => {
-                                if (!knownImageFilenames.has(img.filename)) {
-                                    addImageToGrid(img, i + 1);
-                                    knownImageFilenames.add(img.filename);
-                                }
-                            });
-                        }
-                        
-                        // Add composite if present
-                        if (data.composite && !knownImageFilenames.has(data.composite)) {
-                            addCompositeToGrid(data.composite);
-                            knownImageFilenames.add(data.composite);
-                        }
-                        
-                        generationInfo.textContent = data.composite
-                            ? `Generated ${data.images.length} images + 1 composite in ${data.generation_time.toFixed(1)}s`
-                            : `Generated ${data.images.length} image(s) in ${data.generation_time.toFixed(1)}s`;
-                        
-                        loadHistory();
-                    } else if (data.error) {
-                        status.className = 'status error';
-                        statusText.textContent = 'Error: ' + data.error;
-                        document.getElementById('progressTracker').style.display = 'none';
-                        const pwrapErr = document.getElementById('previewWrap');
-                        if (pwrapErr) pwrapErr.style.display = 'none';
-                    } else {
-                        status.className = 'status'; // Idle
-                    }
-                }
+                renderRunning(data.running);
+                renderQueue(data.queued || []);
+                renderRecentDone(data.recent_done || []);
             } catch (err) {
                 console.error('Polling error:', err);
-                // Don't clear interval here, server might be briefly down or network issue
             }
         }
 
@@ -1239,15 +1426,8 @@ HTML_PAGE = """
                 formData.aspect_mode = aspectModeEl ? aspectModeEl.value : 'keep';
             }
 
-            knownImageFilenames.clear();
-            imageGrid.innerHTML = '';
-            result.className = 'result';
+            // Briefly disable to prevent double-submit during the fetch; re-enable on response.
             submitBtn.disabled = true;
-            status.className = 'status generating';
-            statusText.textContent = 'Starting generation...';
-            lastPreviewStep = -1;
-            const previewWrapEl = document.getElementById('previewWrap');
-            if (previewWrapEl) previewWrapEl.style.display = 'none';
 
             try {
                 const response = await fetch('/generate', {
@@ -1255,48 +1435,34 @@ HTML_PAGE = """
                     headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
                     body: JSON.stringify(formData)
                 });
-                
-                if (response.status === 503) {
-                    statusText.textContent = 'Generation already in progress... joining session.';
-                    if (pollInterval) clearInterval(pollInterval);
-                    pollInterval = setInterval(pollStatus, 1500);
-                    return;
-                }
-                
-                const data = await response.json();
-                
-                if (data.success) {
-                    if (pollInterval) clearInterval(pollInterval);
-                    pollInterval = setInterval(pollStatus, 1500);
+
+                const data = await response.json().catch(() => ({}));
+
+                if (response.ok && data.success) {
+                    const posMsg = data.position > 1 ? `Queued at position ${data.position}` : 'Starting generation...';
+                    status.className = 'status generating';
+                    statusText.textContent = posMsg;
+                    pollStatus();
                 } else {
                     status.className = 'status error';
-                    statusText.textContent = 'Error: ' + (data.error || 'Unknown error');
-                    submitBtn.disabled = false;
+                    statusText.textContent = 'Error: ' + (data.error || `HTTP ${response.status}`);
                 }
             } catch (err) {
                 status.className = 'status error';
-                statusText.textContent = 'Error starting generation: ' + err.message;
+                statusText.textContent = 'Error submitting generation: ' + err.message;
+            } finally {
                 submitBtn.disabled = false;
             }
         }
 
         // Handle visibility change for mobile robustness
         document.addEventListener('visibilitychange', function() {
-            if (document.visibilityState === 'visible') {
-                // If we were supposed to be polling, or just to check current status
-                pollStatus();
-                if (!pollInterval && submitBtn.disabled) {
-                    pollInterval = setInterval(pollStatus, 1500);
-                }
-            }
+            if (document.visibilityState === 'visible') pollStatus();
         });
 
-        // Initial check if server is already generating
-        pollStatus().then(() => {
-            if (submitBtn.disabled && !pollInterval) {
-                pollInterval = setInterval(pollStatus, 1500);
-            }
-        });
+        // Always poll so the queue panel and completed jobs update in real time.
+        pollStatus();
+        pollInterval = setInterval(pollStatus, 1500);
 
         if (submitBtn) submitBtn.addEventListener('click', function(e) { e.preventDefault(); doGenerate(); });
         if (form) form.addEventListener('submit', function(e) { e.preventDefault(); doGenerate(); });
@@ -1363,24 +1529,6 @@ HTML_PAGE = """
         }
 
         const archiveBtn = document.getElementById('archiveBtn');
-        const resetLockBtn = document.getElementById('resetLockBtn');
-
-        if (resetLockBtn) {
-            resetLockBtn.addEventListener('click', async () => {
-                if (!confirm("This will FORCE unlock the server. Only do this if you are certain no image is actually generating!")) return;
-                try {
-                    const response = await fetch('/reset-lock', { 
-                        method: 'POST',
-                        headers: getAuthHeaders()
-                    });
-                    const data = await response.json();
-                    if (data.success) {
-                        alert("Server lock released.");
-                        pollStatus();
-                    }
-                } catch (err) { alert("Failed to reset lock: " + err.message); }
-            });
-        }
 
         archiveBtn.addEventListener('click', async () => {
             if (!confirm("Move all of today's images to the archive folder?")) return;
@@ -1422,256 +1570,279 @@ HTML_PAGE = """
 """
 
 
-def background_generation_task(data):
-    """Background task for image generation, ensuring it continues if client disconnects."""
-    global _current_status
-    
-    try:
-        prompt = data.get('prompt', '').strip()
-        orientation = data.get('orientation', 'landscape')
-        size = data.get('size', '1mp')
-        steps = int(data.get('steps', 25))
-        seed = data.get('seed')
-        guidance_scale = data.get('guidance')
-        batch = min(max(int(data.get('batch', 1)), 1), 128)
-        
-        # Handle input image
-        input_image = None
-        strength = float(data.get('strength', 0.5))
-        input_image_b64 = data.get('input_image')
-        if input_image_b64:
-            if ',' in input_image_b64:
-                input_image_b64 = input_image_b64.split(',', 1)[1]
-            image_data = base64.b64decode(input_image_b64)
-            input_image = Image.open(io.BytesIO(image_data)).convert('RGB')
+def _run_job(job: Job):
+    """Execute one generation job, writing progress/results into the Job object."""
+    data = job.params
+    prompt = (data.get('prompt') or '').strip()
+    orientation = data.get('orientation', 'landscape')
+    size = data.get('size', '1mp')
+    steps = int(data.get('steps', 25))
+    seed = data.get('seed')
+    guidance_scale = data.get('guidance')
+    batch = min(max(int(data.get('batch', 1)), 1), 128)
 
-        # Dimensions
-        scale = SIZES.get(size, 1.0)
-        aspect_mode = data.get('aspect_mode', 'keep')
+    # Handle input image
+    input_image = None
+    strength = float(data.get('strength', 0.5))
+    input_image_b64 = data.get('input_image')
+    if input_image_b64:
+        if ',' in input_image_b64:
+            input_image_b64 = input_image_b64.split(',', 1)[1]
+        image_data = base64.b64decode(input_image_b64)
+        input_image = Image.open(io.BytesIO(image_data)).convert('RGB')
 
-        if input_image is not None and aspect_mode == 'keep':
-            in_w, in_h = input_image.size
-            target_pixels = 1_000_000 * (scale ** 2)
-            current_pixels = in_w * in_h
-            factor = (target_pixels / current_pixels) ** 0.5
-            width = int(round(in_w * factor / 8) * 8)
-            height = int(round(in_h * factor / 8) * 8)
+    # Dimensions
+    scale = SIZES.get(size, 1.0)
+    aspect_mode = data.get('aspect_mode', 'keep')
+
+    if input_image is not None and aspect_mode == 'keep':
+        in_w, in_h = input_image.size
+        target_pixels = 1_000_000 * (scale ** 2)
+        current_pixels = in_w * in_h
+        factor = (target_pixels / current_pixels) ** 0.5
+        width = int(round(in_w * factor / 8) * 8)
+        height = int(round(in_h * factor / 8) * 8)
+    else:
+        base_w, base_h = ORIENTATIONS_1K.get(orientation, ORIENTATIONS_1K['landscape'])
+        width, height = int(base_w * scale), int(base_h * scale)
+
+    spectrum_grid = data.get('spectrum_grid', False)
+    spectrum_same_seed = data.get('spectrum_same_seed', True)
+    selected_cells = data.get('selected_cells', []) # Indices 0-15
+
+    if spectrum_grid:
+        guidance_values = [0] if _schnell else [1.0, 3.0, 5.0, 7.0]
+        strength_values = [0.2, 0.4, 0.6, 0.8] if input_image else [0.0, 0.0, 0.0, 0.0] # Dummy if no image
+
+        if selected_cells:
+            total_batch = len(selected_cells)
+        elif input_image and not _schnell:
+            # Fallback to diagonals if nothing selected but somehow grid is on
+            total_batch = 8
         else:
-            base_w, base_h = ORIENTATIONS_1K.get(orientation, ORIENTATIONS_1K['landscape'])
-            width, height = int(base_w * scale), int(base_h * scale)
+            total_batch = len(strength_values) * len(guidance_values)
+    else:
+        total_batch = batch
 
-        spectrum_grid = data.get('spectrum_grid', False)
-        spectrum_same_seed = data.get('spectrum_same_seed', True)
-        selected_cells = data.get('selected_cells', []) # Indices 0-15
+    job.batch = total_batch
+    job.total_steps = steps
 
-        if spectrum_grid:
-            guidance_values = [0] if _schnell else [1.0, 3.0, 5.0, 7.0]
-            strength_values = [0.2, 0.4, 0.6, 0.8] if input_image else [0.0, 0.0, 0.0, 0.0] # Dummy if no image
+    show_preview = bool(data.get('show_preview', False))
+    preview_state = {"last_decode": 0.0}
 
-            if selected_cells:
-                total_batch = len(selected_cells)
-            elif input_image and not _schnell:
-                # Fallback to diagonals if nothing selected but somehow grid is on
-                total_batch = 8
-            else:
-                total_batch = len(strength_values) * len(guidance_values)
-        else:
-            total_batch = batch
-
-        _current_status["batch"] = total_batch
-        _current_status["total_steps"] = steps
-
-        show_preview = bool(data.get('show_preview', False))
-        preview_state = {"last_decode": 0.0}
-
-        def _step_callback(pipe_obj, step_index, timestep, callback_kwargs):
-            _current_status["step"] = step_index + 1
-            if show_preview:
-                now = time.perf_counter()
-                is_final = (step_index + 1) >= steps
-                if is_final or (now - preview_state["last_decode"]) >= PREVIEW_MIN_INTERVAL_S:
-                    latents = callback_kwargs.get("latents")
-                    preview_img = fl24bit.decode_latents_to_preview(
-                        pipe_obj, latents, height, width
-                    )
-                    if preview_img is not None:
-                        try:
-                            preview_img.save(os.path.join(OUTPUT_DIR, PREVIEW_FILENAME))
-                            _current_status["preview"] = PREVIEW_FILENAME
-                            _current_status["preview_step"] = step_index + 1
-                            _current_status["preview_ts"] = int(time.time() * 1000)
-                            preview_state["last_decode"] = now
-                        except Exception as e:
-                            print(f"[preview] save failed: {e}", flush=True)
-            return callback_kwargs
-
-        start_time = time.perf_counter()
-
-        if spectrum_grid:
-            grid_seed = seed if seed is not None else random.randint(0, 2**32 - 1)
-            grid_cells = []
-
-            # We still want to build a full 4x4 grid for the composite, but only generate selected
-            guidance_values = [0] if _schnell else [1.0, 3.0, 5.0, 7.0]
-            strength_values = [0.2, 0.4, 0.6, 0.8] if input_image else [0.0, 0.2, 0.4, 0.6] # Use some defaults if no image for grid
-
-            generated_count = 0
-            for r_idx, s_val in enumerate(strength_values):
-                row_images = []
-                for c_idx, g_val in enumerate(guidance_values):
-                    cell_idx = r_idx * 4 + c_idx
-
-                    # Check if this cell should be generated
-                    should_gen = False
-                    if selected_cells:
-                        should_gen = cell_idx in selected_cells
-                    elif input_image and not _schnell:
-                        # Legacy diagonal logic
-                        is_main_diag = (r_idx == c_idx)
-                        is_anti_diag = (r_idx == len(guidance_values) - 1 - c_idx)
-                        should_gen = is_main_diag or is_anti_diag
-                    else:
-                        should_gen = True
-
-                    if not should_gen:
-                        row_images.append(None)
-                        continue
-
-                    generated_count += 1
-                    _current_status["current"] = generated_count
-                    _current_status["step"] = 0
-                    current_seed = grid_seed if spectrum_same_seed else random.randint(0, 2**32 - 1)
-
-                    image, used_seed, timings = generate_image(
-                        prompt, seed=current_seed, steps=steps, width=width, height=height,
-                        local_encoder=_local_encoder, input_image=input_image,
-                        strength=(s_val if input_image else 0.5),
-                        guidance_scale=g_val,
-                        callback_on_step_end=_step_callback
-                    )                    
-                    t_save = time.perf_counter()
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    unique_id = uuid.uuid4().hex[:8]
-                    g_str = str(g_val).replace('.', '_')
-                    s_str = f"str_{s_val}" if s_val is not None else "txt2img"
-                    output_filename = f"flux{fl24bit._flux_version}_{timestamp}_g{g_str}_{s_str}_{unique_id}.png"
-                    output_path = os.path.join(OUTPUT_DIR, output_filename)
-                    image.save(output_path)
-                    timings['save'] = time.perf_counter() - t_save
-                    save_prompt_file(output_path, prompt, prompt, width, height, used_seed, steps, timings, g_val, s_val if input_image else None)
-                    
-                    img_data = {
-                        "filename": output_filename,
-                        "seed": used_seed,
-                        "guidance": g_val,
-                        "strength": s_val,
-                        "timings": {
-                            'encoding': round(timings['encoding'], 2),
-                            'diffusion': round(timings['diffusion'], 2),
-                            'save': round(timings['save'], 2),
-                            'total': round(timings['encoding'] + timings['diffusion'] + timings['save'], 2)
-                        }
-                    }
-                    _current_status["images"].append(img_data)
-                    row_images.append((image.copy(), generated_count))
-                grid_cells.append(row_images)
-
-            # Create composite
-            # Calculate cell size based on aspect ratio
-            aspect_ratio = width / height
-            if width >= height:
-                cell_width = 256
-                cell_height = int(round(cell_width / aspect_ratio))
-            else:
-                cell_height = 256
-                cell_width = int(round(cell_height * aspect_ratio))
-
-            n_rows, n_cols = len(grid_cells), len(grid_cells[0])
-            composite = Image.new('RGB', (n_cols * cell_width, n_rows * cell_height), (32, 32, 32))
-            for row_idx, row_images in enumerate(grid_cells):
-                for col_idx, cell in enumerate(row_images):
-                    if cell is None: continue # Skip empty diagonal cells
-                    img, _seq = cell
-                    img_small = img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
-                    composite.paste(img_small, (col_idx * cell_width, row_idx * cell_height))
-
-            # Overlay the generation-sequence number on each populated cell
-            draw = ImageDraw.Draw(composite)
-            font_size = max(14, cell_height // 12)
-            font = None
-            for font_path in (
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-                "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-            ):
-                if os.path.exists(font_path):
+    def _step_callback(pipe_obj, step_index, timestep, callback_kwargs):
+        job.step = step_index + 1
+        if show_preview:
+            now = time.perf_counter()
+            is_final = (step_index + 1) >= steps
+            if is_final or (now - preview_state["last_decode"]) >= PREVIEW_MIN_INTERVAL_S:
+                latents = callback_kwargs.get("latents")
+                preview_img = fl24bit.decode_latents_to_preview(
+                    pipe_obj, latents, height, width
+                )
+                if preview_img is not None:
                     try:
-                        font = ImageFont.truetype(font_path, font_size)
-                        break
-                    except Exception:
-                        font = None
-            if font is None:
-                font = ImageFont.load_default()
-            for row_idx, row_images in enumerate(grid_cells):
-                for col_idx, cell in enumerate(row_images):
-                    if cell is None: continue
-                    _img, seq = cell
-                    label = str(seq)
-                    pad = 4
-                    bbox = draw.textbbox((0, 0), label, font=font)
-                    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-                    x0 = col_idx * cell_width + 6
-                    y0 = row_idx * cell_height + 6
-                    draw.rectangle(
-                        [x0 - pad, y0 - pad, x0 + tw + pad, y0 + th + pad],
-                        fill=(0, 0, 0),
-                    )
-                    draw.text((x0 - bbox[0], y0 - bbox[1]), label, fill=(255, 255, 255), font=font)
+                        preview_img.save(os.path.join(OUTPUT_DIR, PREVIEW_FILENAME))
+                        job.preview = PREVIEW_FILENAME
+                        job.preview_step = step_index + 1
+                        job.preview_ts = int(time.time() * 1000)
+                        preview_state["last_decode"] = now
+                    except Exception as e:
+                        print(f"[preview] save failed: {e}", flush=True)
+        return callback_kwargs
 
-            comp_filename = f"flux{fl24bit._flux_version}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_spectrum_grid.png"
-            composite.save(os.path.join(OUTPUT_DIR, comp_filename))
-            _current_status["composite"] = comp_filename
-        else:
-            for i in range(batch):
-                _current_status["current"] = i + 1
-                _current_status["step"] = 0
-                current_seed = (seed + i) if seed is not None else None
+    start_time = time.perf_counter()
+
+    if spectrum_grid:
+        grid_seed = seed if seed is not None else random.randint(0, 2**32 - 1)
+        grid_cells = []
+
+        # We still want to build a full 4x4 grid for the composite, but only generate selected
+        guidance_values = [0] if _schnell else [1.0, 3.0, 5.0, 7.0]
+        strength_values = [0.2, 0.4, 0.6, 0.8] if input_image else [0.0, 0.2, 0.4, 0.6] # Use some defaults if no image for grid
+
+        generated_count = 0
+        for r_idx, s_val in enumerate(strength_values):
+            row_images = []
+            for c_idx, g_val in enumerate(guidance_values):
+                cell_idx = r_idx * 4 + c_idx
+
+                # Check if this cell should be generated
+                should_gen = False
+                if selected_cells:
+                    should_gen = cell_idx in selected_cells
+                elif input_image and not _schnell:
+                    # Legacy diagonal logic
+                    is_main_diag = (r_idx == c_idx)
+                    is_anti_diag = (r_idx == len(guidance_values) - 1 - c_idx)
+                    should_gen = is_main_diag or is_anti_diag
+                else:
+                    should_gen = True
+
+                if not should_gen:
+                    row_images.append(None)
+                    continue
+
+                generated_count += 1
+                job.current = generated_count
+                job.step = 0
+                current_seed = grid_seed if spectrum_same_seed else random.randint(0, 2**32 - 1)
+
                 image, used_seed, timings = generate_image(
                     prompt, seed=current_seed, steps=steps, width=width, height=height,
-                    local_encoder=_local_encoder, input_image=input_image, strength=strength,
-                    guidance_scale=guidance_scale,
+                    local_encoder=_local_encoder, input_image=input_image,
+                    strength=(s_val if input_image else 0.5),
+                    guidance_scale=g_val,
                     callback_on_step_end=_step_callback
-                )
-                
+                )                    
                 t_save = time.perf_counter()
-                output_filename = f"flux{fl24bit._flux_version}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.png"
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                unique_id = uuid.uuid4().hex[:8]
+                g_str = str(g_val).replace('.', '_')
+                s_str = f"str_{s_val}" if s_val is not None else "txt2img"
+                output_filename = f"flux{fl24bit._flux_version}_{timestamp}_g{g_str}_{s_str}_{unique_id}.png"
                 output_path = os.path.join(OUTPUT_DIR, output_filename)
                 image.save(output_path)
                 timings['save'] = time.perf_counter() - t_save
-                save_prompt_file(output_path, prompt, prompt, width, height, used_seed, steps, timings, guidance_scale, strength if input_image else None)
-
+                save_prompt_file(output_path, prompt, prompt, width, height, used_seed, steps, timings, g_val, s_val if input_image else None)
+                
                 img_data = {
-                    'filename': output_filename,
-                    'seed': used_seed,
-                    'guidance': guidance_scale,
-                    'strength': strength if input_image else None,
-                    'timings': {
+                    "filename": output_filename,
+                    "seed": used_seed,
+                    "guidance": g_val,
+                    "strength": s_val,
+                    "timings": {
                         'encoding': round(timings['encoding'], 2),
                         'diffusion': round(timings['diffusion'], 2),
                         'save': round(timings['save'], 2),
                         'total': round(timings['encoding'] + timings['diffusion'] + timings['save'], 2)
                     }
                 }
-                _current_status["images"].append(img_data)
+                job.images.append(img_data)
+                row_images.append((image.copy(), generated_count))
+            grid_cells.append(row_images)
 
-        _current_status["generation_time"] = time.perf_counter() - start_time
-        _current_status["done"] = True
-    except Exception as e:
-        print(f"Background generation error: {e}")
-        _current_status["error"] = str(e)
-    finally:
-        _current_status["generating"] = False
-        if _generation_lock.locked():
-            _generation_lock.release()
+        # Create composite
+        # Calculate cell size based on aspect ratio
+        aspect_ratio = width / height
+        if width >= height:
+            cell_width = 256
+            cell_height = int(round(cell_width / aspect_ratio))
+        else:
+            cell_height = 256
+            cell_width = int(round(cell_height * aspect_ratio))
+
+        n_rows, n_cols = len(grid_cells), len(grid_cells[0])
+        composite = Image.new('RGB', (n_cols * cell_width, n_rows * cell_height), (32, 32, 32))
+        for row_idx, row_images in enumerate(grid_cells):
+            for col_idx, cell in enumerate(row_images):
+                if cell is None: continue # Skip empty diagonal cells
+                img, _seq = cell
+                img_small = img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
+                composite.paste(img_small, (col_idx * cell_width, row_idx * cell_height))
+
+        # Overlay the generation-sequence number on each populated cell
+        draw = ImageDraw.Draw(composite)
+        font_size = max(14, cell_height // 12)
+        font = None
+        for font_path in (
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        ):
+            if os.path.exists(font_path):
+                try:
+                    font = ImageFont.truetype(font_path, font_size)
+                    break
+                except Exception:
+                    font = None
+        if font is None:
+            font = ImageFont.load_default()
+        for row_idx, row_images in enumerate(grid_cells):
+            for col_idx, cell in enumerate(row_images):
+                if cell is None: continue
+                _img, seq = cell
+                label = str(seq)
+                pad = 4
+                bbox = draw.textbbox((0, 0), label, font=font)
+                tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                x0 = col_idx * cell_width + 6
+                y0 = row_idx * cell_height + 6
+                draw.rectangle(
+                    [x0 - pad, y0 - pad, x0 + tw + pad, y0 + th + pad],
+                    fill=(0, 0, 0),
+                )
+                draw.text((x0 - bbox[0], y0 - bbox[1]), label, fill=(255, 255, 255), font=font)
+
+        comp_filename = f"flux{fl24bit._flux_version}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_spectrum_grid.png"
+        composite.save(os.path.join(OUTPUT_DIR, comp_filename))
+        job.composite = comp_filename
+    else:
+        for i in range(batch):
+            job.current = i + 1
+            job.step = 0
+            current_seed = (seed + i) if seed is not None else None
+            image, used_seed, timings = generate_image(
+                prompt, seed=current_seed, steps=steps, width=width, height=height,
+                local_encoder=_local_encoder, input_image=input_image, strength=strength,
+                guidance_scale=guidance_scale,
+                callback_on_step_end=_step_callback
+            )
+            
+            t_save = time.perf_counter()
+            output_filename = f"flux{fl24bit._flux_version}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.png"
+            output_path = os.path.join(OUTPUT_DIR, output_filename)
+            image.save(output_path)
+            timings['save'] = time.perf_counter() - t_save
+            save_prompt_file(output_path, prompt, prompt, width, height, used_seed, steps, timings, guidance_scale, strength if input_image else None)
+
+            img_data = {
+                'filename': output_filename,
+                'seed': used_seed,
+                'guidance': guidance_scale,
+                'strength': strength if input_image else None,
+                'timings': {
+                    'encoding': round(timings['encoding'], 2),
+                    'diffusion': round(timings['diffusion'], 2),
+                    'save': round(timings['save'], 2),
+                    'total': round(timings['encoding'] + timings['diffusion'] + timings['save'], 2)
+                }
+            }
+            job.images.append(img_data)
+
+    job.generation_time = time.perf_counter() - start_time
+
+
+def _queue_worker():
+    """Single long-running thread that consumes queued jobs one at a time."""
+    global _running_job
+    while True:
+        with _queue_cv:
+            while not _pending:
+                _queue_cv.wait()
+            job = _pending.pop(0)
+            _running_job = job
+        job.state = 'running'
+        job.started_at = time.time()
+        try:
+            _run_job(job)
+            job.state = 'done'
+        except Exception as e:
+            print(f"[queue] job {job.id} failed: {e}", flush=True)
+            job.state = 'failed'
+            job.error = str(e)
+        finally:
+            job.finished_at = time.time()
+            with _queue_cv:
+                _running_job = None
+                _recent_done.insert(0, job)
+                del _recent_done[RECENT_DONE_MAX:]
+
+
+def _start_queue_worker():
+    global _queue_worker_thread
+    if _queue_worker_thread is None or not _queue_worker_thread.is_alive():
+        _queue_worker_thread = threading.Thread(target=_queue_worker, daemon=True, name="queue-worker")
+        _queue_worker_thread.start()
 
 
 @app.route('/')
@@ -1694,37 +1865,24 @@ def ready():
 def generate():
     if not _model_ready:
         return jsonify({'success': False, 'error': 'Model still loading. Please wait.'}), 503
-    if not _generation_lock.acquire(blocking=False):
-        return jsonify({'success': False, 'error': 'Generation in progress'}), 503
-    
-    try:
-        # Initialize status for new run BEFORE starting thread to avoid race conditions
-        global _current_status
-        data = request.json
-        _current_status = {
-            "generating": True,
-            "prompt": data.get('prompt', ''),
-            "current": 0,
-            "batch": 0,
-            "step": 0,
-            "total_steps": 0,
-            "images": [],
-            "composite": None,
-            "done": False,
-            "error": None,
-            "generation_time": 0,
-            "preview": None,
-            "preview_step": 0,
-            "preview_ts": 0
-        }
-        
-        # Logic is moved to thread, release is handled by thread finally
-        threading.Thread(target=background_generation_task, args=(data,)).start()
-        return jsonify({'success': True})
-    except Exception as e:
-        if _generation_lock.locked():
-            _generation_lock.release()
-        return jsonify({'success': False, 'error': str(e)}), 500
+
+    data = request.json or {}
+    prompt = (data.get('prompt') or '').strip()
+    if not prompt:
+        return jsonify({'success': False, 'error': 'prompt is required'}), 400
+
+    with _queue_cv:
+        if len(_pending) >= QUEUE_MAX_SIZE:
+            return jsonify({
+                'success': False,
+                'error': f'Queue is full ({QUEUE_MAX_SIZE} max). Cancel a queued job or wait.',
+            }), 429
+        job = Job(id=uuid.uuid4().hex[:12], params=data, submitted_at=time.time())
+        _pending.append(job)
+        position = len(_pending)  # 1-based position of this job in the pending list
+        _queue_cv.notify()
+
+    return jsonify({'success': True, 'job_id': job.id, 'position': position})
 
 
 @app.route('/images/<filename>')
@@ -1734,22 +1892,32 @@ def serve_image(filename):
 
 @app.route('/status')
 def status():
-    return jsonify(_current_status)
+    with _queue_cv:
+        running = _running_job.full() if _running_job else None
+        queued = [j.summary() for j in _pending]
+        recent = [j.full() for j in _recent_done]
+    return jsonify({
+        'running': running,
+        'queued': queued,
+        'recent_done': recent,
+        'queue_max_size': QUEUE_MAX_SIZE,
+    })
 
 
-@app.route('/reset-lock', methods=['POST'])
-def reset_lock():
-    if not check_auth():
-        return jsonify({"success": False, "error": "Unauthorized"}), 401
-        
-    global _current_status
-    if _generation_lock.locked():
-        _generation_lock.release()
-        
-    _current_status["generating"] = False
-    _current_status["done"] = False
-    _current_status["error"] = "Lock reset by user."
-    return jsonify({"success": True, "message": "Server lock has been manually released."})
+@app.route('/jobs/<job_id>/cancel', methods=['POST'])
+def cancel_job(job_id):
+    with _queue_cv:
+        for i, j in enumerate(_pending):
+            if j.id == job_id:
+                j.state = 'canceled'
+                j.finished_at = time.time()
+                del _pending[i]
+                _recent_done.insert(0, j)
+                del _recent_done[RECENT_DONE_MAX:]
+                return jsonify({'success': True, 'message': f'Job {job_id} canceled'})
+        if _running_job and _running_job.id == job_id:
+            return jsonify({'success': False, 'error': 'Cannot cancel a running job'}), 400
+    return jsonify({'success': False, 'error': 'Job not found'}), 404
 
 
 @app.route('/model-info')
@@ -1917,5 +2085,6 @@ if __name__ == '__main__':
 
     _model_load_start_ts = time.perf_counter()
     threading.Thread(target=_load_in_background, daemon=True).start()
+    _start_queue_worker()
     print(f"\nStarting web server on http://0.0.0.0:{args.port} (model loading in background)")
     app.run(host='0.0.0.0', port=args.port, threaded=True)
