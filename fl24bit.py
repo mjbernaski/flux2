@@ -858,6 +858,7 @@ def main():
         'portrait': (768, 1344),
         'landscape': (1344, 768),
         '16:9': (1360, 768),
+        'wide': (1360, 768),  # 16:9 alias
         'widescreen': (1568, 672),  # ~21:9 extra-wide
     }
     # Size presets
@@ -896,7 +897,7 @@ def main():
     print("  '/square' - Set square aspect ratio")
     print("  '/portrait' - Set portrait aspect ratio")
     print("  '/landscape' - Set landscape aspect ratio")
-    print("  '/16:9' - Set 16:9 widescreen aspect ratio")
+    print("  '/16:9' or '/wide' - Set 16:9 widescreen aspect ratio")
     print("  '/widescreen' - Set 21:9 extra-wide aspect ratio")
     print("  '/0.75' - Set 0.75K resolution (smaller/faster)")
     print("  '/1k' - Set 1K resolution (default)")
@@ -970,7 +971,7 @@ def main():
                     print(f"Could not load image '{image_arg}': {e}")
             continue
 
-        if lower_input in ('/square', '/portrait', '/landscape', '/16:9', '/widescreen'):
+        if lower_input in ('/square', '/portrait', '/landscape', '/16:9', '/wide', '/widescreen'):
             orientation = lower_input[1:]  # Remove the leading /
             base_w, base_h = orientations_1k[orientation]
             width, height = int(base_w * sizes[size]), int(base_h * sizes[size])
@@ -993,7 +994,7 @@ def main():
             if lower_word in ('/0.75', '/1k', '/2k', '/4k'):
                 size = lower_word[1:]
                 modifiers_found.append(f"size={size}")
-            elif lower_word in ('/square', '/portrait', '/landscape', '/16:9', '/widescreen'):
+            elif lower_word in ('/square', '/portrait', '/landscape', '/16:9', '/wide', '/widescreen'):
                 orientation = lower_word[1:]
                 modifiers_found.append(f"orientation={orientation}")
             else:

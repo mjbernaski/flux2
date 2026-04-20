@@ -111,6 +111,7 @@ ORIENTATIONS_1K = {
     'square': (1024, 1024),
     'portrait': (768, 1344),
     'landscape': (1344, 768),
+    'wide': (1360, 768),  # 16:9
     'widescreen': (1568, 672),  # ~21:9 extra-wide, ~1 MP
 }
 
@@ -670,6 +671,7 @@ HTML_PAGE = """
                     <option value="square">Square</option>
                     <option value="landscape" selected>Landscape</option>
                     <option value="portrait">Portrait</option>
+                    <option value="wide">Wide (16:9)</option>
                     <option value="widescreen">Extra-wide (21:9)</option>
                 </select>
             </div>
