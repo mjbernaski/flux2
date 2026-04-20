@@ -11,7 +11,7 @@ from datetime import datetime
 import random
 import uuid
 from flask import Flask, request, jsonify, send_from_directory, Response, stream_with_context
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from dotenv import load_dotenv
 
 # Load .env file if it exists
@@ -89,14 +89,21 @@ _current_status = {
     "composite": None,
     "done": False,
     "error": None,
-    "generation_time": 0
+    "generation_time": 0,
+    "preview": None,
+    "preview_step": 0,
+    "preview_ts": 0
 }
+
+PREVIEW_FILENAME = "_preview_current.png"
+PREVIEW_MIN_INTERVAL_S = 0.75  # throttle: skip decode if last preview was this recent
 
 # Orientation presets (width, height) at 1K base
 ORIENTATIONS_1K = {
     'square': (1024, 1024),
     'portrait': (768, 1344),
     'landscape': (1344, 768),
+    'widescreen': (1568, 672),  # ~21:9 extra-wide, ~1 MP
 }
 
 SIZES = {
@@ -422,6 +429,7 @@ HTML_PAGE = """
             font-size: 18px;
             margin: 0;
         }
+        .history-actions { display: flex; gap: 8px; }
         .archive-btn {
             flex: 0 0 auto;
             padding: 8px 16px;
@@ -432,6 +440,37 @@ HTML_PAGE = """
             border-radius: 6px;
         }
         .archive-btn:hover:not(:disabled) { background: #d35400; }
+        .delete-btn {
+            flex: 0 0 auto;
+            padding: 8px 16px;
+            background: #c0392b;
+            color: #fff;
+            font-size: 13px;
+            font-weight: bold;
+            border-radius: 6px;
+        }
+        .delete-btn:hover:not(:disabled) { background: #992d22; }
+        .history-item .item-delete {
+            position: absolute;
+            top: 4px;
+            right: 4px;
+            width: 22px;
+            height: 22px;
+            padding: 0;
+            background: rgba(192, 57, 43, 0.85);
+            color: #fff;
+            border: none;
+            border-radius: 4px;
+            font-size: 13px;
+            font-weight: bold;
+            line-height: 1;
+            cursor: pointer;
+            opacity: 0;
+            transition: opacity 0.2s;
+            z-index: 2;
+        }
+        .history-item:hover .item-delete { opacity: 1; }
+        .history-item .item-delete:hover { background: rgba(153, 45, 34, 1); }
         .history-grid {
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
@@ -581,6 +620,7 @@ HTML_PAGE = """
                     <option value="square">Square</option>
                     <option value="landscape" selected>Landscape</option>
                     <option value="portrait">Portrait</option>
+                    <option value="widescreen">Extra-wide (21:9)</option>
                 </select>
             </div>
             <div class="form-group">
@@ -668,6 +708,15 @@ HTML_PAGE = """
             </div>
         </div>
 
+        <div class="row">
+            <div class="form-group">
+                <label class="checkbox-label">
+                    <input type="checkbox" id="showPreview">
+                    Show live preview (slower — decodes each step)
+                </label>
+            </div>
+        </div>
+
         <div class="button-row">
             <button type="submit" id="submitBtn">Generate Image</button>
             <button type="button" class="reset-btn" id="resetBtn">Reset</button>
@@ -683,6 +732,9 @@ HTML_PAGE = """
             </div>
             <span class="progress-text" id="progressText">0 / 0</span>
         </div>
+        <div class="preview-wrap" id="previewWrap" style="display: none; margin-top: 12px;">
+            <img id="previewImgLive" alt="Live preview" style="max-width: 512px; width: 100%; border-radius: 6px; display: block;">
+        </div>
     </div>
 
     <div class="result" id="result">
@@ -693,7 +745,10 @@ HTML_PAGE = """
     <div class="history-section" id="historySection">
         <div class="history-header">
             <h2>Today's Generations</h2>
-            <button type="button" class="archive-btn" id="archiveBtn" style="display: none;">Archive Today</button>
+            <div class="history-actions">
+                <button type="button" class="archive-btn" id="archiveBtn" style="display: none;">Archive Today</button>
+                <button type="button" class="delete-btn" id="deleteAllBtn" style="display: none;">Delete Today</button>
+            </div>
         </div>
         <div class="history-grid" id="historyGrid"></div>
     </div>
@@ -766,6 +821,7 @@ HTML_PAGE = """
         
         let pollInterval = null;
         let knownImageFilenames = new Set();
+        let lastPreviewStep = -1;
 
         if (strengthSlider) strengthSlider.addEventListener('input', function() { if (strengthValue) strengthValue.textContent = strengthSlider.value; });
 
@@ -945,6 +1001,19 @@ HTML_PAGE = """
                         progressTracker.style.display = 'none';
                     }
                     
+                    // Live preview (only when user enabled it; server emits preview_step > 0).
+                    // Use preview_ts as the cache buster so new generations don't collide
+                    // with cached step-N images from previous generations.
+                    if (data.preview && data.preview_ts && data.preview_ts !== lastPreviewStep) {
+                        const pwrap = document.getElementById('previewWrap');
+                        const pimg = document.getElementById('previewImgLive');
+                        if (pwrap && pimg) {
+                            pimg.src = `/images/${data.preview}?t=${data.preview_ts}`;
+                            pwrap.style.display = 'block';
+                        }
+                        lastPreviewStep = data.preview_ts;
+                    }
+
                     // Show images as they arrive
                     if (data.images && data.images.length > 0) {
                         result.className = 'result visible';
@@ -965,6 +1034,8 @@ HTML_PAGE = """
                         status.className = 'status';
                         result.className = 'result visible';
                         document.getElementById('progressTracker').style.display = 'none';
+                        const pwrapDone = document.getElementById('previewWrap');
+                        if (pwrapDone) pwrapDone.style.display = 'none';
                         
                         // Add any remaining images
                         if (data.images) {
@@ -991,6 +1062,8 @@ HTML_PAGE = """
                         status.className = 'status error';
                         statusText.textContent = 'Error: ' + data.error;
                         document.getElementById('progressTracker').style.display = 'none';
+                        const pwrapErr = document.getElementById('previewWrap');
+                        if (pwrapErr) pwrapErr.style.display = 'none';
                     } else {
                         status.className = 'status'; // Idle
                     }
@@ -1053,6 +1126,8 @@ HTML_PAGE = """
             const spectrumGrid = spectrumGridEl ? spectrumGridEl.checked : false;
             const spectrumSameSeedEl = document.getElementById('spectrumSameSeed');
             const spectrumSameSeed = spectrumSameSeedEl ? spectrumSameSeedEl.checked : true;
+            const showPreviewEl = document.getElementById('showPreview');
+            const showPreview = showPreviewEl ? showPreviewEl.checked : false;
 
             const formData = {
                 prompt: promptEl ? promptEl.value : '',
@@ -1064,6 +1139,7 @@ HTML_PAGE = """
                 batch: batchEl ? parseInt(batchEl.value, 10) : 1,
                 spectrum_grid: spectrumGrid,
                 spectrum_same_seed: spectrumSameSeed,
+                show_preview: showPreview,
                 selected_cells: Array.from(selectedCells)
             };
             if (currentInputImage && strengthSlider) {
@@ -1078,6 +1154,9 @@ HTML_PAGE = """
             submitBtn.disabled = true;
             status.className = 'status generating';
             statusText.textContent = 'Starting generation...';
+            lastPreviewStep = -1;
+            const previewWrapEl = document.getElementById('previewWrap');
+            if (previewWrapEl) previewWrapEl.style.display = 'none';
 
             try {
                 const response = await fetch('/generate', {
@@ -1138,27 +1217,52 @@ HTML_PAGE = """
         });
 
         const historyGrid = document.getElementById('historyGrid');
+        const deleteAllBtn = document.getElementById('deleteAllBtn');
         async function loadHistory() {
             try {
                 const response = await fetch('/history', { headers: getAuthHeaders() });
                 const data = await response.json();
                 historyGrid.innerHTML = '';
-                archiveBtn.style.display = data.images.length > 0 ? 'block' : 'none';
-                if (data.images.length === 0) {
+                const hasImages = data.images.length > 0;
+                archiveBtn.style.display = hasImages ? 'block' : 'none';
+                if (deleteAllBtn) deleteAllBtn.style.display = hasImages ? 'block' : 'none';
+                if (!hasImages) {
                     historyGrid.innerHTML = '<p class="history-empty">No images generated today</p>';
                     return;
                 }
                 data.images.forEach(img => {
                     const item = document.createElement('div');
                     item.className = 'history-item';
+                    const safeName = img.filename.replace(/"/g, '&quot;');
                     item.innerHTML = `
                         <img src="/images/${img.filename}" alt="${img.prompt || 'Generated image'}" loading="lazy">
+                        <button type="button" class="item-delete" data-filename="${safeName}" title="Delete">X</button>
                         <div class="overlay">
                             <span class="time">${img.time}</span>
                         </div>
                     `;
                     item.title = img.prompt || img.filename;
-                    item.addEventListener('click', () => { window.open(`/images/${img.filename}`, '_blank'); });
+                    item.addEventListener('click', (e) => {
+                        if (e.target.classList.contains('item-delete')) return;
+                        window.open(`/images/${img.filename}`, '_blank');
+                    });
+                    const delBtn = item.querySelector('.item-delete');
+                    if (delBtn) {
+                        delBtn.addEventListener('click', async (e) => {
+                            e.stopPropagation();
+                            if (!confirm(`Permanently delete this image?\n\n${img.filename}`)) return;
+                            try {
+                                const res = await fetch('/delete', {
+                                    method: 'POST',
+                                    headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+                                    body: JSON.stringify({ filename: img.filename })
+                                });
+                                const body = await res.json();
+                                if (body.success) { loadHistory(); }
+                                else { alert('Delete failed: ' + (body.error || 'unknown error')); }
+                            } catch (err) { alert('Delete failed: ' + err.message); }
+                        });
+                    }
                     historyGrid.appendChild(item);
                 });
             } catch (err) {
@@ -1192,7 +1296,7 @@ HTML_PAGE = """
             archiveBtn.disabled = true;
             archiveBtn.textContent = 'Archiving...';
             try {
-                const response = await fetch('/archive', { 
+                const response = await fetch('/archive', {
                     method: 'POST',
                     headers: getAuthHeaders()
                 });
@@ -1201,6 +1305,23 @@ HTML_PAGE = """
             } catch (err) { alert('Archive failed: ' + err.message); }
             archiveBtn.disabled = false;
             archiveBtn.textContent = 'Archive Today';
+        });
+
+        if (deleteAllBtn) deleteAllBtn.addEventListener('click', async () => {
+            if (!confirm("Permanently DELETE all of today's generated images and prompt files? This cannot be undone.")) return;
+            deleteAllBtn.disabled = true;
+            deleteAllBtn.textContent = 'Deleting...';
+            try {
+                const response = await fetch('/delete', {
+                    method: 'POST',
+                    headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+                    body: JSON.stringify({})
+                });
+                const data = await response.json();
+                if (data.success) { loadHistory(); } else { alert('Delete failed: ' + data.error); }
+            } catch (err) { alert('Delete failed: ' + err.message); }
+            deleteAllBtn.disabled = false;
+            deleteAllBtn.textContent = 'Delete Today';
         });
 
         loadHistory();
@@ -1269,8 +1390,28 @@ def background_generation_task(data):
         _current_status["batch"] = total_batch
         _current_status["total_steps"] = steps
 
-        def _step_callback(pipe, step_index, timestep, callback_kwargs):
+        show_preview = bool(data.get('show_preview', False))
+        preview_state = {"last_decode": 0.0}
+
+        def _step_callback(pipe_obj, step_index, timestep, callback_kwargs):
             _current_status["step"] = step_index + 1
+            if show_preview:
+                now = time.perf_counter()
+                is_final = (step_index + 1) >= steps
+                if is_final or (now - preview_state["last_decode"]) >= PREVIEW_MIN_INTERVAL_S:
+                    latents = callback_kwargs.get("latents")
+                    preview_img = fl24bit.decode_latents_to_preview(
+                        pipe_obj, latents, height, width
+                    )
+                    if preview_img is not None:
+                        try:
+                            preview_img.save(os.path.join(OUTPUT_DIR, PREVIEW_FILENAME))
+                            _current_status["preview"] = PREVIEW_FILENAME
+                            _current_status["preview_step"] = step_index + 1
+                            _current_status["preview_ts"] = int(time.time() * 1000)
+                            preview_state["last_decode"] = now
+                        except Exception as e:
+                            print(f"[preview] save failed: {e}", flush=True)
             return callback_kwargs
 
         start_time = time.perf_counter()
@@ -1341,7 +1482,7 @@ def background_generation_task(data):
                         }
                     }
                     _current_status["images"].append(img_data)
-                    row_images.append(image.copy())
+                    row_images.append((image.copy(), generated_count))
                 grid_cells.append(row_images)
 
             # Create composite
@@ -1357,11 +1498,44 @@ def background_generation_task(data):
             n_rows, n_cols = len(grid_cells), len(grid_cells[0])
             composite = Image.new('RGB', (n_cols * cell_width, n_rows * cell_height), (32, 32, 32))
             for row_idx, row_images in enumerate(grid_cells):
-                for col_idx, img in enumerate(row_images):
-                    if img is None: continue # Skip empty diagonal cells
+                for col_idx, cell in enumerate(row_images):
+                    if cell is None: continue # Skip empty diagonal cells
+                    img, _seq = cell
                     img_small = img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
                     composite.paste(img_small, (col_idx * cell_width, row_idx * cell_height))
-            
+
+            # Overlay the generation-sequence number on each populated cell
+            draw = ImageDraw.Draw(composite)
+            font_size = max(14, cell_height // 12)
+            font = None
+            for font_path in (
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            ):
+                if os.path.exists(font_path):
+                    try:
+                        font = ImageFont.truetype(font_path, font_size)
+                        break
+                    except Exception:
+                        font = None
+            if font is None:
+                font = ImageFont.load_default()
+            for row_idx, row_images in enumerate(grid_cells):
+                for col_idx, cell in enumerate(row_images):
+                    if cell is None: continue
+                    _img, seq = cell
+                    label = str(seq)
+                    pad = 4
+                    bbox = draw.textbbox((0, 0), label, font=font)
+                    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                    x0 = col_idx * cell_width + 6
+                    y0 = row_idx * cell_height + 6
+                    draw.rectangle(
+                        [x0 - pad, y0 - pad, x0 + tw + pad, y0 + th + pad],
+                        fill=(0, 0, 0),
+                    )
+                    draw.text((x0 - bbox[0], y0 - bbox[1]), label, fill=(255, 255, 255), font=font)
+
             comp_filename = f"flux{fl24bit._flux_version}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_spectrum_grid.png"
             composite.save(os.path.join(OUTPUT_DIR, comp_filename))
             _current_status["composite"] = comp_filename
@@ -1434,7 +1608,10 @@ def generate():
             "composite": None,
             "done": False,
             "error": None,
-            "generation_time": 0
+            "generation_time": 0,
+            "preview": None,
+            "preview_step": 0,
+            "preview_ts": 0
         }
         
         # Logic is moved to thread, release is handled by thread finally
@@ -1545,6 +1722,50 @@ def archive_today():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
     return jsonify({'success': True, 'moved': moved})
+
+
+@app.route('/delete', methods=['POST'])
+def delete_today():
+    """Permanently delete today's generated files (PNG + .prompt).
+
+    If a single filename is provided in the JSON body, only that image (and its
+    sidecar .prompt) is deleted. Otherwise all of today's files are removed.
+    """
+    today = datetime.now().strftime("%Y%m%d")
+    body = request.get_json(silent=True) or {}
+    target = body.get('filename')
+    deleted = 0
+
+    def _remove_pair(png_name):
+        nonlocal deleted
+        png_path = os.path.join(OUTPUT_DIR, png_name)
+        if os.path.isfile(png_path):
+            os.remove(png_path)
+            deleted += 1
+        prompt_path = os.path.join(OUTPUT_DIR, png_name.rsplit('.', 1)[0] + '.prompt')
+        if os.path.isfile(prompt_path):
+            os.remove(prompt_path)
+
+    try:
+        if target:
+            # Guard against path traversal and ensure it's a today image
+            if '/' in target or '\\' in target or not target.endswith('.png'):
+                return jsonify({'success': False, 'error': 'Invalid filename'}), 400
+            parts = target.split('_')
+            if len(parts) < 3 or parts[1] != today:
+                return jsonify({'success': False, 'error': 'Not a today image'}), 400
+            _remove_pair(target)
+        else:
+            for filename in os.listdir(OUTPUT_DIR):
+                filepath = os.path.join(OUTPUT_DIR, filename)
+                if not os.path.isfile(filepath): continue
+                parts = filename.split('_')
+                if len(parts) >= 3 and parts[1] == today:
+                    os.remove(filepath)
+                    deleted += 1
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+    return jsonify({'success': True, 'deleted': deleted})
 
 
 if __name__ == '__main__':
