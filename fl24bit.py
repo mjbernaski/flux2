@@ -64,6 +64,11 @@ FLUX1_GGUF_MODELS = {
 # FLUX.2 repos
 FLUX2_REPO_4BIT = "diffusers/FLUX.2-dev-bnb-4bit"
 FLUX2_REPO_FULL = "black-forest-labs/FLUX.2-dev"
+
+# FLUX.2 klein (smaller 9B model, uses Flux2KleinPipeline). Full bf16 only — NVFP4
+# variants are blocked by a diffusers upstream bug in the Flux2 single-file converter
+# (qkv-chunking assumes unquantized fused weights; NVFP4 scale tensors break it).
+FLUX2_KLEIN_REPO_FULL = "black-forest-labs/FLUX.2-klein-9B"
 device = "cuda:0"
 torch_dtype = torch.bfloat16
 
@@ -144,7 +149,7 @@ def _wrap_vae_for_dtype_safety(pipeline):
     vae.decode = wrapped_decode
 
 
-def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=False, schnell=False, for_lora=False):
+def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=False, schnell=False, for_lora=False, klein=False):
     """Load the FLUX model components. Call this before generating images.
 
     Args:
@@ -154,10 +159,18 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
         flux2: Use FLUX.2 model instead of FLUX.1
         schnell: Use FLUX.1-schnell (fast 4-step model) - FLUX.1 only
         for_lora: Use simple loading path compatible with LoRA (avoids meta tensor issues)
+        klein: Use FLUX.2-klein (9B) variant instead of FLUX.2-dev (32B). Implies flux2.
+            Klein always loads as full bf16 (no quantized variant wired up — NVFP4 blocked by
+            diffusers upstream qkv-chunking bug in the Flux2 single-file converter).
     """
     global transformer, pipe, _model_type, _flux_version, _schnell_enabled
     if pipe is not None:
         return {}  # Already loaded
+
+    # klein implies flux2 + full (bf16). Klein has no working 4-bit/NVFP4 path in current diffusers.
+    if klein:
+        flux2 = True
+        full_model = True
 
     _flux_version = 2 if flux2 else 1
     _schnell_enabled = schnell and not flux2  # Schnell only for FLUX.1
@@ -176,7 +189,7 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
     # Select repos based on version
     if flux2:
         repo_4bit = FLUX2_REPO_4BIT
-        repo_full = FLUX2_REPO_FULL
+        repo_full = FLUX2_KLEIN_REPO_FULL if klein else FLUX2_REPO_FULL
         if gguf_quant:
             print("Warning: GGUF not available for FLUX.2, using 4-bit instead")
             gguf_quant = None
@@ -190,6 +203,7 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
     total_start = time.perf_counter()
 
     # Determine model type
+    klein_tag = "-klein" if klein else "-dev"
     if schnell and not flux2:
         _model_type = "schnell"
         model_desc = f"FLUX.1-schnell (4-step)"
@@ -197,8 +211,8 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
         _model_type = f"gguf-{gguf_quant}"
         model_desc = f"GGUF {gguf_quant.upper()} {flux_name}"
     elif full_model:
-        _model_type = "full"
-        model_desc = f"full {flux_name}-dev"
+        _model_type = "full-klein" if klein else "full"
+        model_desc = f"full {flux_name}{klein_tag}"
     else:
         _model_type = "4bit"
         model_desc = f"4-bit quantized {flux_name}"
@@ -274,11 +288,19 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
         t0 = time.perf_counter()
 
         if flux2:
-            # FLUX.2 uses Mistral3 text encoder
+            # FLUX.2-dev uses Mistral3 text encoder; FLUX.2-klein uses Qwen3.
             # Load sequentially (not parallel) to reduce peak memory usage on unified memory systems
-            from transformers import Mistral3ForConditionalGeneration
+            if klein:
+                from transformers import Qwen3ForCausalLM
+                text_encoder_cls = Qwen3ForCausalLM
+                text_encoder_label = "Qwen3"
+            else:
+                from transformers import Mistral3ForConditionalGeneration
+                text_encoder_cls = Mistral3ForConditionalGeneration
+                text_encoder_label = "Mistral3"
 
-            print("  Loading transformer (32B params)...")
+            param_desc = "9B" if klein else "32B"
+            print(f"  Loading transformer ({param_desc} params)...")
             t_trans = time.perf_counter()
             transformer = Flux2Transformer2DModel.from_pretrained(
                 repo_id, subfolder="transformer", torch_dtype=torch_dtype,
@@ -287,11 +309,11 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
             load_timings['transformer'] = time.perf_counter() - t_trans
             print(f"    Transformer loaded in {load_timings['transformer']:.2f}s")
 
-            print("  Loading text encoder (Mistral3)...")
+            print(f"  Loading text encoder ({text_encoder_label})...")
             t_enc = time.perf_counter()
             # Don't use device_map="auto" - it can place embedding layer on CPU causing
             # index_select device mismatch errors. Load to CPU then move to GPU.
-            text_encoder = Mistral3ForConditionalGeneration.from_pretrained(
+            text_encoder = text_encoder_cls.from_pretrained(
                 repo_id, subfolder="text_encoder", torch_dtype=torch_dtype,
                 use_safetensors=True
             ).to(device)
@@ -304,9 +326,14 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
             # Assemble FLUX.2 pipeline
             # Note: Use device_map="balanced" (not "cuda" + low_cpu_mem_usage) to avoid
             # meta tensor errors when loading remaining components (VAE, scheduler, etc.)
-            print("Assembling pipeline...")
+            if klein:
+                from diffusers import Flux2KleinPipeline
+                pipeline_cls = Flux2KleinPipeline
+            else:
+                pipeline_cls = Flux2Pipeline
+            print(f"Assembling {pipeline_cls.__name__}...")
             t0 = time.perf_counter()
-            pipe = Flux2Pipeline.from_pretrained(
+            pipe = pipeline_cls.from_pretrained(
                 repo_id,
                 transformer=transformer,
                 text_encoder=text_encoder,
@@ -517,7 +544,62 @@ def remote_text_encoder(prompt, use_cache=True):
 
     return result
 
-def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_encoder=False, input_image=None, strength=0.75, sigmas=None, guidance_scale=None):
+def decode_latents_to_preview(pipe_obj, latents, height, width, max_size=512):
+    """Decode intermediate Flux latents into a PIL preview image.
+
+    Handles both FLUX.1 (scaling_factor/shift_factor + _unpack_latents) and
+    FLUX.2 (batch-norm stats + _unpatchify_latents). Returns None on any
+    failure so callers can treat previews as best-effort.
+    """
+    if pipe_obj is None or latents is None:
+        return None
+    try:
+        vae_scale_factor = getattr(pipe_obj, "vae_scale_factor", 8)
+        unpatchify = getattr(pipe_obj, "_unpatchify_latents", None)
+
+        with torch.inference_mode():
+            if unpatchify is not None:
+                # FLUX.2: latents are (B, H*W, C*4) with contiguous position ids,
+                # so unpacking is a reshape+permute. Then apply vae.bn stats and
+                # unpatchify before decoding.
+                patch_h = int(height) // (vae_scale_factor * 2)
+                patch_w = int(width) // (vae_scale_factor * 2)
+                B, seq, ch = latents.shape
+                if seq != patch_h * patch_w:
+                    raise ValueError(
+                        f"latent seq {seq} != patch_h*patch_w {patch_h * patch_w}"
+                    )
+                lat = latents.view(B, patch_h, patch_w, ch).permute(0, 3, 1, 2).contiguous()
+                vae = pipe_obj.vae
+                bn_mean = vae.bn.running_mean.view(1, -1, 1, 1).to(lat.device, lat.dtype)
+                bn_std = torch.sqrt(
+                    vae.bn.running_var.view(1, -1, 1, 1) + vae.config.batch_norm_eps
+                ).to(lat.device, lat.dtype)
+                lat = lat * bn_std + bn_mean
+                lat = unpatchify(lat)
+                decoded = vae.decode(lat, return_dict=False)[0]
+            else:
+                # FLUX.1
+                unpack = getattr(pipe_obj, "_unpack_latents", None)
+                lat = unpack(latents, height, width, vae_scale_factor) if unpack is not None else latents
+                vae_cfg = pipe_obj.vae.config
+                lat = (lat / vae_cfg.scaling_factor) + vae_cfg.shift_factor
+                decoded = pipe_obj.vae.decode(lat, return_dict=False)[0]
+
+        image = pipe_obj.image_processor.postprocess(decoded, output_type="pil")[0]
+        if max_size and max(image.size) > max_size:
+            ratio = max_size / max(image.size)
+            image = image.resize(
+                (int(image.width * ratio), int(image.height * ratio)),
+                Image.Resampling.LANCZOS,
+            )
+        return image
+    except Exception as e:
+        print(f"[preview] decode failed: {e}", flush=True)
+        return None
+
+
+def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_encoder=False, input_image=None, strength=0.75, sigmas=None, guidance_scale=None, callback_on_step_end=None):
     """Generate an image from a text prompt.
 
     Args:
@@ -531,6 +613,8 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
         strength: Denoising strength for img2img (0.0-1.0, higher = more change)
         sigmas: Custom noise schedule (for turbo LoRA, use TURBO_SIGMAS)
         guidance_scale: Classifier-free guidance scale (default: 4, turbo uses 2.5)
+        callback_on_step_end: Optional callback called after each inference step.
+            Signature: callback(pipe, step_index, timestep, callback_kwargs) -> callback_kwargs
     """
     global pipe_img2img
 
@@ -591,6 +675,8 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
                 }
                 if sigmas is not None:
                     pipe_kwargs["sigmas"] = sigmas
+                if callback_on_step_end is not None:
+                    pipe_kwargs["callback_on_step_end"] = callback_on_step_end
                 image = pipe(**pipe_kwargs).images[0]
                 timings['diffusion'] = time.perf_counter() - t0
                 timings['encoding'] = 0
@@ -617,15 +703,18 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
                 input_image = input_image.resize((width, height))
 
                 t0 = time.perf_counter()
-                image = pipe_img2img(
-                    prompt=prompt,
-                    image=input_image,
-                    strength=strength,
-                    generator=torch.Generator(device=device).manual_seed(seed),
-                    num_inference_steps=steps,
-                    guidance_scale=guidance_scale,
-                    max_sequence_length=512,
-                ).images[0]
+                img2img_kwargs = {
+                    "prompt": prompt,
+                    "image": input_image,
+                    "strength": strength,
+                    "generator": torch.Generator(device=device).manual_seed(seed),
+                    "num_inference_steps": steps,
+                    "guidance_scale": guidance_scale,
+                    "max_sequence_length": 512,
+                }
+                if callback_on_step_end is not None:
+                    img2img_kwargs["callback_on_step_end"] = callback_on_step_end
+                image = pipe_img2img(**img2img_kwargs).images[0]
                 timings['diffusion'] = time.perf_counter() - t0
                 timings['encoding'] = 0
         elif local_encoder or _flux_version == 2:
@@ -642,6 +731,8 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
             }
             if sigmas is not None:
                 pipe_kwargs["sigmas"] = sigmas
+            if callback_on_step_end is not None:
+                pipe_kwargs["callback_on_step_end"] = callback_on_step_end
             image = pipe(**pipe_kwargs).images[0]
             timings['diffusion'] = time.perf_counter() - t0
             timings['encoding'] = 0  # Included in diffusion for local
@@ -652,14 +743,17 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
             timings['encoding'] = time.perf_counter() - t0
 
             t0 = time.perf_counter()
-            image = pipe(
-                prompt_embeds=embeds,
-                generator=torch.Generator(device=device).manual_seed(seed),
-                num_inference_steps=steps,
-                guidance_scale=guidance_scale,
-                width=width,
-                height=height,
-            ).images[0]
+            remote_pipe_kwargs = {
+                "prompt_embeds": embeds,
+                "generator": torch.Generator(device=device).manual_seed(seed),
+                "num_inference_steps": steps,
+                "guidance_scale": guidance_scale,
+                "width": width,
+                "height": height,
+            }
+            if callback_on_step_end is not None:
+                remote_pipe_kwargs["callback_on_step_end"] = callback_on_step_end
+            image = pipe(**remote_pipe_kwargs).images[0]
             timings['diffusion'] = time.perf_counter() - t0
 
     timings['total'] = timings['encoding'] + timings['diffusion']
@@ -764,6 +858,7 @@ def main():
         'portrait': (768, 1344),
         'landscape': (1344, 768),
         '16:9': (1360, 768),
+        'widescreen': (1568, 672),  # ~21:9 extra-wide
     }
     # Size presets
     sizes = {
@@ -802,6 +897,7 @@ def main():
     print("  '/portrait' - Set portrait aspect ratio")
     print("  '/landscape' - Set landscape aspect ratio")
     print("  '/16:9' - Set 16:9 widescreen aspect ratio")
+    print("  '/widescreen' - Set 21:9 extra-wide aspect ratio")
     print("  '/0.75' - Set 0.75K resolution (smaller/faster)")
     print("  '/1k' - Set 1K resolution (default)")
     print("  '/2k' - Set 2K resolution")
@@ -874,7 +970,7 @@ def main():
                     print(f"Could not load image '{image_arg}': {e}")
             continue
 
-        if lower_input in ('/square', '/portrait', '/landscape', '/16:9'):
+        if lower_input in ('/square', '/portrait', '/landscape', '/16:9', '/widescreen'):
             orientation = lower_input[1:]  # Remove the leading /
             base_w, base_h = orientations_1k[orientation]
             width, height = int(base_w * sizes[size]), int(base_h * sizes[size])
@@ -897,7 +993,7 @@ def main():
             if lower_word in ('/0.75', '/1k', '/2k', '/4k'):
                 size = lower_word[1:]
                 modifiers_found.append(f"size={size}")
-            elif lower_word in ('/square', '/portrait', '/landscape', '/16:9'):
+            elif lower_word in ('/square', '/portrait', '/landscape', '/16:9', '/widescreen'):
                 orientation = lower_word[1:]
                 modifiers_found.append(f"orientation={orientation}")
             else:
