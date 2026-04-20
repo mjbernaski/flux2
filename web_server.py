@@ -51,13 +51,21 @@ def check_auth():
 
 @app.before_request
 def require_auth():
-    # Allow the main page and images to load without authentication
-    # Images are served with random filenames which provides basic security
-    if request.endpoint in ['index', 'static', 'serve_image']:
+    # Allow the main page, images, and the readiness probe to load without auth.
+    # Images are served with random filenames which provides basic security;
+    # /ready must be reachable before the user can enter their API key.
+    if request.endpoint in ['index', 'static', 'serve_image', 'ready']:
         return
-        
+
     if not check_auth():
         return jsonify({"success": False, "error": "Unauthorized. Please provide a valid X-API-Key header or api_key parameter."}), 401
+
+
+# Model-loading readiness state (set by the background loader in main()).
+_model_ready = False
+_model_load_error = None
+_model_load_start_ts = 0.0
+_model_load_status = "starting"
 
 # Will be set by command-line args
 _local_encoder = False
@@ -543,6 +551,41 @@ HTML_PAGE = """
             align-items: center;
             gap: 8px;
         }
+        .loading-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(10, 10, 21, 0.96);
+            color: #eee;
+            z-index: 9999;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 18px;
+            text-align: center;
+            padding: 20px;
+        }
+        .loading-overlay .spinner {
+            width: 48px;
+            height: 48px;
+            border-width: 5px;
+            margin: 0;
+        }
+        .loading-overlay h2 {
+            color: #00d4ff;
+            margin: 0;
+            font-size: 22px;
+        }
+        .loading-overlay .loading-status {
+            color: #aaa;
+            font-size: 15px;
+        }
+        .loading-overlay .loading-elapsed {
+            color: #666;
+            font-size: 13px;
+            font-variant-numeric: tabular-nums;
+        }
+        .loading-overlay.error h2 { color: #ff6b6b; }
         #apiKeyInput {
             margin-top: 10px;
             padding: 8px;
@@ -556,6 +599,13 @@ HTML_PAGE = """
     </style>
 </head>
 <body>
+    <div class="loading-overlay" id="loadingOverlay">
+        <div class="spinner"></div>
+        <h2 id="loadingTitle">Loading model…</h2>
+        <div class="loading-status" id="loadingStatus">starting</div>
+        <div class="loading-elapsed" id="loadingElapsed">0s</div>
+    </div>
+
     <div class="header-info">
         <span class="hostname" id="hostname"></span>
         <span class="version" id="version"></span>
@@ -754,6 +804,44 @@ HTML_PAGE = """
     </div>
 
     <script>
+        // Model readiness overlay: poll /ready until the model is loaded, then hide.
+        (function() {
+            const overlay = document.getElementById('loadingOverlay');
+            const statusEl = document.getElementById('loadingStatus');
+            const elapsedEl = document.getElementById('loadingElapsed');
+            const titleEl = document.getElementById('loadingTitle');
+            if (!overlay) return;
+            let readyPollTimer = null;
+
+            async function checkReady() {
+                try {
+                    const res = await fetch('/ready', { cache: 'no-store' });
+                    const data = await res.json();
+                    if (data.ready) {
+                        overlay.style.display = 'none';
+                        if (readyPollTimer) { clearInterval(readyPollTimer); readyPollTimer = null; }
+                        return;
+                    }
+                    if (data.error) {
+                        overlay.classList.add('error');
+                        titleEl.textContent = 'Model load failed';
+                        statusEl.textContent = data.error;
+                        if (readyPollTimer) { clearInterval(readyPollTimer); readyPollTimer = null; }
+                        return;
+                    }
+                    if (data.status) statusEl.textContent = data.status;
+                    if (typeof data.elapsed_s === 'number') {
+                        const s = Math.round(data.elapsed_s);
+                        elapsedEl.textContent = s < 60 ? `${s}s` : `${Math.floor(s/60)}m ${s%60}s`;
+                    }
+                } catch (err) {
+                    statusEl.textContent = 'waiting for server…';
+                }
+            }
+            checkReady();
+            readyPollTimer = setInterval(checkReady, 1500);
+        })();
+
         // Security helpers
         function getAuthHeaders(extraHeaders = {}) {
             const apiKey = localStorage.getItem('flux_api_key');
@@ -1589,8 +1677,21 @@ def index():
     return HTML_PAGE
 
 
+@app.route('/ready')
+def ready():
+    elapsed = time.perf_counter() - _model_load_start_ts if _model_load_start_ts else 0.0
+    return jsonify({
+        'ready': _model_ready,
+        'error': _model_load_error,
+        'status': _model_load_status,
+        'elapsed_s': round(elapsed, 1),
+    })
+
+
 @app.route('/generate', methods=['POST'])
 def generate():
+    if not _model_ready:
+        return jsonify({'success': False, 'error': 'Model still loading. Please wait.'}), 503
     if not _generation_lock.acquire(blocking=False):
         return jsonify({'success': False, 'error': 'Generation in progress'}), 503
     
@@ -1792,9 +1893,27 @@ if __name__ == '__main__':
     # Turbo LoRA is a FLUX.2-dev LoRA — don't auto-enable for klein (different architecture)
     _turbo = (args.turbo or (args.flux2 and not _klein)) and not args.no_turbo
 
-    print(f"Loading {'FLUX.2' if _flux2 else 'FLUX.1'}...")
-    load_model(local_encoder=_local_encoder, full_model=_full_model, gguf_quant=_gguf_quant, flux2=_flux2, schnell=_schnell, for_lora=_uncensored, klein=_klein)
-    if _turbo: load_turbo_lora()
-    if _uncensored: load_uncensored_lora()
-    print(f"\nStarting web server on http://0.0.0.0:{args.port}")
+    def _load_in_background():
+        global _model_ready, _model_load_error, _model_load_status
+        try:
+            _model_load_status = f"loading {'FLUX.2' if _flux2 else 'FLUX.1'} model"
+            print(f"Loading {'FLUX.2' if _flux2 else 'FLUX.1'}...")
+            load_model(local_encoder=_local_encoder, full_model=_full_model, gguf_quant=_gguf_quant, flux2=_flux2, schnell=_schnell, for_lora=_uncensored, klein=_klein)
+            if _turbo:
+                _model_load_status = "loading turbo LoRA"
+                load_turbo_lora()
+            if _uncensored:
+                _model_load_status = "loading uncensored LoRA"
+                load_uncensored_lora()
+            _model_load_status = "ready"
+            _model_ready = True
+            print("Model ready.")
+        except Exception as e:
+            _model_load_error = str(e)
+            _model_load_status = "error"
+            print(f"FATAL: model load failed: {e}")
+
+    _model_load_start_ts = time.perf_counter()
+    threading.Thread(target=_load_in_background, daemon=True).start()
+    print(f"\nStarting web server on http://0.0.0.0:{args.port} (model loading in background)")
     app.run(host='0.0.0.0', port=args.port, threaded=True)
