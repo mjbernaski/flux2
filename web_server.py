@@ -702,7 +702,7 @@ HTML_PAGE = """
                 </div>
                 <div class="spectrum-hint" id="spectrumHint">Guidance: 1, 3, 5, 7. Strength (img2img): 0.2, 0.4, 0.6, 0.8.</div>
                 <label class="checkbox-label" style="margin-top: 6px;">
-                    <input type="checkbox" id="spectrumSameSeed" checked>
+                    <input type="checkbox" id="spectrumSameSeed">
                     Use same seed for all grid images
                 </label>
             </div>
@@ -711,7 +711,7 @@ HTML_PAGE = """
         <div class="row">
             <div class="form-group">
                 <label class="checkbox-label">
-                    <input type="checkbox" id="showPreview">
+                    <input type="checkbox" id="showPreview" checked>
                     Show live preview (slower — decodes each step)
                 </label>
             </div>
@@ -915,7 +915,8 @@ HTML_PAGE = """
             if (aspectModeControl) aspectModeControl.style.display = 'none';
             if (aspectModeEl) aspectModeEl.value = 'keep';
             var sg = document.getElementById('spectrumGrid'); if (sg) sg.checked = false;
-            var sss = document.getElementById('spectrumSameSeed'); if (sss) sss.checked = true;
+            var sss = document.getElementById('spectrumSameSeed'); if (sss) sss.checked = false;
+            var spv = document.getElementById('showPreview'); if (spv) spv.checked = true;
             if (gridContainer) gridContainer.style.display = 'none';
             selectedCells.clear();
             if (gridSelector) {
