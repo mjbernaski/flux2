@@ -1122,7 +1122,10 @@ HTML_PAGE = """
             gridContainer.style.display = spectrumGridEl.checked ? 'block' : 'none';
         });
 
-        if (resetBtn) resetBtn.addEventListener('click', function() {
+        if (resetBtn) resetBtn.addEventListener('click', async function() {
+            try {
+                await fetch('/reset', { method: 'POST', headers: getAuthHeaders() });
+            } catch (e) { console.warn('Reset request failed:', e); }
             var p = document.getElementById('prompt'); if (p) p.value = '';
             var o = document.getElementById('orientation'); if (o) o.value = 'landscape';
             var s = document.getElementById('size'); if (s) s.value = '1mp';
@@ -1166,6 +1169,8 @@ HTML_PAGE = """
                 if (statusText) statusText.textContent = 'Generating...';
             }
             if (knownImageFilenames) knownImageFilenames.clear();
+            seenDoneJobIds.clear();
+            lastCompletedJobId = null;
             const pt = document.getElementById('progressTracker'); if (pt) pt.style.display = 'none';
             const pb = document.getElementById('progressBar'); if (pb) pb.style.width = '0%';
         });
@@ -1902,6 +1907,15 @@ def status():
         'recent_done': recent,
         'queue_max_size': QUEUE_MAX_SIZE,
     })
+
+
+@app.route('/reset', methods=['POST'])
+def reset_recent():
+    """Clear the in-memory list of recently-completed jobs so the client's
+    results view stays empty across page reloads."""
+    with _queue_cv:
+        _recent_done.clear()
+    return jsonify({'success': True})
 
 
 @app.route('/jobs/<job_id>/cancel', methods=['POST'])
