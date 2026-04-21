@@ -856,10 +856,9 @@ def main():
     orientations_1k = {
         'square': (1024, 1024),
         'portrait': (768, 1344),
-        'landscape': (1344, 768),
-        '16:9': (1360, 768),
-        'wide': (1360, 768),  # 16:9 alias
+        'landscape': (1360, 768),  # 16:9
         'widescreen': (1568, 672),  # ~21:9 extra-wide
+        'extra-tall': (672, 1568),  # ~9:21 mirror of widescreen
     }
     # Size presets
     sizes = {
@@ -896,9 +895,9 @@ def main():
     print("  '/strength <number>' - Set img2img denoising strength 0.0-1.0 (current: {})".format(strength))
     print("  '/square' - Set square aspect ratio")
     print("  '/portrait' - Set portrait aspect ratio")
-    print("  '/landscape' - Set landscape aspect ratio")
-    print("  '/16:9' or '/wide' - Set 16:9 widescreen aspect ratio")
+    print("  '/landscape' - Set 16:9 landscape aspect ratio")
     print("  '/widescreen' - Set 21:9 extra-wide aspect ratio")
+    print("  '/extra-tall' - Set 9:21 extra-tall aspect ratio")
     print("  '/0.75' - Set 0.75K resolution (smaller/faster)")
     print("  '/1k' - Set 1K resolution (default)")
     print("  '/2k' - Set 2K resolution")
@@ -971,7 +970,7 @@ def main():
                     print(f"Could not load image '{image_arg}': {e}")
             continue
 
-        if lower_input in ('/square', '/portrait', '/landscape', '/16:9', '/wide', '/widescreen'):
+        if lower_input in ('/square', '/portrait', '/landscape', '/widescreen', '/extra-tall'):
             orientation = lower_input[1:]  # Remove the leading /
             base_w, base_h = orientations_1k[orientation]
             width, height = int(base_w * sizes[size]), int(base_h * sizes[size])
@@ -994,7 +993,7 @@ def main():
             if lower_word in ('/0.75', '/1k', '/2k', '/4k'):
                 size = lower_word[1:]
                 modifiers_found.append(f"size={size}")
-            elif lower_word in ('/square', '/portrait', '/landscape', '/16:9', '/wide', '/widescreen'):
+            elif lower_word in ('/square', '/portrait', '/landscape', '/widescreen', '/extra-tall'):
                 orientation = lower_word[1:]
                 modifiers_found.append(f"orientation={orientation}")
             else:

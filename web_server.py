@@ -171,9 +171,9 @@ _queue_worker_thread: Optional[threading.Thread] = None
 ORIENTATIONS_1K = {
     'square': (1024, 1024),
     'portrait': (768, 1344),
-    'landscape': (1344, 768),
-    'wide': (1360, 768),  # 16:9
+    'landscape': (1360, 768),  # 16:9
     'widescreen': (1568, 672),  # ~21:9 extra-wide, ~1 MP
+    'extra-tall': (672, 1568),  # ~9:21 mirror of widescreen, ~1 MP
 }
 
 SIZES = {
@@ -421,6 +421,19 @@ HTML_PAGE = """
             margin-top: 15px;
             text-align: center;
         }
+        .clear-recent-row {
+            display: flex;
+            justify-content: center;
+            margin-top: 10px;
+        }
+        .clear-recent-btn {
+            width: auto;
+            padding: 8px 16px;
+            font-size: 13px;
+            background: #6c757d;
+            color: #fff;
+        }
+        .clear-recent-btn:hover:not(:disabled) { background: #5a6268; }
         .image-input-container {
             display: flex;
             gap: 20px;
@@ -798,10 +811,10 @@ HTML_PAGE = """
                 <label for="orientation">Orientation</label>
                 <select id="orientation" name="orientation">
                     <option value="square">Square</option>
-                    <option value="landscape" selected>Landscape</option>
+                    <option value="landscape" selected>Landscape (16:9)</option>
                     <option value="portrait">Portrait</option>
-                    <option value="wide">Wide (16:9)</option>
                     <option value="widescreen">Extra-wide (21:9)</option>
+                    <option value="extra-tall">Extra-tall (9:21)</option>
                 </select>
             </div>
             <div class="form-group">
@@ -929,6 +942,9 @@ HTML_PAGE = """
     <div class="result" id="result">
         <div class="image-grid" id="imageGrid"></div>
         <p class="generation-info" id="generationInfo"></p>
+        <div class="clear-recent-row">
+            <button type="button" class="clear-recent-btn" id="clearRecentBtn">Clear recent</button>
+        </div>
     </div>
 
     <div class="history-section" id="historySection">
@@ -1174,6 +1190,19 @@ HTML_PAGE = """
             lastCompletedJobId = null;
             const pt = document.getElementById('progressTracker'); if (pt) pt.style.display = 'none';
             const pb = document.getElementById('progressBar'); if (pb) pb.style.width = '0%';
+        });
+
+        const clearRecentBtn = document.getElementById('clearRecentBtn');
+        if (clearRecentBtn) clearRecentBtn.addEventListener('click', async function() {
+            try {
+                await fetch('/reset', { method: 'POST', headers: getAuthHeaders() });
+            } catch (e) { console.warn('Clear recent request failed:', e); }
+            if (imageGrid) imageGrid.innerHTML = '';
+            if (generationInfo) generationInfo.textContent = '';
+            if (result) result.className = 'result';
+            if (knownImageFilenames) knownImageFilenames.clear();
+            seenDoneJobIds.clear();
+            lastCompletedJobId = null;
         });
 
         let lastCompletedJobId = null;
