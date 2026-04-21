@@ -188,7 +188,8 @@ HTML_PAGE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FLUX.1 Image Generator</title>
+    <title>flux</title>
+    <script>document.title = window.location.hostname + ' flux';</script>
     <style>
         * { box-sizing: border-box; }
         body {
