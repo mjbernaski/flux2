@@ -503,6 +503,8 @@ const state = {
   current: null,     // selected image item
   naturalSize: null, // {w,h} of current image
   cropBox: null,     // {x1,y1,x2,y2} in image pixel coords
+  selected: new Set(), // rel paths of selected images in the current folder
+  lastClickedRel: null, // for shift-click range selection
 };
 
 function apiKey() { return $('#apiKey').value.trim(); }
@@ -578,8 +580,52 @@ async function loadFolders() {
 async function loadList(folder) {
   const data = await api('/api/list?folder=' + encodeURIComponent(folder));
   state.items = data.items;
+  // Drop selections for items no longer present (e.g., after a delete).
+  const present = new Set(state.items.map(it => it.rel));
+  for (const rel of Array.from(state.selected)) {
+    if (!present.has(rel)) state.selected.delete(rel);
+  }
   $('#count').textContent = `${data.count} image${data.count === 1 ? '' : 's'}`;
   renderGrid();
+  updateSelectionUI();
+}
+
+function updateSelectionUI() {
+  const n = state.selected.size;
+  $('#selCount').style.display = n ? 'inline' : 'none';
+  $('#selCount').textContent = n ? `${n} selected` : '';
+  $('#bulkDeleteBtn').style.display = n ? 'inline-block' : 'none';
+  $('#clearSelBtn').style.display = n ? 'inline-block' : 'none';
+  $('#selectAllBtn').style.display = state.items.length ? 'inline-block' : 'none';
+  $('#selectAllBtn').textContent =
+    (n && n === state.items.length) ? 'Deselect all' : 'Select all';
+}
+
+function toggleSelect(rel, shiftKey=false) {
+  if (shiftKey && state.lastClickedRel && state.lastClickedRel !== rel) {
+    const rels = state.items.map(it => it.rel);
+    const a = rels.indexOf(state.lastClickedRel);
+    const b = rels.indexOf(rel);
+    if (a >= 0 && b >= 0) {
+      const [lo, hi] = a < b ? [a, b] : [b, a];
+      const shouldSelect = !state.selected.has(rel);
+      for (let i = lo; i <= hi; i++) {
+        if (shouldSelect) state.selected.add(rels[i]);
+        else state.selected.delete(rels[i]);
+      }
+      state.lastClickedRel = rel;
+      renderGrid();
+      updateSelectionUI();
+      return;
+    }
+  }
+  if (state.selected.has(rel)) state.selected.delete(rel);
+  else state.selected.add(rel);
+  state.lastClickedRel = rel;
+  // Update just this card's class without full re-render
+  const card = document.querySelector(`.card[data-rel="${CSS.escape(rel)}"]`);
+  if (card) card.classList.toggle('selected', state.selected.has(rel));
+  updateSelectionUI();
 }
 
 function renderGrid() {
@@ -592,8 +638,10 @@ function renderGrid() {
   $('#empty').style.display = 'none';
   for (const it of state.items) {
     const card = document.createElement('div');
-    card.className = 'card';
+    card.className = 'card' + (state.selected.has(it.rel) ? ' selected' : '');
+    card.dataset.rel = it.rel;
     card.innerHTML = `
+      <div class="select-cb" title="Select (shift-click for range)">✓</div>
       <div class="thumb" title="Click to open">
         <img loading="lazy" src="${imgUrl(it.rel, true)}" alt="">
       </div>
@@ -606,8 +654,17 @@ function renderGrid() {
         <button data-act="hide">Hide</button>
         <button class="danger" data-act="delete">Delete</button>
       </div>`;
+    const cb = card.querySelector('.select-cb');
+    cb.addEventListener('click', e => {
+      e.stopPropagation();
+      toggleSelect(it.rel, e.shiftKey);
+    });
     const thumb = card.querySelector('.thumb');
-    thumb.addEventListener('click', () => openModal(it));
+    thumb.addEventListener('click', e => {
+      // Shift-click on the thumb toggles selection (range with prior click).
+      if (e.shiftKey) { toggleSelect(it.rel, true); return; }
+      openModal(it);
+    });
     card.querySelectorAll('[data-act]').forEach(btn => {
       btn.addEventListener('click', e => {
         e.stopPropagation();
@@ -812,8 +869,52 @@ $('#closeBtn').addEventListener('click', closeModal);
 $('#modal').addEventListener('click', e => { if (e.target.id === 'modal') closeModal(); });
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
 
-$('#folderSel').addEventListener('change', () => loadList($('#folderSel').value).catch(e => toast(e.message, true)));
+$('#folderSel').addEventListener('change', () => {
+  state.selected.clear();
+  state.lastClickedRel = null;
+  loadList($('#folderSel').value).catch(e => toast(e.message, true));
+});
 $('#refresh').addEventListener('click', () => refresh());
+
+$('#selectAllBtn').addEventListener('click', () => {
+  if (state.selected.size === state.items.length) {
+    state.selected.clear();
+  } else {
+    state.selected = new Set(state.items.map(it => it.rel));
+  }
+  renderGrid();
+  updateSelectionUI();
+});
+
+$('#clearSelBtn').addEventListener('click', () => {
+  state.selected.clear();
+  state.lastClickedRel = null;
+  renderGrid();
+  updateSelectionUI();
+});
+
+$('#bulkDeleteBtn').addEventListener('click', async () => {
+  const targets = state.items.filter(it => state.selected.has(it.rel));
+  if (targets.length === 0) return;
+  if (!confirm(`Permanently delete ${targets.length} image${targets.length === 1 ? '' : 's'}? This cannot be undone.`)) return;
+  const btn = $('#bulkDeleteBtn');
+  btn.disabled = true;
+  const origLabel = btn.textContent;
+  let ok = 0, failed = 0, lastErr = '';
+  for (let i = 0; i < targets.length; i++) {
+    btn.textContent = `Deleting ${i + 1}/${targets.length}...`;
+    try {
+      await api('/api/delete', { method: 'POST', body: { path: targets[i].rel } });
+      state.selected.delete(targets[i].rel);
+      ok++;
+    } catch (e) { failed++; lastErr = e.message; }
+  }
+  btn.textContent = origLabel;
+  btn.disabled = false;
+  state.lastClickedRel = null;
+  toast(failed ? `Deleted ${ok}, ${failed} failed: ${lastErr}` : `Deleted ${ok}`, failed > 0);
+  refresh();
+});
 $('#apiKey').addEventListener('change', () => {
   localStorage.setItem('im_api_key', apiKey());
   refresh();
