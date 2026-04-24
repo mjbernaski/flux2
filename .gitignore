@@ -55,3 +55,6 @@ nohup.out
 server.log
 server.pid
 ._.DS_Store
+
+# Generated image artifacts
+web-generated/

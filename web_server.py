@@ -816,6 +816,10 @@ HTML_PAGE = """
                     <option value="widescreen">Extra-wide (21:9)</option>
                     <option value="extra-tall">Extra-tall (9:21)</option>
                 </select>
+                <label class="checkbox-label all-orientations-label" style="display: flex; align-items: center; gap: 6px; cursor: pointer; margin-top: 6px; font-size: 12px; color: #aaa;">
+                    <input type="checkbox" id="allOrientations" style="width: auto;">
+                    Queue one per orientation (5 jobs)
+                </label>
             </div>
             <div class="form-group">
                 <label for="size">Size</label>
@@ -1139,12 +1143,22 @@ HTML_PAGE = """
             gridContainer.style.display = spectrumGridEl.checked ? 'block' : 'none';
         });
 
+        const allOrientationsEl = document.getElementById('allOrientations');
+        const orientationSelectEl = document.getElementById('orientation');
+        if (allOrientationsEl && orientationSelectEl) {
+            allOrientationsEl.addEventListener('change', () => {
+                orientationSelectEl.disabled = allOrientationsEl.checked;
+                orientationSelectEl.style.opacity = allOrientationsEl.checked ? '0.5' : '';
+            });
+        }
+
         if (resetBtn) resetBtn.addEventListener('click', async function() {
             try {
                 await fetch('/reset', { method: 'POST', headers: getAuthHeaders() });
             } catch (e) { console.warn('Reset request failed:', e); }
             var p = document.getElementById('prompt'); if (p) p.value = '';
-            var o = document.getElementById('orientation'); if (o) o.value = 'landscape';
+            var o = document.getElementById('orientation'); if (o) { o.value = 'landscape'; o.disabled = false; o.style.opacity = ''; }
+            var ao = document.getElementById('allOrientations'); if (ao) ao.checked = false;
             var s = document.getElementById('size'); if (s) s.value = '1mp';
             var st = document.getElementById('steps'); if (st) st.value = '25';
             var sd = document.getElementById('seed'); if (sd) sd.value = '';
@@ -1441,8 +1455,10 @@ HTML_PAGE = """
             const spectrumSameSeed = spectrumSameSeedEl ? spectrumSameSeedEl.checked : true;
             const showPreviewEl = document.getElementById('showPreview');
             const showPreview = showPreviewEl ? showPreviewEl.checked : false;
+            const allOrientationsEl = document.getElementById('allOrientations');
+            const allOrientations = allOrientationsEl ? allOrientationsEl.checked : false;
 
-            const formData = {
+            const baseFormData = {
                 prompt: promptEl ? promptEl.value : '',
                 orientation: orientationEl ? orientationEl.value : 'landscape',
                 size: sizeEl ? sizeEl.value : '1mp',
@@ -1456,31 +1472,53 @@ HTML_PAGE = """
                 selected_cells: Array.from(selectedCells)
             };
             if (currentInputImage && strengthSlider) {
-                formData.input_image = currentInputImage;
-                formData.strength = parseFloat(strengthSlider.value);
-                formData.aspect_mode = aspectModeEl ? aspectModeEl.value : 'keep';
+                baseFormData.input_image = currentInputImage;
+                baseFormData.strength = parseFloat(strengthSlider.value);
+                baseFormData.aspect_mode = aspectModeEl ? aspectModeEl.value : 'keep';
             }
+
+            const orientationsToQueue = allOrientations
+                ? ['square', 'landscape', 'portrait', 'widescreen', 'extra-tall']
+                : [baseFormData.orientation];
 
             // Briefly disable to prevent double-submit during the fetch; re-enable on response.
             submitBtn.disabled = true;
 
+            let firstPosition = null;
+            let submitted = 0;
+            let errorMsg = null;
             try {
-                const response = await fetch('/generate', {
-                    method: 'POST',
-                    headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
-                    body: JSON.stringify(formData)
-                });
+                for (const orient of orientationsToQueue) {
+                    const formData = Object.assign({}, baseFormData, { orientation: orient });
+                    const response = await fetch('/generate', {
+                        method: 'POST',
+                        headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+                        body: JSON.stringify(formData)
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (response.ok && data.success) {
+                        submitted += 1;
+                        if (firstPosition === null) firstPosition = data.position;
+                    } else {
+                        errorMsg = data.error || `HTTP ${response.status}`;
+                        break;
+                    }
+                }
 
-                const data = await response.json().catch(() => ({}));
-
-                if (response.ok && data.success) {
-                    const posMsg = data.position > 1 ? `Queued at position ${data.position}` : 'Starting generation...';
+                if (submitted > 0 && !errorMsg) {
+                    const posMsg = orientationsToQueue.length > 1
+                        ? `Queued ${submitted} jobs (one per orientation)`
+                        : (firstPosition > 1 ? `Queued at position ${firstPosition}` : 'Starting generation...');
                     status.className = 'status generating';
                     statusText.textContent = posMsg;
                     pollStatus();
+                } else if (submitted > 0 && errorMsg) {
+                    status.className = 'status error';
+                    statusText.textContent = `Queued ${submitted}/${orientationsToQueue.length}; stopped: ${errorMsg}`;
+                    pollStatus();
                 } else {
                     status.className = 'status error';
-                    statusText.textContent = 'Error: ' + (data.error || `HTTP ${response.status}`);
+                    statusText.textContent = 'Error: ' + (errorMsg || 'submission failed');
                 }
             } catch (err) {
                 status.className = 'status error';

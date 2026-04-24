@@ -1,7 +1,0 @@
-# Raw input: a Milanese model
-# Prompt: a Milanese model
-# Dimensions: 888x1128
-# Seed: 3273746367
-# Steps: 25
-# Guidance: auto
-# Timings: encoding=0.00s, diffusion=96.43s, save=0.19s

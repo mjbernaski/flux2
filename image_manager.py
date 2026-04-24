@@ -1,0 +1,857 @@
+"""Image Manager — a small web UI for browsing, deleting, moving, and cropping
+images under web-generated/ and its subfolders.
+
+Run:
+    ./run_image_manager.sh
+or
+    python image_manager.py --port 2223
+"""
+import argparse
+import io
+import os
+import shutil
+import socket
+from urllib.parse import quote
+
+from flask import Flask, abort, jsonify, request, send_file
+from PIL import Image
+from dotenv import load_dotenv
+
+load_dotenv()
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "web-generated"))
+os.makedirs(ROOT, exist_ok=True)
+
+API_KEY = (os.environ.get("FLUX_API_KEY") or "").strip()
+
+IMG_EXTS = (".png", ".jpg", ".jpeg", ".webp")
+SKIP_FILES = {".DS_Store"}
+SKIP_PREFIXES = ("_preview_",)
+
+app = Flask(__name__)
+
+
+def check_auth():
+    provided = request.headers.get("X-API-Key") or request.args.get("api_key")
+    return provided == API_KEY
+
+
+@app.before_request
+def require_auth():
+    if request.endpoint in ("index", "ready"):
+        return
+    if not API_KEY:
+        return jsonify({"success": False, "error": "Server misconfigured: FLUX_API_KEY not set"}), 500
+    if not check_auth():
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+
+
+def safe_resolve(rel_path):
+    """Resolve a path relative to ROOT. Returns absolute path, or None if it
+    would escape ROOT."""
+    if rel_path is None:
+        rel_path = ""
+    rel_path = rel_path.replace("\\", "/").lstrip("/")
+    abs_path = os.path.abspath(os.path.join(ROOT, rel_path))
+    if abs_path != ROOT and not abs_path.startswith(ROOT + os.sep):
+        return None
+    return abs_path
+
+
+def rel_of(abs_path):
+    return os.path.relpath(abs_path, ROOT).replace(os.sep, "/")
+
+
+def sidecar_path(abs_image_path):
+    """Return the .prompt sidecar path for an image path."""
+    return os.path.splitext(abs_image_path)[0] + ".prompt"
+
+
+def folder_tree(abs_dir, rel=""):
+    children = []
+    try:
+        for item in sorted(os.listdir(abs_dir), key=str.lower):
+            full = os.path.join(abs_dir, item)
+            if os.path.isdir(full):
+                children.append(folder_tree(full, (rel + "/" + item) if rel else item))
+    except Exception:
+        pass
+    # Count image files directly in this folder
+    count = 0
+    try:
+        for name in os.listdir(abs_dir):
+            if name in SKIP_FILES or name.startswith(SKIP_PREFIXES):
+                continue
+            if name.lower().endswith(IMG_EXTS) and os.path.isfile(os.path.join(abs_dir, name)):
+                count += 1
+    except Exception:
+        pass
+    return {
+        "rel": rel,
+        "name": os.path.basename(abs_dir) if rel else "(root)",
+        "hidden": os.path.basename(abs_dir) == ".hide",
+        "count": count,
+        "children": children,
+    }
+
+
+def flat_folder_list(tree, out=None):
+    """Flatten the folder tree into [(rel, label)] pairs, depth-indented."""
+    if out is None:
+        out = []
+    depth = tree["rel"].count("/") + (1 if tree["rel"] else 0)
+    label = ("  " * depth) + tree["name"] + (f"  ({tree['count']})" if tree["count"] else "")
+    out.append({"rel": tree["rel"], "label": label, "hidden": tree["hidden"]})
+    for c in tree["children"]:
+        flat_folder_list(c, out)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# API
+# ---------------------------------------------------------------------------
+
+@app.route("/ready")
+def ready():
+    return jsonify({"ready": True})
+
+
+@app.route("/api/folders")
+def api_folders():
+    tree = folder_tree(ROOT)
+    return jsonify({"tree": tree, "flat": flat_folder_list(tree)})
+
+
+@app.route("/api/list")
+def api_list():
+    folder = request.args.get("folder", "")
+    abs_dir = safe_resolve(folder)
+    if not abs_dir or not os.path.isdir(abs_dir):
+        return jsonify({"error": "Invalid folder"}), 400
+    items = []
+    try:
+        for name in os.listdir(abs_dir):
+            if name in SKIP_FILES or name.startswith(SKIP_PREFIXES):
+                continue
+            if not name.lower().endswith(IMG_EXTS):
+                continue
+            full = os.path.join(abs_dir, name)
+            if not os.path.isfile(full):
+                continue
+            try:
+                stat = os.stat(full)
+            except Exception:
+                continue
+            prompt = None
+            sp = sidecar_path(full)
+            if os.path.isfile(sp):
+                try:
+                    with open(sp, "r") as f:
+                        for line in f:
+                            if line.startswith("# Prompt: "):
+                                prompt = line[10:].strip()
+                                break
+                except Exception:
+                    pass
+            items.append({
+                "name": name,
+                "rel": rel_of(full),
+                "size": stat.st_size,
+                "mtime": stat.st_mtime,
+                "prompt": prompt,
+            })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    items.sort(key=lambda x: x["mtime"], reverse=True)
+    return jsonify({"folder": folder, "items": items, "count": len(items)})
+
+
+@app.route("/api/image")
+def api_image():
+    rel = request.args.get("path", "")
+    abs_path = safe_resolve(rel)
+    if not abs_path or not os.path.isfile(abs_path):
+        abort(404)
+    return send_file(abs_path)
+
+
+@app.route("/api/thumb")
+def api_thumb():
+    rel = request.args.get("path", "")
+    abs_path = safe_resolve(rel)
+    if not abs_path or not os.path.isfile(abs_path):
+        abort(404)
+    try:
+        size = max(64, min(512, int(request.args.get("size", 256))))
+    except Exception:
+        size = 256
+    try:
+        img = Image.open(abs_path)
+        img.thumbnail((size, size))
+        if img.mode in ("RGBA", "P", "LA"):
+            img = img.convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=82)
+        buf.seek(0)
+        return send_file(buf, mimetype="image/jpeg")
+    except Exception:
+        abort(500)
+
+
+@app.route("/api/delete", methods=["POST"])
+def api_delete():
+    body = request.get_json(silent=True) or {}
+    rel = body.get("path", "")
+    abs_path = safe_resolve(rel)
+    if not abs_path or not os.path.isfile(abs_path):
+        return jsonify({"success": False, "error": "File not found"}), 404
+    try:
+        os.remove(abs_path)
+        sp = sidecar_path(abs_path)
+        if os.path.isfile(sp):
+            os.remove(sp)
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    return jsonify({"success": True})
+
+
+@app.route("/api/move", methods=["POST"])
+def api_move():
+    body = request.get_json(silent=True) or {}
+    src_rel = body.get("path", "")
+    dst_folder = body.get("folder", "")
+    src_abs = safe_resolve(src_rel)
+    dst_dir_abs = safe_resolve(dst_folder)
+    if not src_abs or not os.path.isfile(src_abs):
+        return jsonify({"success": False, "error": "Source not found"}), 404
+    if dst_dir_abs is None:
+        return jsonify({"success": False, "error": "Invalid destination folder"}), 400
+    os.makedirs(dst_dir_abs, exist_ok=True)
+    name = os.path.basename(src_abs)
+    dst_abs = os.path.join(dst_dir_abs, name)
+    if os.path.abspath(src_abs) == os.path.abspath(dst_abs):
+        return jsonify({"success": False, "error": "Source and destination are the same"}), 400
+    if os.path.exists(dst_abs):
+        return jsonify({"success": False, "error": f"Destination already has a file named {name}"}), 409
+    try:
+        shutil.move(src_abs, dst_abs)
+        src_prompt = sidecar_path(src_abs)
+        if os.path.isfile(src_prompt):
+            shutil.move(src_prompt, sidecar_path(dst_abs))
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    return jsonify({"success": True, "new_path": rel_of(dst_abs)})
+
+
+@app.route("/api/hide", methods=["POST"])
+def api_hide():
+    """Toggle hidden: move into (or out of) a .hide/ subfolder of the image's parent."""
+    body = request.get_json(silent=True) or {}
+    rel = body.get("path", "")
+    abs_path = safe_resolve(rel)
+    if not abs_path or not os.path.isfile(abs_path):
+        return jsonify({"success": False, "error": "File not found"}), 404
+    parent = os.path.dirname(abs_path)
+    name = os.path.basename(abs_path)
+    if os.path.basename(parent) == ".hide":
+        dst_dir = os.path.dirname(parent)
+        action = "unhide"
+    else:
+        dst_dir = os.path.join(parent, ".hide")
+        os.makedirs(dst_dir, exist_ok=True)
+        action = "hide"
+    dst_abs = os.path.join(dst_dir, name)
+    if os.path.exists(dst_abs):
+        return jsonify({"success": False, "error": f"Destination already has a file named {name}"}), 409
+    try:
+        shutil.move(abs_path, dst_abs)
+        src_prompt = sidecar_path(abs_path)
+        if os.path.isfile(src_prompt):
+            shutil.move(src_prompt, sidecar_path(dst_abs))
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    return jsonify({"success": True, "action": action, "new_path": rel_of(dst_abs)})
+
+
+@app.route("/api/crop", methods=["POST"])
+def api_crop():
+    """Crop a rectangle. Body: {path, left, top, right, bottom, mode: 'replace'|'new'}
+    Coords are in the original image's pixel space."""
+    body = request.get_json(silent=True) or {}
+    rel = body.get("path", "")
+    abs_path = safe_resolve(rel)
+    if not abs_path or not os.path.isfile(abs_path):
+        return jsonify({"success": False, "error": "File not found"}), 404
+    try:
+        left = int(round(float(body.get("left", 0))))
+        top = int(round(float(body.get("top", 0))))
+        right = int(round(float(body.get("right", 0))))
+        bottom = int(round(float(body.get("bottom", 0))))
+    except Exception:
+        return jsonify({"success": False, "error": "Invalid coordinates"}), 400
+    mode = body.get("mode", "replace")
+    try:
+        img = Image.open(abs_path)
+        w, h = img.size
+        left = max(0, min(left, w))
+        top = max(0, min(top, h))
+        right = max(left + 1, min(right, w))
+        bottom = max(top + 1, min(bottom, h))
+        if right - left < 2 or bottom - top < 2:
+            return jsonify({"success": False, "error": "Crop area is too small"}), 400
+        cropped = img.crop((left, top, right, bottom))
+        if mode == "new":
+            base, ext = os.path.splitext(abs_path)
+            dst = f"{base}_crop{ext}"
+            i = 2
+            while os.path.exists(dst):
+                dst = f"{base}_crop{i}{ext}"
+                i += 1
+            cropped.save(dst)
+            src_prompt = sidecar_path(abs_path)
+            if os.path.isfile(src_prompt):
+                shutil.copy2(src_prompt, sidecar_path(dst))
+            return jsonify({"success": True, "new_path": rel_of(dst), "replaced": False})
+        else:
+            cropped.save(abs_path)
+            return jsonify({"success": True, "new_path": rel, "replaced": True,
+                            "size": {"w": cropped.width, "h": cropped.height}})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------------
+
+HTML_PAGE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Image Manager</title>
+<style>
+  :root {
+    --bg: #1a1a1a; --panel: #232323; --panel2: #2b2b2b;
+    --fg: #e0e0e0; --muted: #888; --accent: #5aa8ff; --danger: #e05050;
+    --border: #333;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px system-ui, -apple-system, sans-serif;
+         background: var(--bg); color: var(--fg); height: 100vh; display: flex; flex-direction: column; }
+  header { padding: 8px 12px; background: var(--panel); border-bottom: 1px solid var(--border);
+           display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  header h1 { font-size: 16px; margin: 0; margin-right: 6px; }
+  header select, header input, header button {
+    background: var(--panel2); color: var(--fg); border: 1px solid var(--border);
+    padding: 5px 8px; border-radius: 4px; font: inherit;
+  }
+  header button { cursor: pointer; }
+  header button:hover { background: #363636; }
+  .muted { color: var(--muted); }
+  main { flex: 1; overflow: auto; padding: 12px; }
+  #grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; overflow: hidden;
+          display: flex; flex-direction: column; }
+  .card .thumb { background: #000; aspect-ratio: 1 / 1; display: flex; align-items: center; justify-content: center;
+                 cursor: pointer; overflow: hidden; }
+  .card .thumb img { max-width: 100%; max-height: 100%; object-fit: contain; }
+  .card .meta { padding: 6px 8px; font-size: 12px; color: var(--muted); word-break: break-all; }
+  .card .meta .name { color: var(--fg); font-size: 11px; }
+  .card .actions { display: flex; gap: 4px; padding: 6px; border-top: 1px solid var(--border); }
+  .card .actions button { flex: 1; background: var(--panel2); color: var(--fg);
+                          border: 1px solid var(--border); border-radius: 3px; padding: 4px 2px;
+                          font-size: 11px; cursor: pointer; }
+  .card .actions button:hover { background: #363636; }
+  .card .actions button.danger:hover { background: var(--danger); border-color: var(--danger); }
+  .card { position: relative; }
+  .card.selected { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .card .select-cb { position: absolute; top: 6px; left: 6px; width: 22px; height: 22px;
+                     background: rgba(0,0,0,0.6); border: 1px solid var(--border);
+                     border-radius: 4px; cursor: pointer; z-index: 2; user-select: none;
+                     display: flex; align-items: center; justify-content: center;
+                     font-size: 14px; font-weight: bold; color: transparent; }
+  .card .select-cb:hover { background: rgba(0,0,0,0.85); }
+  .card.selected .select-cb { background: var(--accent); border-color: var(--accent); color: #000; }
+  header button.danger { background: var(--danger); border-color: var(--danger); color: #fff; }
+  header button.danger:hover { background: #ff6a6a; }
+  header button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  #modal { position: fixed; inset: 0; background: rgba(0,0,0,0.85); display: none;
+           align-items: center; justify-content: center; z-index: 10; }
+  #modal.open { display: flex; }
+  .modal-box { background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+               max-width: 95vw; max-height: 95vh; display: flex; flex-direction: column; overflow: hidden; }
+  .modal-head { display: flex; justify-content: space-between; align-items: center;
+                padding: 8px 12px; border-bottom: 1px solid var(--border); gap: 10px; }
+  .modal-head .title { font-weight: 600; word-break: break-all; font-size: 13px; }
+  .modal-body { display: flex; flex: 1; min-height: 0; }
+  .modal-img-wrap { flex: 1; min-width: 0; min-height: 0; background: #000;
+                    display: flex; align-items: center; justify-content: center; position: relative;
+                    overflow: hidden; }
+  #modalImg { max-width: 100%; max-height: 80vh; object-fit: contain; display: block; user-select: none;
+              -webkit-user-drag: none; }
+  .crop-overlay { position: absolute; inset: 0; cursor: crosshair; }
+  .crop-rect { position: absolute; border: 2px dashed var(--accent); background: rgba(90,168,255,0.12);
+               box-shadow: 0 0 0 9999px rgba(0,0,0,0.5); pointer-events: none; }
+  .modal-side { width: 280px; padding: 12px; border-left: 1px solid var(--border);
+                display: flex; flex-direction: column; gap: 10px; overflow: auto; }
+  .modal-side h3 { margin: 0; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+  .modal-side .row { display: flex; gap: 6px; align-items: center; }
+  .modal-side select, .modal-side button {
+    background: var(--panel2); color: var(--fg); border: 1px solid var(--border);
+    padding: 6px 8px; border-radius: 4px; font: inherit;
+  }
+  .modal-side button { cursor: pointer; }
+  .modal-side button:hover { background: #363636; }
+  .modal-side button.primary { background: var(--accent); border-color: var(--accent); color: #000; font-weight: 600; }
+  .modal-side button.primary:hover { background: #7ab8ff; }
+  .modal-side button.danger { background: var(--danger); border-color: var(--danger); color: #fff; }
+  .modal-side .prompt { background: var(--panel2); padding: 6px 8px; border-radius: 4px;
+                        font-size: 12px; white-space: pre-wrap; word-break: break-word; max-height: 120px; overflow: auto; }
+  .close-btn { background: transparent; border: none; color: var(--fg); font-size: 20px; cursor: pointer; }
+
+  #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+           background: var(--panel); border: 1px solid var(--border); border-radius: 4px;
+           padding: 8px 16px; z-index: 100; display: none; }
+  #toast.error { border-color: var(--danger); }
+  #toast.show { display: block; }
+
+  .empty { color: var(--muted); text-align: center; padding: 40px; }
+  .flex-grow { flex-grow: 1; }
+
+  /* Make selected folder option easy to read */
+  #folderSel option { font-family: ui-monospace, monospace; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Image Manager</h1>
+  <label>Folder:
+    <select id="folderSel"></select>
+  </label>
+  <span id="count" class="muted"></span>
+  <button id="selectAllBtn" title="Select all images in this folder">Select all</button>
+  <span id="selCount" class="muted" style="display:none"></span>
+  <button id="bulkDeleteBtn" class="danger" style="display:none">Delete selected</button>
+  <button id="clearSelBtn" style="display:none">Clear</button>
+  <span class="flex-grow"></span>
+  <input id="apiKey" type="password" placeholder="API key" size="24">
+  <button id="refresh">Refresh</button>
+</header>
+
+<main>
+  <div id="grid"></div>
+  <div id="empty" class="empty" style="display:none">No images in this folder.</div>
+</main>
+
+<div id="modal">
+  <div class="modal-box">
+    <div class="modal-head">
+      <div class="title" id="modalTitle"></div>
+      <button class="close-btn" id="closeBtn">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div class="modal-img-wrap">
+        <img id="modalImg" src="" alt="">
+        <div class="crop-overlay" id="cropOverlay" style="display:none">
+          <div class="crop-rect" id="cropRect" style="display:none"></div>
+        </div>
+      </div>
+      <div class="modal-side">
+        <h3>Info</h3>
+        <div id="modalInfo" class="muted" style="font-size:12px"></div>
+        <div id="modalPrompt" class="prompt" style="display:none"></div>
+
+        <h3>Move to folder</h3>
+        <div class="row">
+          <select id="moveSel" class="flex-grow" style="flex:1"></select>
+          <button id="moveBtn">Move</button>
+        </div>
+
+        <h3>Hide</h3>
+        <button id="hideBtn">Toggle hide</button>
+
+        <h3>Crop</h3>
+        <div class="muted" style="font-size:12px">Drag on the image to select a region.</div>
+        <div id="cropCoords" class="muted" style="font-size:11px; font-family:ui-monospace,monospace"></div>
+        <div class="row">
+          <button id="cropResetBtn">Clear selection</button>
+        </div>
+        <div class="row">
+          <button id="cropReplaceBtn" class="primary" disabled>Crop &amp; replace</button>
+        </div>
+        <div class="row">
+          <button id="cropNewBtn" disabled>Crop as new file</button>
+        </div>
+
+        <div style="flex-grow:1"></div>
+        <h3>Danger zone</h3>
+        <button id="deleteBtn" class="danger">Delete permanently</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+const $ = sel => document.querySelector(sel);
+const state = {
+  folders: [],       // flat folder list
+  items: [],         // current folder images
+  current: null,     // selected image item
+  naturalSize: null, // {w,h} of current image
+  cropBox: null,     // {x1,y1,x2,y2} in image pixel coords
+};
+
+function apiKey() { return $('#apiKey').value.trim(); }
+
+function authQuery() {
+  const k = apiKey();
+  return k ? ('api_key=' + encodeURIComponent(k)) : '';
+}
+
+async function api(path, opts={}) {
+  const url = path + (path.includes('?') ? '&' : '?') + authQuery();
+  const init = { ...opts };
+  init.headers = Object.assign({}, opts.headers || {}, { 'X-API-Key': apiKey() });
+  if (init.body && typeof init.body === 'object' && !(init.body instanceof FormData)) {
+    init.headers['Content-Type'] = 'application/json';
+    init.body = JSON.stringify(init.body);
+  }
+  const r = await fetch(url, init);
+  if (!r.ok) {
+    const t = await r.text();
+    try { const j = JSON.parse(t); throw new Error(j.error || r.statusText); }
+    catch (e) { throw e instanceof Error ? e : new Error(t || r.statusText); }
+  }
+  return r.json();
+}
+
+function toast(msg, isErr=false) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.className = 'show' + (isErr ? ' error' : '');
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => t.className = '', 2500);
+}
+
+function fmtBytes(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1024*1024) return (n/1024).toFixed(1) + ' KB';
+  return (n/1024/1024).toFixed(1) + ' MB';
+}
+
+function fmtDate(ts) {
+  const d = new Date(ts * 1000);
+  return d.toLocaleString();
+}
+
+function imgUrl(rel, thumb=false) {
+  const base = thumb ? '/api/thumb' : '/api/image';
+  const k = apiKey();
+  return base + '?path=' + encodeURIComponent(rel) + (k ? '&api_key=' + encodeURIComponent(k) : '');
+}
+
+async function loadFolders() {
+  const data = await api('/api/folders');
+  state.folders = data.flat;
+  const sel = $('#folderSel');
+  const move = $('#moveSel');
+  const prevSel = sel.value;
+  const prevMove = move.value;
+  sel.innerHTML = '';
+  move.innerHTML = '';
+  for (const f of data.flat) {
+    const opt = document.createElement('option');
+    opt.value = f.rel;
+    opt.textContent = f.label + (f.hidden ? '  [hidden]' : '');
+    sel.appendChild(opt);
+    const opt2 = opt.cloneNode(true);
+    move.appendChild(opt2);
+  }
+  if (prevSel && data.flat.some(f => f.rel === prevSel)) sel.value = prevSel;
+  if (prevMove && data.flat.some(f => f.rel === prevMove)) move.value = prevMove;
+}
+
+async function loadList(folder) {
+  const data = await api('/api/list?folder=' + encodeURIComponent(folder));
+  state.items = data.items;
+  $('#count').textContent = `${data.count} image${data.count === 1 ? '' : 's'}`;
+  renderGrid();
+}
+
+function renderGrid() {
+  const grid = $('#grid');
+  grid.innerHTML = '';
+  if (state.items.length === 0) {
+    $('#empty').style.display = 'block';
+    return;
+  }
+  $('#empty').style.display = 'none';
+  for (const it of state.items) {
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.innerHTML = `
+      <div class="thumb" title="Click to open">
+        <img loading="lazy" src="${imgUrl(it.rel, true)}" alt="">
+      </div>
+      <div class="meta">
+        <div class="name">${it.name}</div>
+        <div>${fmtBytes(it.size)} · ${new Date(it.mtime*1000).toLocaleString()}</div>
+      </div>
+      <div class="actions">
+        <button data-act="open">Open</button>
+        <button data-act="hide">Hide</button>
+        <button class="danger" data-act="delete">Delete</button>
+      </div>`;
+    const thumb = card.querySelector('.thumb');
+    thumb.addEventListener('click', () => openModal(it));
+    card.querySelectorAll('[data-act]').forEach(btn => {
+      btn.addEventListener('click', e => {
+        e.stopPropagation();
+        const act = btn.getAttribute('data-act');
+        if (act === 'open') openModal(it);
+        else if (act === 'delete') quickDelete(it);
+        else if (act === 'hide') quickHide(it);
+      });
+    });
+    grid.appendChild(card);
+  }
+}
+
+async function quickDelete(it) {
+  if (!confirm(`Permanently delete ${it.name}?`)) return;
+  try {
+    await api('/api/delete', { method: 'POST', body: { path: it.rel } });
+    toast('Deleted');
+    refresh();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function quickHide(it) {
+  try {
+    const r = await api('/api/hide', { method: 'POST', body: { path: it.rel } });
+    toast(r.action === 'hide' ? 'Hidden' : 'Unhidden');
+    refresh();
+  } catch (e) { toast(e.message, true); }
+}
+
+// ---- Modal ----
+function openModal(it) {
+  state.current = it;
+  state.cropBox = null;
+  state.naturalSize = null;
+  $('#modal').classList.add('open');
+  $('#modalTitle').textContent = it.name;
+  $('#modalInfo').textContent = `${it.rel}  ·  ${fmtBytes(it.size)}  ·  ${fmtDate(it.mtime)}`;
+  const promptEl = $('#modalPrompt');
+  if (it.prompt) { promptEl.style.display = 'block'; promptEl.textContent = it.prompt; }
+  else { promptEl.style.display = 'none'; }
+  const img = $('#modalImg');
+  img.onload = () => {
+    state.naturalSize = { w: img.naturalWidth, h: img.naturalHeight };
+    $('#cropOverlay').style.display = 'block';
+    $('#cropRect').style.display = 'none';
+    $('#cropCoords').textContent = `image: ${img.naturalWidth} × ${img.naturalHeight}`;
+    $('#cropReplaceBtn').disabled = true;
+    $('#cropNewBtn').disabled = true;
+  };
+  img.src = imgUrl(it.rel) + '&t=' + Date.now();
+  // Preselect the current folder in the move dropdown
+  const currentFolder = $('#folderSel').value;
+  $('#moveSel').value = currentFolder;
+}
+
+function closeModal() {
+  $('#modal').classList.remove('open');
+  state.current = null;
+  state.cropBox = null;
+  $('#modalImg').src = '';
+  $('#cropRect').style.display = 'none';
+  $('#cropOverlay').style.display = 'none';
+}
+
+// ---- Crop interactions ----
+(function setupCrop() {
+  const overlay = $('#cropOverlay');
+  const rect = $('#cropRect');
+  let startX, startY, dragging = false;
+
+  function imgGeom() {
+    const img = $('#modalImg');
+    const wrap = overlay.parentElement;
+    const wrapRect = wrap.getBoundingClientRect();
+    const imgRect = img.getBoundingClientRect();
+    return {
+      // overlay is positioned inset:0 over wrap; coords of img inside overlay:
+      offX: imgRect.left - wrapRect.left,
+      offY: imgRect.top - wrapRect.top,
+      w: imgRect.width, h: imgRect.height,
+      natW: img.naturalWidth, natH: img.naturalHeight,
+    };
+  }
+
+  overlay.addEventListener('mousedown', e => {
+    if (e.button !== 0) return;
+    const g = imgGeom();
+    const ox = e.offsetX, oy = e.offsetY;
+    // Only start if inside the image area
+    if (ox < g.offX || ox > g.offX + g.w || oy < g.offY || oy > g.offY + g.h) return;
+    dragging = true;
+    startX = ox; startY = oy;
+    rect.style.left = ox + 'px'; rect.style.top = oy + 'px';
+    rect.style.width = '0px'; rect.style.height = '0px';
+    rect.style.display = 'block';
+    e.preventDefault();
+  });
+
+  overlay.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    const g = imgGeom();
+    const x = Math.max(g.offX, Math.min(e.offsetX, g.offX + g.w));
+    const y = Math.max(g.offY, Math.min(e.offsetY, g.offY + g.h));
+    const x1 = Math.min(startX, x), y1 = Math.min(startY, y);
+    const x2 = Math.max(startX, x), y2 = Math.max(startY, y);
+    rect.style.left = x1 + 'px'; rect.style.top = y1 + 'px';
+    rect.style.width = (x2 - x1) + 'px'; rect.style.height = (y2 - y1) + 'px';
+  });
+
+  overlay.addEventListener('mouseup', e => {
+    if (!dragging) return;
+    dragging = false;
+    const g = imgGeom();
+    const r = rect.getBoundingClientRect();
+    const wrapRect = overlay.parentElement.getBoundingClientRect();
+    const x1_px = r.left - wrapRect.left - g.offX;
+    const y1_px = r.top - wrapRect.top - g.offY;
+    const x2_px = x1_px + r.width;
+    const y2_px = y1_px + r.height;
+    if (r.width < 5 || r.height < 5) {
+      rect.style.display = 'none';
+      state.cropBox = null;
+      $('#cropReplaceBtn').disabled = true;
+      $('#cropNewBtn').disabled = true;
+      return;
+    }
+    const scaleX = g.natW / g.w;
+    const scaleY = g.natH / g.h;
+    state.cropBox = {
+      left: Math.round(x1_px * scaleX),
+      top: Math.round(y1_px * scaleY),
+      right: Math.round(x2_px * scaleX),
+      bottom: Math.round(y2_px * scaleY),
+    };
+    $('#cropCoords').textContent =
+      `crop: (${state.cropBox.left}, ${state.cropBox.top}) → (${state.cropBox.right}, ${state.cropBox.bottom})` +
+      `  size: ${state.cropBox.right - state.cropBox.left} × ${state.cropBox.bottom - state.cropBox.top}`;
+    $('#cropReplaceBtn').disabled = false;
+    $('#cropNewBtn').disabled = false;
+  });
+
+  $('#cropResetBtn').addEventListener('click', () => {
+    rect.style.display = 'none';
+    state.cropBox = null;
+    $('#cropReplaceBtn').disabled = true;
+    $('#cropNewBtn').disabled = true;
+    const img = $('#modalImg');
+    $('#cropCoords').textContent = `image: ${img.naturalWidth} × ${img.naturalHeight}`;
+  });
+})();
+
+async function doCrop(mode) {
+  if (!state.current || !state.cropBox) return;
+  if (mode === 'replace' && !confirm('Replace the original file with the cropped image?')) return;
+  try {
+    const r = await api('/api/crop', { method: 'POST', body: {
+      path: state.current.rel, ...state.cropBox, mode,
+    }});
+    toast(mode === 'replace' ? 'Cropped & replaced' : 'Saved cropped copy');
+    closeModal();
+    refresh();
+  } catch (e) { toast(e.message, true); }
+}
+
+$('#cropReplaceBtn').addEventListener('click', () => doCrop('replace'));
+$('#cropNewBtn').addEventListener('click', () => doCrop('new'));
+
+$('#moveBtn').addEventListener('click', async () => {
+  if (!state.current) return;
+  const dst = $('#moveSel').value;
+  try {
+    await api('/api/move', { method: 'POST', body: { path: state.current.rel, folder: dst }});
+    toast('Moved');
+    closeModal();
+    refresh();
+  } catch (e) { toast(e.message, true); }
+});
+
+$('#hideBtn').addEventListener('click', async () => {
+  if (!state.current) return;
+  try {
+    const r = await api('/api/hide', { method: 'POST', body: { path: state.current.rel }});
+    toast(r.action === 'hide' ? 'Hidden' : 'Unhidden');
+    closeModal();
+    refresh();
+  } catch (e) { toast(e.message, true); }
+});
+
+$('#deleteBtn').addEventListener('click', async () => {
+  if (!state.current) return;
+  if (!confirm(`Permanently delete ${state.current.name}?`)) return;
+  try {
+    await api('/api/delete', { method: 'POST', body: { path: state.current.rel }});
+    toast('Deleted');
+    closeModal();
+    refresh();
+  } catch (e) { toast(e.message, true); }
+});
+
+$('#closeBtn').addEventListener('click', closeModal);
+$('#modal').addEventListener('click', e => { if (e.target.id === 'modal') closeModal(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
+$('#folderSel').addEventListener('change', () => loadList($('#folderSel').value).catch(e => toast(e.message, true)));
+$('#refresh').addEventListener('click', () => refresh());
+$('#apiKey').addEventListener('change', () => {
+  localStorage.setItem('im_api_key', apiKey());
+  refresh();
+});
+
+async function refresh() {
+  try {
+    await loadFolders();
+    await loadList($('#folderSel').value || '');
+  } catch (e) { toast(e.message, true); }
+}
+
+// On startup
+$('#apiKey').value = localStorage.getItem('im_api_key') || '';
+refresh();
+</script>
+</body>
+</html>
+"""
+
+
+@app.route("/")
+def index():
+    from flask import Response
+    return Response(HTML_PAGE, mimetype="text/html")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="FLUX Image Manager")
+    parser.add_argument("--port", type=int, default=int(os.environ.get("IMAGE_MANAGER_PORT", 2223)))
+    parser.add_argument("--host", default="0.0.0.0")
+    args = parser.parse_args()
+
+    if not API_KEY:
+        print("ERROR: FLUX_API_KEY is not set. Put it in .env or export it before starting.")
+        import sys
+        sys.exit(1)
+
+    print(f"Image Manager serving {ROOT}")
+    print(f"Listening on http://{args.host}:{args.port}  (hostname: {socket.gethostname()})")
+    app.run(host=args.host, port=args.port, threaded=True)

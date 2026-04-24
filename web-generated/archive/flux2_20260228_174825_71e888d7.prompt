@@ -1,7 +1,0 @@
-# Raw input: tokens from a large language model
-# Prompt: tokens from a large language model
-# Dimensions: 1224x816
-# Seed: 44373748
-# Steps: 25
-# Guidance: auto
-# Timings: encoding=0.00s, diffusion=89.59s, save=0.21s

@@ -1,8 +1,0 @@
-# Raw input: seductove
-# Prompt: seductove
-# Dimensions: 624x904
-# Seed: 326093034
-# Steps: 25
-# Guidance: 3.0
-# Strength: 0.25 (img2img)
-# Timings: encoding=0.00s, diffusion=76.07s, save=0.84s

@@ -13,3 +13,4 @@ protobuf
 flask
 pillow
 python-dotenv
+# nvidia-modelopt  # installed for future NVFP4 support (currently blocked by diffusers Flux2 converter)

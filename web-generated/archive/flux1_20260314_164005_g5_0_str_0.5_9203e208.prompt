@@ -1,8 +1,0 @@
-# Raw input: Cartoon
-# Prompt: Cartoon
-# Dimensions: 1000x1000
-# Seed: 3417711520
-# Steps: 25
-# Guidance: 5.0
-# Strength: 0.5 (img2img)
-# Timings: encoding=0.00s, diffusion=138.57s, save=0.72s

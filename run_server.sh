@@ -50,6 +50,7 @@ show_menu() {
     echo -e "${CYAN}║${NC}    ${GREEN}6)${NC} FLUX.2 Full           (High VRAM, best quality)       ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}    ${GREEN}7)${NC} FLUX.2 Full + Turbo   (8-step fast inference)         ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}    ${GREEN}9)${NC} FLUX.2 Full (no Turbo) (Max quality, slower)          ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   ${GREEN}10)${NC} FLUX.2-klein-9B       ${YELLOW}[default]${NC} (9B, faster)          ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}                                                              ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}    ${RED}q)${NC} Quit                                                  ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}                                                              ${CYAN}║${NC}"
@@ -106,6 +107,10 @@ start_server() {
         9)
             args="--flux2 --full-model --no-turbo"
             desc="FLUX.2 Full (no Turbo)"
+            ;;
+        10)
+            args="--klein"
+            desc="FLUX.2-klein-9B"
             ;;
         *)
             echo -e "${RED}Invalid selection${NC}"
@@ -203,18 +208,28 @@ start_server() {
 # Main loop
 main() {
     # Check if a number was passed as argument
-    if [ -n "$1" ] && [[ "$1" =~ ^[1-9]$ ]]; then
+    if [ -n "$1" ] && [[ "$1" =~ ^([1-9]|10)$ ]]; then
         start_server "$@"
+        exit $?
+    fi
+
+    # No arguments passed → launch default (klein) directly
+    if [ -z "$1" ] && [ ! -t 0 ]; then
+        start_server 10
         exit $?
     fi
 
     while true; do
         show_menu
-        echo -ne "${CYAN}Select configuration [1-9, q to quit]: ${NC}"
+        echo -ne "${CYAN}Select configuration [1-10, default=10, q to quit]: ${NC}"
         read -r choice
+        # Empty input → run default (klein)
+        if [ -z "$choice" ]; then
+            choice=10
+        fi
 
         case $choice in
-            [1-9])
+            [1-9]|10)
                 start_server "$choice"
                 exit $?
                 ;;

@@ -1,7 +1,0 @@
-# Raw input: the blacksmith has the piece of iron red hot in his furnace
-# Prompt: the blacksmith has the piece of iron red hot in his furnace
-# Dimensions: 1024x1024
-# Seed: 2988699382
-# Steps: 25
-# Guidance: 6.75
-# Timings: encoding=0.00s, diffusion=110.19s, save=0.66s
