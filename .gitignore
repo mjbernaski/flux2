@@ -58,3 +58,4 @@ server.pid
 
 # Generated image artifacts
 web-generated/
+server_smoke_test/

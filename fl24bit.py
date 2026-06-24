@@ -80,6 +80,7 @@ _model_type = None  # Track which model is loaded
 _flux_version = 1  # Track FLUX version (1 or 2)
 _turbo_enabled = False  # Track if turbo LoRA is loaded
 _schnell_enabled = False  # Track if using schnell (4-step) model
+_local_encoder_active = False  # Set when local encoders are loaded (incl. remote-encoder fallback)
 
 # Pre-shifted custom sigmas for 8-step turbo inference (FLUX.2 only)
 TURBO_SIGMAS = [1.0, 0.6509, 0.4374, 0.2932, 0.1893, 0.1108, 0.0495, 0.00031]
@@ -163,9 +164,10 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
             Klein always loads as full bf16 (no quantized variant wired up — NVFP4 blocked by
             diffusers upstream qkv-chunking bug in the Flux2 single-file converter).
     """
-    global transformer, pipe, _model_type, _flux_version, _schnell_enabled
+    global transformer, pipe, _model_type, _flux_version, _schnell_enabled, _local_encoder_active
     if pipe is not None:
         return {}  # Already loaded
+    _local_encoder_active = local_encoder
 
     # klein implies flux2 + full (bf16). Klein has no working 4-bit/NVFP4 path in current diffusers.
     if klein:
@@ -444,7 +446,16 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
                 )
         else:
             # FLUX.1 pipeline
-            if local_encoder:
+            use_local = local_encoder
+            if not use_local and not remote_encoder_available():
+                # The remote text-encoder service is unavailable (HF has a
+                # history of decommissioning it). Fall back to loading the
+                # local T5+CLIP encoders so 4-bit FLUX.1 still works.
+                print("Remote text encoder unavailable - falling back to local encoders.")
+                use_local = True
+                _local_encoder_active = True
+
+            if use_local:
                 print("Loading local text encoders (this requires more VRAM)...")
                 pipe = FluxPipeline.from_pretrained(
                     repo_id, transformer=transformer, torch_dtype=torch_dtype,
@@ -525,12 +536,19 @@ def load_uncensored_lora():
     _uncensored_enabled = True
 
 
+REMOTE_ENCODER_URL = "https://remote-text-encoder-flux-2.huggingface.co/predict"
+
+
+class RemoteEncoderUnavailable(RuntimeError):
+    """Raised when the remote text-encoder endpoint does not return embeddings."""
+
+
 def remote_text_encoder(prompt, use_cache=True):
     if use_cache and prompt in _embedding_cache:
         return _embedding_cache[prompt]
 
     response = _session.post(
-        "https://remote-text-encoder-flux-2.huggingface.co/predict",
+        REMOTE_ENCODER_URL,
         json={"prompt": prompt},
         headers={
             "Authorization": f"Bearer {get_token()}",
@@ -539,13 +557,44 @@ def remote_text_encoder(prompt, use_cache=True):
         timeout=(10, 60),  # (connect timeout, read timeout) in seconds
     )
     response.raise_for_status()
-    prompt_embeds = torch.load(io.BytesIO(response.content))
+
+    # The endpoint has a history of being decommissioned and silently serving
+    # the Hugging Face website (HTTP 206, text/html) instead of embeddings,
+    # which produces a cryptic unpickling error. Detect that explicitly so the
+    # caller can fall back to the local encoder.
+    ctype = response.headers.get("content-type", "")
+    if "text/html" in ctype or response.content[:1] in (b"<",):
+        raise RemoteEncoderUnavailable(
+            f"Remote text encoder returned non-tensor content "
+            f"(status {response.status_code}, content-type '{ctype}'). "
+            f"The HF remote encoder service appears to be unavailable."
+        )
+
+    # PyTorch 2.6 flipped torch.load's `weights_only` default to True, which
+    # rejects the pickled tensor payload returned by the remote encoder. The
+    # endpoint is HF's official, bearer-token-authenticated service, so the
+    # source is trusted and weights_only=False is safe here.
+    prompt_embeds = torch.load(io.BytesIO(response.content), weights_only=False)
     result = prompt_embeds.to(device)
 
     if use_cache:
         _embedding_cache[prompt] = result
 
     return result
+
+
+def remote_encoder_available():
+    """Best-effort probe of the remote text-encoder endpoint.
+
+    Returns True only if it responds with an actual embedding tensor. Used at
+    load time to decide whether to fall back to the local encoder.
+    """
+    try:
+        remote_text_encoder("ping", use_cache=False)
+        return True
+    except Exception as e:
+        print(f"  Remote text encoder probe failed: {e}")
+        return False
 
 def decode_latents_to_preview(pipe_obj, latents, height, width, max_size=512):
     """Decode intermediate Flux latents into a PIL preview image.
@@ -720,8 +769,8 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
                 image = pipe_img2img(**img2img_kwargs).images[0]
                 timings['diffusion'] = time.perf_counter() - t0
                 timings['encoding'] = 0
-        elif local_encoder or _flux_version == 2:
-            # Use local text encoder
+        elif local_encoder or _local_encoder_active or _flux_version == 2:
+            # Use local text encoder (incl. remote-encoder fallback)
             t0 = time.perf_counter()
             pipe_kwargs = {
                 "prompt": prompt,
