@@ -34,27 +34,24 @@ kill_existing_server() {
 # Display menu
 show_menu() {
     clear
-    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║${NC}           ${GREEN}FLUX Image Generator - Server Launcher${NC}            ${CYAN}║${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}                                                              ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}FLUX.1 Models:${NC}                                             ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}    ${GREEN}1)${NC} FLUX.1 4-bit BNB      (Low VRAM, remote encoder)      ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}    ${GREEN}2)${NC} FLUX.1 Full           (High VRAM, best quality)       ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}    ${GREEN}3)${NC} FLUX.1 GGUF Q8        (DGX Spark optimized)           ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}    ${GREEN}4)${NC} FLUX.1-schnell        (4-step fast, Apache 2.0)       ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}    ${GREEN}8)${NC} FLUX.1 + Uncensored   (Full model + LoRA)             ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}                                                              ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}FLUX.2 Models:${NC}                                             ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}    ${GREEN}5)${NC} FLUX.2 4-bit BNB      (Low VRAM, local encoder)       ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}    ${GREEN}6)${NC} FLUX.2 Full           (High VRAM, best quality)       ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}    ${GREEN}7)${NC} FLUX.2 Full + Turbo   (8-step fast inference)         ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}    ${GREEN}9)${NC} FLUX.2 Full (no Turbo) (Max quality, slower)          ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}   ${GREEN}10)${NC} FLUX.2-klein-9B       ${YELLOW}[default]${NC} (9B, faster)          ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}                                                              ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}    ${RED}q)${NC} Quit                                                  ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}                                                              ${CYAN}║${NC}"
-    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo -e "${CYAN}══════════════════════════════════════════════════${NC}"
+    echo -e "       ${GREEN}FLUX Image Generator — Server Launcher${NC}"
+    echo -e "${CYAN}══════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "  ${YELLOW}FLUX.1 (12B)${NC}"
+    echo -e "    ${GREEN}1)${NC} 4-bit            Low VRAM"
+    echo -e "    ${GREEN}2)${NC} Full             Best quality"
+    echo -e "    ${GREEN}3)${NC} GGUF Q8          DGX Spark optimized"
+    echo -e "    ${GREEN}4)${NC} schnell          4-step fast (Apache 2.0)"
+    echo -e "    ${GREEN}5)${NC} Uncensored       Full model + LoRA"
+    echo ""
+    echo -e "  ${YELLOW}FLUX.2 (32B · klein 9B)${NC}"
+    echo -e "    ${GREEN}6)${NC} 4-bit            Low VRAM"
+    echo -e "    ${GREEN}7)${NC} Full (Turbo)     8-step fast inference"
+    echo -e "    ${GREEN}8)${NC} Full (no Turbo)  Max quality, slower"
+    echo -e "    ${GREEN}9)${NC} klein-9B         ${YELLOW}[default]${NC} faster 9B"
+    echo ""
+    echo -e "    ${RED}q)${NC} Quit"
     echo ""
 }
 
@@ -89,26 +86,22 @@ start_server() {
             desc="FLUX.1-schnell"
             ;;
         5)
-            args="--flux2"
-            desc="FLUX.2 4-bit BNB"
+            args="--uncensored"
+            desc="FLUX.1 + Uncensored LoRA"
             ;;
         6)
-            args="--flux2 --full-model"
-            desc="FLUX.2 Full"
+            args="--flux2"
+            desc="FLUX.2 4-bit BNB"
             ;;
         7)
             args="--flux2 --full-model --turbo"
             desc="FLUX.2 Full + Turbo"
             ;;
         8)
-            args="--uncensored"
-            desc="FLUX.1 + Uncensored LoRA"
-            ;;
-        9)
             args="--flux2 --full-model --no-turbo"
             desc="FLUX.2 Full (no Turbo)"
             ;;
-        10)
+        9)
             args="--klein"
             desc="FLUX.2-klein-9B"
             ;;
@@ -208,28 +201,28 @@ start_server() {
 # Main loop
 main() {
     # Check if a number was passed as argument
-    if [ -n "$1" ] && [[ "$1" =~ ^([1-9]|10)$ ]]; then
+    if [ -n "$1" ] && [[ "$1" =~ ^[1-9]$ ]]; then
         start_server "$@"
         exit $?
     fi
 
     # No arguments passed → launch default (klein) directly
     if [ -z "$1" ] && [ ! -t 0 ]; then
-        start_server 10
+        start_server 9
         exit $?
     fi
 
     while true; do
         show_menu
-        echo -ne "${CYAN}Select configuration [1-10, default=10, q to quit]: ${NC}"
+        echo -ne "${CYAN}Select configuration [1-9, default=9, q to quit]: ${NC}"
         read -r choice
         # Empty input → run default (klein)
         if [ -z "$choice" ]; then
-            choice=10
+            choice=9
         fi
 
         case $choice in
-            [1-9]|10)
+            [1-9])
                 start_server "$choice"
                 exit $?
                 ;;
