@@ -514,9 +514,12 @@ def load_uncensored_lora():
         print("Uncensored LoRA already loaded")
         return
 
-    print("Loading Flux-Uncensored-V2 LoRA (enhanceaiteam/Flux-Uncensored-V2)...")
+    # enhanceaiteam/Flux-Uncensored-V2 was removed from the Hugging Face Hub
+    # (404). aifeifei798/flux-lora-uncensored is an equivalent diffusers-format
+    # FLUX.1-dev LoRA that is still available.
+    print("Loading uncensored LoRA (aifeifei798/flux-lora-uncensored)...")
     t0 = time.perf_counter()
-    pipe.load_lora_weights("enhanceaiteam/Flux-Uncensored-V2")
+    pipe.load_lora_weights("aifeifei798/flux-lora-uncensored")
     load_time = time.perf_counter() - t0
     print(f"  Uncensored LoRA loaded in {load_time:.2f}s")
     _uncensored_enabled = True
