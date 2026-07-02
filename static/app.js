@@ -360,8 +360,18 @@ function applyInpaintMode() {
     if (!inpaintMode) return;
     const on = inpaintMode.checked;
     if (inpaintTools) inpaintTools.style.display = on ? 'block' : 'none';
-    // Inpaint replaces the reference-image strength workflow; hide it while active.
-    if (strengthControl) strengthControl.style.display = (on || !currentInputImage) ? 'none' : 'flex';
+    // FLUX.2's masked diffusion ignores strength, so the slider hides in its
+    // inpaint mode. On SDXL the slider IS the inpaint control — the denoise
+    // level of the painted region — so it stays, with a hint to match.
+    const sdxlInpaint = on && window.__fluxVersion !== 2;
+    if (strengthControl) {
+        strengthControl.style.display =
+            ((on && !sdxlInpaint) || !currentInputImage) ? 'none' : 'flex';
+        const hint = strengthControl.querySelector('.strength-hint');
+        if (hint) hint.textContent = sdxlInpaint
+            ? 'Denoise level for the painted region: ~1.0 fully replaces it, 0.4–0.7 keeps some of the original showing through'
+            : '0 = closest to original, 0.5 = default, 1 = most change';
+    }
     if (on && currentInputImage && inpaintBaseImg) {
         inpaintBaseImg.src = currentInputImage;
     }
