@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>flux</title>
+    <script>document.title = window.location.hostname + ' flux';</script>
+    <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+    <div class="loading-overlay" id="loadingOverlay">
+        <div class="spinner"></div>
+        <h2 id="loadingTitle">Loading model…</h2>
+        <div class="loading-status" id="loadingStatus">starting</div>
+        <div class="loading-elapsed" id="loadingElapsed">0s</div>
+    </div>
+
+    <div class="header-info">
+        <span class="hostname" id="hostname"></span>
+        <span class="version" id="version"></span>
+    </div>
+    <h1>FLUX Image Generator</h1>
+    <p class="subtitle" id="modelInfo">Loading model info...</p>
+
+    <!-- Security UI -->
+    <div class="security-section">
+        <div class="security-header" onclick="document.getElementById('securityContent').style.display = document.getElementById('securityContent').style.display === 'none' ? 'block' : 'none'">
+            <div class="security-title">
+                <span>🔒 Security Settings</span>
+            </div>
+            <span style="font-size: 12px; color: #888;">Click to toggle</span>
+        </div>
+        <div id="securityContent" style="display: none; padding-top: 10px;">
+            <label for="apiKey">API Access Key:</label>
+            <input type="password" id="apiKeyInput" placeholder="Enter API Key (REQUIRED)..." oninput="localStorage.setItem('flux_api_key', this.value)">
+            <p style="font-size: 11px; color: #666; margin-top: 5px;">Stored in browser local storage for convenience. Always required to use this server.</p>
+        </div>
+    </div>
+
+    <form id="generateForm" action="#">
+        <div class="form-group">
+            <label for="prompt">Prompt</label>
+            <textarea id="prompt" name="prompt" rows="5" placeholder="A majestic mountain landscape at sunset..." required></textarea>
+        </div>
+
+        <div class="form-group">
+            <label>Reference Image (optional - guides generation)</label>
+            <div class="image-input-container">
+                <div class="image-upload-area" id="uploadArea">
+                    <input type="file" id="inputImage" accept="image/*" style="display: none;">
+                    <div class="upload-placeholder" id="uploadPlaceholder">
+                        <span>Click or drag image here</span>
+                    </div>
+                    <div class="image-preview" id="imagePreview" style="display: none;">
+                        <img id="previewImg" src="">
+                        <button type="button" class="clear-btn" id="clearImage">X</button>
+                    </div>
+                </div>
+                <div class="strength-control" id="strengthControl" style="display: none;">
+                    <label for="strength">Reference following (strength): <span id="strengthValue">0.5</span></label>
+                    <input type="range" id="strength" name="strength" min="0" max="1" step="0.1" value="0.5">
+                    <div class="strength-hint">0 = closest to original, 0.5 = default, 1 = most change</div>
+                </div>
+                <div class="aspect-mode-control" id="aspectModeControl" style="display: none; margin-top: 10px;">
+                    <label for="aspectMode">Image aspect ratio mode:</label>
+                    <select id="aspectMode" name="aspectMode">
+                        <option value="keep" selected>Keep original aspect ratio (auto-scale)</option>
+                        <option value="stretch">Stretch/Squash to match Orientation selection</option>
+                    </select>
+                </div>
+                <div class="inpaint-control" id="inpaintControl" style="display: none;">
+                    <label class="inpaint-toggle">
+                        <input type="checkbox" id="inpaintMode"> Inpaint &mdash; paint the area to regenerate (FLUX.2)
+                    </label>
+                    <div class="inpaint-tools" id="inpaintTools" style="display: none;">
+                        <div class="inpaint-stage" id="inpaintStage">
+                            <img id="inpaintBaseImg" src="" alt="Inpaint base">
+                            <canvas id="inpaintCanvas"></canvas>
+                        </div>
+                        <div class="inpaint-buttons">
+                            <label>Brush <input type="range" id="brushSize" min="5" max="150" value="40"></label>
+                            <button type="button" id="inpaintEraser">Eraser</button>
+                            <button type="button" id="inpaintClear">Clear mask</button>
+                        </div>
+                        <div class="strength-hint">Paint over what FLUX.2 should regenerate; everything else stays unchanged. Your prompt describes the new content for the painted area.</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="row">
+            <div class="form-group">
+                <label for="orientation">Orientation</label>
+                <select id="orientation" name="orientation">
+                    <option value="square">Square</option>
+                    <option value="landscape" selected>Landscape (16:9)</option>
+                    <option value="portrait">Portrait</option>
+                    <option value="widescreen">Extra-wide (21:9)</option>
+                    <option value="extra-tall">Extra-tall (9:21)</option>
+                </select>
+                <label class="checkbox-label all-orientations-label" style="display: flex; align-items: center; gap: 6px; cursor: pointer; margin-top: 6px; font-size: 12px; color: #aaa;">
+                    <input type="checkbox" id="allOrientations" style="width: auto;">
+                    Queue one per orientation (5 jobs)
+                </label>
+            </div>
+            <div class="form-group">
+                <label for="size">Size</label>
+                <select id="size" name="size">
+                    <option value="0.75mp">0.75 MP</option>
+                    <option value="1mp" selected>1 MP</option>
+                    <option value="2mp">2 MP</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="steps">Steps</label>
+                <select id="steps" name="steps">
+                    <option value="4">4</option>
+                    <option value="8">8</option>
+                    <option value="10">10</option>
+                    <option value="15">15</option>
+                    <option value="20">20</option>
+                    <option value="25" selected>25</option>
+                    <option value="30">30</option>
+                    <option value="40">40</option>
+                    <option value="50">50</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="row">
+            <div class="form-group">
+                <label for="seed">Seed (optional)</label>
+                <input type="text" id="seed" name="seed" placeholder="Random if empty">
+            </div>
+            <div class="form-group">
+                <label for="guidance">Guidance Scale</label>
+                <select id="guidance" name="guidance">
+                    <option value="">Auto</option>
+                    <option value="1">1.0 (high variety)</option>
+                    <option value="1.5">1.5</option>
+                    <option value="2">2.0</option>
+                    <option value="2.5">2.5</option>
+                    <option value="3">3.0</option>
+                    <option value="3.5">3.5</option>
+                    <option value="4" selected>4.0 (default)</option>
+                    <option value="4.5">4.5</option>
+                    <option value="5">5.0</option>
+                    <option value="5.5">5.5</option>
+                    <option value="6">6.0</option>
+                    <option value="6.5">6.5</option>
+                    <option value="7">7.0 (strict)</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="batch">Batch Size</label>
+                <select id="batch" name="batch">
+                    <option value="1" selected>1 image</option>
+                    <option value="2">2 images</option>
+                    <option value="4">4 images</option>
+                    <option value="8">8 images</option>
+                    <option value="16">16 images</option>
+                    <option value="32">32 images</option>
+                    <option value="64">64 images</option>
+                    <option value="128">128 images</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="row">
+            <div class="form-group spectrum-option">
+                <label class="checkbox-label">
+                    <input type="checkbox" id="spectrumGrid" name="spectrum_grid" value="1">
+                    Generate spectrum grid (interactive 4×4 matrix)
+                </label>
+                <div id="gridContainer" style="display: none; margin-top: 10px;">
+                    <div style="font-size: 11px; color: #888; margin-bottom: 4px;">Select combinations (Guidance →, Strength ↓)</div>
+                    <div class="spectrum-grid-selector" id="gridSelector">
+                        <!-- 16 cells added via JS -->
+                    </div>
+                    <div class="grid-labels">
+                        <span>Min G/S</span>
+                        <span>Max G/S</span>
+                    </div>
+                </div>
+                <div class="spectrum-hint" id="spectrumHint">Guidance: 1, 3, 5, 7. Strength (img2img): 0.2, 0.4, 0.6, 0.8.</div>
+                <label class="checkbox-label" style="margin-top: 6px;">
+                    <input type="checkbox" id="spectrumSameSeed">
+                    Use same seed for all grid images
+                </label>
+            </div>
+        </div>
+
+        <div class="row">
+            <div class="form-group">
+                <label class="checkbox-label">
+                    <input type="checkbox" id="showPreview" checked>
+                    Show live preview (slower — decodes each step)
+                </label>
+            </div>
+        </div>
+
+        <div class="button-row">
+            <button type="submit" id="submitBtn">Generate Image</button>
+            <button type="button" class="reset-btn" id="resetBtn">Reset</button>
+        </div>
+    </form>
+
+    <div class="status" id="status">
+        <span class="spinner"></span>
+        <span id="statusText">Generating...</span>
+        <div class="progress-tracker" id="progressTracker" style="display: none;">
+            <div class="progress-bar-wrap">
+                <div class="progress-bar" id="progressBar" style="width: 0%;"></div>
+            </div>
+            <span class="progress-text" id="progressText">0 / 0</span>
+        </div>
+        <div class="preview-wrap" id="previewWrap" style="display: none; margin-top: 12px;">
+            <img id="previewImgLive" alt="Live preview" style="max-width: 512px; width: 100%; border-radius: 6px; display: block;">
+        </div>
+        <button type="button" class="watch-btn" id="watchBtn" style="display: none;">⛶ Watch fullscreen</button>
+    </div>
+
+    <div class="watch-overlay" id="watchOverlay">
+        <button type="button" class="watch-close" id="watchClose">✕ Exit (Esc)</button>
+        <img id="watchImg" class="hidden" alt="Live generation preview">
+        <div class="watch-waiting" id="watchWaiting">Waiting for first preview…</div>
+        <div class="watch-info">
+            <div class="watch-progress-wrap">
+                <div class="watch-progress" id="watchProgress"></div>
+            </div>
+            <div class="watch-text" id="watchText">Starting…</div>
+        </div>
+    </div>
+
+    <div class="queue-panel" id="queuePanel" style="display: none;">
+        <div class="queue-header">
+            <h3>Queue</h3>
+            <span class="queue-count" id="queueCount"></span>
+        </div>
+        <div class="queue-list" id="queueList"></div>
+    </div>
+
+    <div class="result" id="result">
+        <div class="image-grid" id="imageGrid"></div>
+        <p class="generation-info" id="generationInfo"></p>
+        <div class="clear-recent-row">
+            <button type="button" class="clear-recent-btn" id="clearRecentBtn">Clear recent</button>
+        </div>
+    </div>
+
+    <div class="history-section" id="historySection">
+        <div class="history-header">
+            <h2>Today's Generations</h2>
+            <div class="history-actions">
+                <button type="button" class="archive-btn" id="archiveBtn" style="display: none;">Archive Today</button>
+                <button type="button" class="delete-btn" id="deleteAllBtn" style="display: none;">Delete Today</button>
+            </div>
+        </div>
+        <div class="history-grid" id="historyGrid"></div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

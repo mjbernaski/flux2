@@ -1,5 +1,6 @@
 import os
 import argparse
+import hmac
 import json
 import threading
 import time
@@ -22,11 +23,14 @@ load_dotenv()
 # Version number - update this when releasing new versions
 VERSION = "1.1.1"
 
-# Import model components from fl24bit
-import fl24bit
-from fl24bit import load_model, generate_image, device, save_prompt_file, load_turbo_lora, load_uncensored_lora
+# Import model components from flux_core (model loading + generation)
+import flux_core
+from flux_core import load_model, generate_image, device, save_prompt_file, load_turbo_lora, load_uncensored_lora
 
 app = Flask(__name__)
+# Bound request bodies (base64 input images are the largest legitimate payload).
+# Without this, Flask accepts unbounded uploads — a trivial memory-DoS vector.
+app.config['MAX_CONTENT_LENGTH'] = 64 * 1024 * 1024
 
 # Security: Load API key from environment
 API_KEY = os.environ.get("FLUX_API_KEY")
@@ -49,7 +53,10 @@ if not API_KEY:
 def check_auth():
     # Check header or query param
     provided_key = request.headers.get("X-API-Key") or request.args.get("api_key")
-    return provided_key == API_KEY
+    if not provided_key:
+        return False
+    # Constant-time compare to avoid a timing side-channel on the key
+    return hmac.compare_digest(provided_key, API_KEY)
 
 @app.before_request
 def require_auth():
@@ -78,6 +85,7 @@ _schnell = False
 _turbo = False
 _uncensored = False
 _klein = False
+_kontext = False
 
 # Configuration
 OUTPUT_DIR = "web-generated"
@@ -112,6 +120,7 @@ class Job:
     preview: Optional[str] = None
     preview_step: int = 0
     preview_ts: int = 0
+    step_times: list = field(default_factory=list)  # per-step durations (s) of the current image
     generation_time: float = 0.0
 
     @property
@@ -150,6 +159,7 @@ class Job:
             'preview': self.preview,
             'preview_step': self.preview_step,
             'preview_ts': self.preview_ts,
+            'step_times': list(self.step_times),
             'generation_time': self.generation_time,
             'error': self.error,
         })
@@ -182,1465 +192,8 @@ SIZES = {
     '2mp': 2.0,
 }
 
-HTML_PAGE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>flux</title>
-    <script>document.title = window.location.hostname + ' flux';</script>
-    <style>
-        * { box-sizing: border-box; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            max-width: 900px;
-            margin: 0 auto;
-            padding: 20px;
-            background: #1a1a2e;
-            color: #eee;
-        }
-        h1 { color: #00d4ff; margin-bottom: 5px; }
-        .header-info { display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px; }
-        .hostname { color: #666; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; }
-        .version { color: #666; font-size: 12px; }
-        .subtitle { color: #888; margin-bottom: 20px; }
-        .form-group { margin-bottom: 15px; }
-        label { display: block; margin-bottom: 5px; color: #aaa; }
-        input[type="text"], select, textarea {
-            width: 100%;
-            padding: 12px;
-            border: 1px solid #333;
-            border-radius: 6px;
-            background: #16213e;
-            color: #fff;
-            font-size: 16px;
-            font-family: inherit;
-        }
-        textarea {
-            resize: vertical;
-            min-height: 60px;
-        }
-        input[type="text"]:focus, select:focus, textarea:focus {
-            outline: none;
-            border-color: #00d4ff;
-        }
-        .row { display: flex; gap: 15px; }
-        .row .form-group { flex: 1; }
-        .button-row {
-            display: flex;
-            gap: 10px;
-        }
-        button {
-            flex: 1;
-            padding: 15px;
-            background: #00d4ff;
-            color: #000;
-            border: none;
-            border-radius: 6px;
-            font-size: 18px;
-            font-weight: bold;
-            cursor: pointer;
-            transition: background 0.2s;
-        }
-        button:hover:not(:disabled) { background: #00b8e6; }
-        button:disabled {
-            background: #444;
-            color: #888;
-            cursor: not-allowed;
-        }
-        .reset-btn {
-            flex: 0 0 auto;
-            width: auto;
-            padding: 15px 25px;
-            background: #6c757d;
-            color: #fff;
-        }
-        .reset-btn:hover:not(:disabled) { background: #5a6268; }
-        .status {
-            text-align: center;
-            padding: 15px;
-            margin: 20px 0;
-            border-radius: 6px;
-            display: none;
-        }
-        .status.generating {
-            display: block;
-            background: #2d2d44;
-            color: #00d4ff;
-        }
-        .status.error {
-            display: block;
-            background: #442d2d;
-            color: #ff6b6b;
-        }
-        .queue-panel {
-            margin: 15px 0;
-            padding: 12px 16px;
-            background: #16213e;
-            border-radius: 6px;
-            border: 1px solid #2a3a5a;
-        }
-        .queue-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: baseline;
-            margin-bottom: 8px;
-        }
-        .queue-header h3 {
-            margin: 0;
-            font-size: 15px;
-            color: #00d4ff;
-        }
-        .queue-count {
-            color: #888;
-            font-size: 13px;
-        }
-        .queue-list {
-            display: flex;
-            flex-direction: column;
-            gap: 6px;
-        }
-        .queue-item {
-            display: flex;
-            gap: 10px;
-            align-items: center;
-            padding: 8px 10px;
-            background: #1a1a2e;
-            border-radius: 4px;
-            font-size: 13px;
-        }
-        .queue-item .pos {
-            color: #00d4ff;
-            font-weight: bold;
-            min-width: 24px;
-            text-align: right;
-        }
-        .queue-item .prompt {
-            flex: 1;
-            color: #ddd;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            white-space: nowrap;
-        }
-        .queue-item .meta {
-            color: #888;
-            font-size: 12px;
-            white-space: nowrap;
-        }
-        .queue-item .cancel {
-            background: transparent;
-            border: 1px solid #553;
-            color: #c88;
-            padding: 3px 10px;
-            border-radius: 3px;
-            cursor: pointer;
-            font-size: 12px;
-        }
-        .queue-item .cancel:hover {
-            background: #442d2d;
-            color: #ff6b6b;
-            border-color: #ff6b6b;
-        }
-        .result {
-            margin-top: 20px;
-            text-align: center;
-            display: none;
-        }
-        .result.visible { display: block; }
-        .image-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-            gap: 20px;
-        }
-        .image-card {
-            background: #16213e;
-            border-radius: 8px;
-            padding: 15px;
-            text-align: center;
-        }
-        .image-card img {
-            max-width: 100%;
-            border-radius: 6px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.5);
-        }
-        .image-card .actions {
-            margin-top: 12px;
-            display: flex;
-            gap: 10px;
-            justify-content: center;
-        }
-        .image-card a {
-            display: inline-block;
-            padding: 8px 16px;
-            background: #28a745;
-            color: #fff;
-            text-decoration: none;
-            border-radius: 6px;
-            font-weight: bold;
-            font-size: 14px;
-        }
-        .image-card a:hover { background: #218838; }
-        .image-card .seed-btn {
-            background: #6c757d;
-            cursor: pointer;
-        }
-        .image-card .seed-btn:hover { background: #5a6268; }
-        .image-card .info {
-            color: #888;
-            font-size: 13px;
-            margin-top: 8px;
-        }
-        .timings {
-            display: flex;
-            flex-wrap: wrap;
-            justify-content: center;
-            gap: 8px;
-            margin-top: 10px;
-            padding: 8px;
-            background: #1a1a2e;
-            border-radius: 4px;
-            font-size: 12px;
-        }
-        .timing-item {
-            color: #aaa;
-        }
-        .timing-label {
-            color: #00d4ff;
-        }
-        .timing-total {
-            color: #fff;
-            font-weight: bold;
-        }
-        .timing-total .timing-label {
-            color: #28a745;
-        }
-        .generation-info {
-            color: #888;
-            font-size: 14px;
-            margin-top: 15px;
-            text-align: center;
-        }
-        .clear-recent-row {
-            display: flex;
-            justify-content: center;
-            margin-top: 10px;
-        }
-        .clear-recent-btn {
-            width: auto;
-            padding: 8px 16px;
-            font-size: 13px;
-            background: #6c757d;
-            color: #fff;
-        }
-        .clear-recent-btn:hover:not(:disabled) { background: #5a6268; }
-        .image-input-container {
-            display: flex;
-            gap: 20px;
-            align-items: flex-start;
-        }
-        .image-upload-area {
-            flex: 0 0 200px;
-            height: 150px;
-            border: 2px dashed #333;
-            border-radius: 8px;
-            cursor: pointer;
-            position: relative;
-            overflow: hidden;
-            transition: border-color 0.2s;
-        }
-        .image-upload-area:hover, .image-upload-area.dragover {
-            border-color: #00d4ff;
-        }
-        .upload-placeholder {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            height: 100%;
-            color: #666;
-            text-align: center;
-            padding: 10px;
-        }
-        .image-preview {
-            width: 100%;
-            height: 100%;
-            position: relative;
-        }
-        .image-preview img {
-            width: 100%;
-            height: 100%;
-            object-fit: contain;
-            background: #0a0a15;
-        }
-        .clear-btn {
-            position: absolute;
-            top: 5px;
-            right: 5px;
-            width: 24px;
-            height: 24px;
-            padding: 0;
-            background: rgba(255, 0, 0, 0.8);
-            color: #fff;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 14px;
-            font-weight: bold;
-            line-height: 1;
-        }
-        .clear-btn:hover {
-            background: rgba(255, 0, 0, 1);
-        }
-        .strength-control {
-            flex: 1;
-            display: flex;
-            flex-direction: column;
-            gap: 8px;
-        }
-        .strength-control label {
-            color: #888;
-            font-size: 14px;
-        }
-        .strength-control input[type="range"] {
-            width: 100%;
-            accent-color: #00d4ff;
-        }
-        .strength-hint {
-            color: #666;
-            font-size: 12px;
-        }
-        .spectrum-option .checkbox-label { display: flex; align-items: center; gap: 8px; cursor: pointer; }
-        .spectrum-option input[type="checkbox"] { width: auto; }
-        .spectrum-hint { color: #666; font-size: 12px; margin-top: 4px; }
-        .spectrum-grid-selector {
-            display: grid;
-            grid-template-columns: repeat(4, 1fr);
-            gap: 4px;
-            margin-top: 10px;
-            max-width: 200px;
-        }
-        .grid-cell {
-            aspect-ratio: 1;
-            background: #222;
-            border: 1px solid #444;
-            cursor: pointer;
-            border-radius: 2px;
-            transition: all 0.2s;
-        }
-        .grid-cell:hover {
-            border-color: #00d4ff;
-        }
-        .grid-cell.selected {
-            background: #00d4ff;
-            box-shadow: 0 0 8px rgba(0, 212, 255, 0.5);
-        }
-        .grid-labels {
-            display: flex;
-            justify-content: space-between;
-            font-size: 10px;
-            color: #666;
-            margin-top: 4px;
-            max-width: 200px;
-        }
-        .composite-card { grid-column: 1 / -1; }
-        .composite-label { font-size: 12px; color: #00d4ff; margin-bottom: 8px; }
-        .composite-img { max-width: 100%; height: auto; }
-        .progress-tracker { margin-top: 10px; }
-        .progress-bar-wrap { height: 8px; background: #333; border-radius: 4px; overflow: hidden; margin-bottom: 6px; }
-        .progress-bar { height: 100%; background: #00d4ff; border-radius: 4px; transition: width 0.2s; }
-        .progress-text { font-size: 13px; color: #888; }
-        #strengthValue {
-            color: #00d4ff;
-            font-weight: bold;
-        }
-        .spinner {
-            display: inline-block;
-            width: 20px;
-            height: 20px;
-            border: 3px solid #00d4ff;
-            border-top-color: transparent;
-            border-radius: 50%;
-            animation: spin 1s linear infinite;
-            margin-right: 10px;
-            vertical-align: middle;
-        }
-        @keyframes spin { to { transform: rotate(360deg); } }
-        .history-section {
-            margin-top: 40px;
-            padding-top: 30px;
-            border-top: 1px solid #333;
-        }
-        .history-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 20px;
-        }
-        .history-section h2 {
-            color: #888;
-            font-size: 18px;
-            margin: 0;
-        }
-        .history-actions { display: flex; gap: 8px; }
-        .archive-btn {
-            flex: 0 0 auto;
-            padding: 8px 16px;
-            background: #e67e22;
-            color: #fff;
-            font-size: 13px;
-            font-weight: bold;
-            border-radius: 6px;
-        }
-        .archive-btn:hover:not(:disabled) { background: #d35400; }
-        .delete-btn {
-            flex: 0 0 auto;
-            padding: 8px 16px;
-            background: #c0392b;
-            color: #fff;
-            font-size: 13px;
-            font-weight: bold;
-            border-radius: 6px;
-        }
-        .delete-btn:hover:not(:disabled) { background: #992d22; }
-        .history-item .item-delete {
-            position: absolute;
-            top: 4px;
-            right: 4px;
-            width: 22px;
-            height: 22px;
-            padding: 0;
-            background: rgba(192, 57, 43, 0.85);
-            color: #fff;
-            border: none;
-            border-radius: 4px;
-            font-size: 13px;
-            font-weight: bold;
-            line-height: 1;
-            cursor: pointer;
-            opacity: 0;
-            transition: opacity 0.2s;
-            z-index: 2;
-        }
-        .history-item:hover .item-delete { opacity: 1; }
-        .history-item .item-delete:hover { background: rgba(153, 45, 34, 1); }
-        .history-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-            gap: 12px;
-        }
-        .history-item {
-            position: relative;
-            background: #0a0a15;
-            border-radius: 6px;
-            overflow: hidden;
-            cursor: pointer;
-            transition: transform 0.2s;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            min-height: 150px;
-        }
-        .history-item:hover {
-            transform: scale(1.05);
-        }
-        .history-item img {
-            max-width: 100%;
-            max-height: 200px;
-            width: auto;
-            height: auto;
-            object-fit: contain;
-        }
-        .history-item .overlay {
-            position: absolute;
-            bottom: 0;
-            left: 0;
-            right: 0;
-            background: linear-gradient(transparent, rgba(0,0,0,0.8));
-            padding: 8px 6px 6px;
-            opacity: 0;
-            transition: opacity 0.2s;
-        }
-        .history-item:hover .overlay {
-            opacity: 1;
-        }
-        .history-item .time {
-            color: #fff;
-            font-size: 11px;
-        }
-        .history-empty {
-            color: #666;
-            text-align: center;
-            padding: 20px;
-        }
-
-        /* Security CSS */
-        .security-section {
-            margin-bottom: 20px;
-            padding: 15px;
-            background: #2d2d44;
-            border-radius: 8px;
-            border: 1px solid #3d3d5c;
-        }
-        .security-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            cursor: pointer;
-        }
-        .security-title {
-            color: #00d4ff;
-            font-size: 14px;
-            font-weight: bold;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-        .loading-overlay {
-            position: fixed;
-            inset: 0;
-            background: rgba(10, 10, 21, 0.96);
-            color: #eee;
-            z-index: 9999;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            gap: 18px;
-            text-align: center;
-            padding: 20px;
-        }
-        .loading-overlay .spinner {
-            width: 48px;
-            height: 48px;
-            border-width: 5px;
-            margin: 0;
-        }
-        .loading-overlay h2 {
-            color: #00d4ff;
-            margin: 0;
-            font-size: 22px;
-        }
-        .loading-overlay .loading-status {
-            color: #aaa;
-            font-size: 15px;
-        }
-        .loading-overlay .loading-elapsed {
-            color: #666;
-            font-size: 13px;
-            font-variant-numeric: tabular-nums;
-        }
-        .loading-overlay.error h2 { color: #ff6b6b; }
-        #apiKeyInput {
-            margin-top: 10px;
-            padding: 8px;
-            font-size: 14px;
-            background: #16213e;
-            border: 1px solid #444;
-            border-radius: 4px;
-            color: #fff;
-            width: 100%;
-        }
-    </style>
-</head>
-<body>
-    <div class="loading-overlay" id="loadingOverlay">
-        <div class="spinner"></div>
-        <h2 id="loadingTitle">Loading model…</h2>
-        <div class="loading-status" id="loadingStatus">starting</div>
-        <div class="loading-elapsed" id="loadingElapsed">0s</div>
-    </div>
-
-    <div class="header-info">
-        <span class="hostname" id="hostname"></span>
-        <span class="version" id="version"></span>
-    </div>
-    <h1>FLUX Image Generator</h1>
-    <p class="subtitle" id="modelInfo">Loading model info...</p>
-
-    <!-- Security UI -->
-    <div class="security-section">
-        <div class="security-header" onclick="document.getElementById('securityContent').style.display = document.getElementById('securityContent').style.display === 'none' ? 'block' : 'none'">
-            <div class="security-title">
-                <span>🔒 Security Settings</span>
-            </div>
-            <span style="font-size: 12px; color: #888;">Click to toggle</span>
-        </div>
-        <div id="securityContent" style="display: none; padding-top: 10px;">
-            <label for="apiKey">API Access Key:</label>
-            <input type="password" id="apiKeyInput" placeholder="Enter API Key (REQUIRED)..." oninput="localStorage.setItem('flux_api_key', this.value)">
-            <p style="font-size: 11px; color: #666; margin-top: 5px;">Stored in browser local storage for convenience. Always required to use this server.</p>
-        </div>
-    </div>
-
-    <form id="generateForm" action="#">
-        <div class="form-group">
-            <label for="prompt">Prompt</label>
-            <textarea id="prompt" name="prompt" rows="3" placeholder="A majestic mountain landscape at sunset..." required></textarea>
-        </div>
-
-        <div class="form-group">
-            <label>Reference Image (optional - guides generation)</label>
-            <div class="image-input-container">
-                <div class="image-upload-area" id="uploadArea">
-                    <input type="file" id="inputImage" accept="image/*" style="display: none;">
-                    <div class="upload-placeholder" id="uploadPlaceholder">
-                        <span>Click or drag image here</span>
-                    </div>
-                    <div class="image-preview" id="imagePreview" style="display: none;">
-                        <img id="previewImg" src="">
-                        <button type="button" class="clear-btn" id="clearImage">X</button>
-                    </div>
-                </div>
-                <div class="strength-control" id="strengthControl" style="display: none;">
-                    <label for="strength">Reference following (strength): <span id="strengthValue">0.5</span></label>
-                    <input type="range" id="strength" name="strength" min="0" max="1" step="0.1" value="0.5">
-                    <div class="strength-hint">0 = closest to original, 0.5 = default, 1 = most change</div>
-                </div>
-                <div class="aspect-mode-control" id="aspectModeControl" style="display: none; margin-top: 10px;">
-                    <label for="aspectMode">Image aspect ratio mode:</label>
-                    <select id="aspectMode" name="aspectMode">
-                        <option value="keep" selected>Keep original aspect ratio (auto-scale)</option>
-                        <option value="stretch">Stretch/Squash to match Orientation selection</option>
-                    </select>
-                </div>
-            </div>
-        </div>
-
-        <div class="row">
-            <div class="form-group">
-                <label for="orientation">Orientation</label>
-                <select id="orientation" name="orientation">
-                    <option value="square">Square</option>
-                    <option value="landscape" selected>Landscape (16:9)</option>
-                    <option value="portrait">Portrait</option>
-                    <option value="widescreen">Extra-wide (21:9)</option>
-                    <option value="extra-tall">Extra-tall (9:21)</option>
-                </select>
-                <label class="checkbox-label all-orientations-label" style="display: flex; align-items: center; gap: 6px; cursor: pointer; margin-top: 6px; font-size: 12px; color: #aaa;">
-                    <input type="checkbox" id="allOrientations" style="width: auto;">
-                    Queue one per orientation (5 jobs)
-                </label>
-            </div>
-            <div class="form-group">
-                <label for="size">Size</label>
-                <select id="size" name="size">
-                    <option value="0.75mp">0.75 MP</option>
-                    <option value="1mp" selected>1 MP</option>
-                    <option value="2mp">2 MP</option>
-                </select>
-            </div>
-            <div class="form-group">
-                <label for="steps">Steps</label>
-                <select id="steps" name="steps">
-                    <option value="10">10</option>
-                    <option value="15">15</option>
-                    <option value="20">20</option>
-                    <option value="25" selected>25</option>
-                    <option value="30">30</option>
-                    <option value="40">40</option>
-                    <option value="50">50</option>
-                </select>
-            </div>
-        </div>
-
-        <div class="row">
-            <div class="form-group">
-                <label for="seed">Seed (optional)</label>
-                <input type="text" id="seed" name="seed" placeholder="Random if empty">
-            </div>
-            <div class="form-group">
-                <label for="guidance">Guidance Scale</label>
-                <select id="guidance" name="guidance">
-                    <option value="">Auto</option>
-                    <option value="1">1.0 (high variety)</option>
-                    <option value="1.5">1.5</option>
-                    <option value="2">2.0</option>
-                    <option value="2.5">2.5</option>
-                    <option value="3">3.0</option>
-                    <option value="3.5">3.5</option>
-                    <option value="4" selected>4.0 (default)</option>
-                    <option value="4.5">4.5</option>
-                    <option value="5">5.0</option>
-                    <option value="5.5">5.5</option>
-                    <option value="6">6.0</option>
-                    <option value="6.5">6.5</option>
-                    <option value="7">7.0 (strict)</option>
-                </select>
-            </div>
-            <div class="form-group">
-                <label for="batch">Batch Size</label>
-                <select id="batch" name="batch">
-                    <option value="1" selected>1 image</option>
-                    <option value="2">2 images</option>
-                    <option value="4">4 images</option>
-                    <option value="8">8 images</option>
-                    <option value="16">16 images</option>
-                    <option value="32">32 images</option>
-                    <option value="64">64 images</option>
-                    <option value="128">128 images</option>
-                </select>
-            </div>
-        </div>
-
-        <div class="row">
-            <div class="form-group spectrum-option">
-                <label class="checkbox-label">
-                    <input type="checkbox" id="spectrumGrid" name="spectrum_grid" value="1">
-                    Generate spectrum grid (interactive 4×4 matrix)
-                </label>
-                <div id="gridContainer" style="display: none; margin-top: 10px;">
-                    <div style="font-size: 11px; color: #888; margin-bottom: 4px;">Select combinations (Guidance →, Strength ↓)</div>
-                    <div class="spectrum-grid-selector" id="gridSelector">
-                        <!-- 16 cells added via JS -->
-                    </div>
-                    <div class="grid-labels">
-                        <span>Min G/S</span>
-                        <span>Max G/S</span>
-                    </div>
-                </div>
-                <div class="spectrum-hint" id="spectrumHint">Guidance: 1, 3, 5, 7. Strength (img2img): 0.2, 0.4, 0.6, 0.8.</div>
-                <label class="checkbox-label" style="margin-top: 6px;">
-                    <input type="checkbox" id="spectrumSameSeed">
-                    Use same seed for all grid images
-                </label>
-            </div>
-        </div>
-
-        <div class="row">
-            <div class="form-group">
-                <label class="checkbox-label">
-                    <input type="checkbox" id="showPreview" checked>
-                    Show live preview (slower — decodes each step)
-                </label>
-            </div>
-        </div>
-
-        <div class="button-row">
-            <button type="submit" id="submitBtn">Generate Image</button>
-            <button type="button" class="reset-btn" id="resetBtn">Reset</button>
-        </div>
-    </form>
-
-    <div class="status" id="status">
-        <span class="spinner"></span>
-        <span id="statusText">Generating...</span>
-        <div class="progress-tracker" id="progressTracker" style="display: none;">
-            <div class="progress-bar-wrap">
-                <div class="progress-bar" id="progressBar" style="width: 0%;"></div>
-            </div>
-            <span class="progress-text" id="progressText">0 / 0</span>
-        </div>
-        <div class="preview-wrap" id="previewWrap" style="display: none; margin-top: 12px;">
-            <img id="previewImgLive" alt="Live preview" style="max-width: 512px; width: 100%; border-radius: 6px; display: block;">
-        </div>
-    </div>
-
-    <div class="queue-panel" id="queuePanel" style="display: none;">
-        <div class="queue-header">
-            <h3>Queue</h3>
-            <span class="queue-count" id="queueCount"></span>
-        </div>
-        <div class="queue-list" id="queueList"></div>
-    </div>
-
-    <div class="result" id="result">
-        <div class="image-grid" id="imageGrid"></div>
-        <p class="generation-info" id="generationInfo"></p>
-        <div class="clear-recent-row">
-            <button type="button" class="clear-recent-btn" id="clearRecentBtn">Clear recent</button>
-        </div>
-    </div>
-
-    <div class="history-section" id="historySection">
-        <div class="history-header">
-            <h2>Today's Generations</h2>
-            <div class="history-actions">
-                <button type="button" class="archive-btn" id="archiveBtn" style="display: none;">Archive Today</button>
-                <button type="button" class="delete-btn" id="deleteAllBtn" style="display: none;">Delete Today</button>
-            </div>
-        </div>
-        <div class="history-grid" id="historyGrid"></div>
-    </div>
-
-    <script>
-        // Model readiness overlay: poll /ready until the model is loaded, then hide.
-        (function() {
-            const overlay = document.getElementById('loadingOverlay');
-            const statusEl = document.getElementById('loadingStatus');
-            const elapsedEl = document.getElementById('loadingElapsed');
-            const titleEl = document.getElementById('loadingTitle');
-            if (!overlay) return;
-            let readyPollTimer = null;
-
-            async function checkReady() {
-                try {
-                    const res = await fetch('/ready', { cache: 'no-store' });
-                    const data = await res.json();
-                    if (data.ready) {
-                        overlay.style.display = 'none';
-                        if (readyPollTimer) { clearInterval(readyPollTimer); readyPollTimer = null; }
-                        return;
-                    }
-                    if (data.error) {
-                        overlay.classList.add('error');
-                        titleEl.textContent = 'Model load failed';
-                        statusEl.textContent = data.error;
-                        if (readyPollTimer) { clearInterval(readyPollTimer); readyPollTimer = null; }
-                        return;
-                    }
-                    if (data.status) statusEl.textContent = data.status;
-                    if (typeof data.elapsed_s === 'number') {
-                        const s = Math.round(data.elapsed_s);
-                        elapsedEl.textContent = s < 60 ? `${s}s` : `${Math.floor(s/60)}m ${s%60}s`;
-                    }
-                } catch (err) {
-                    statusEl.textContent = 'waiting for server…';
-                }
-            }
-            checkReady();
-            readyPollTimer = setInterval(checkReady, 1500);
-        })();
-
-        // Security helpers
-        function getAuthHeaders(extraHeaders = {}) {
-            const apiKey = localStorage.getItem('flux_api_key');
-            const headers = { ...extraHeaders };
-            if (apiKey) {
-                headers['X-API-Key'] = apiKey;
-            }
-            return headers;
-        }
-
-        // Initialize API key input
-        const apiKeyInput = document.getElementById('apiKeyInput');
-        if (apiKeyInput) {
-            apiKeyInput.value = localStorage.getItem('flux_api_key') || '';
-        }
-
-        // Run model-info fetch first, before any other code that might throw (so UI always updates)
-        (function() {
-            var el = document.getElementById('modelInfo');
-            if (!el) return;
-            var timeout = setTimeout(function() {
-                if (el.textContent === 'Loading model info...') el.textContent = 'Model info unavailable (use server URL, e.g. http://localhost:2222)';
-            }, 5000);
-            var ac = new AbortController();
-            setTimeout(function() { ac.abort(); }, 8000);
-            fetch('/model-info', { 
-                signal: ac.signal,
-                headers: getAuthHeaders()
-            })
-                .then(function(r) { if (!r.ok) throw new Error(r.status); return r.json(); })
-                .then(function(data) {
-                    clearTimeout(timeout);
-                    el.textContent = data.description || 'FLUX Image Generator';
-                    var h = document.getElementById('hostname'); if (h) h.textContent = data.hostname || '';
-                    var v = document.getElementById('version'); if (v) v.textContent = 'v' + (data.version || '');
-                    if (data.schnell) {
-                        var s = document.getElementById('steps'); if (s) { s.disabled = true; s.title = 'Schnell uses fixed 4 steps'; }
-                        var g = document.getElementById('guidance'); if (g) { g.disabled = true; g.title = 'Schnell requires guidance_scale=0'; }
-                    }
-                })
-                .catch(function() { clearTimeout(timeout); el.textContent = 'Model info unavailable (use server URL, e.g. http://localhost:2222)'; });
-        })();
-
-        const form = document.getElementById('generateForm');
-        const submitBtn = document.getElementById('submitBtn');
-        const status = document.getElementById('status');
-        const statusText = document.getElementById('statusText');
-        const result = document.getElementById('result');
-        const imageGrid = document.getElementById('imageGrid');
-        const generationInfo = document.getElementById('generationInfo');
-
-        const uploadArea = document.getElementById('uploadArea');
-        const inputImage = document.getElementById('inputImage');
-        const uploadPlaceholder = document.getElementById('uploadPlaceholder');
-        const imagePreview = document.getElementById('imagePreview');
-        const previewImg = document.getElementById('previewImg');
-        const clearImage = document.getElementById('clearImage');
-
-        let currentInputImage = null;
-        const strengthControl = document.getElementById('strengthControl');
-        const aspectModeControl = document.getElementById('aspectModeControl');
-        const aspectModeEl = document.getElementById('aspectMode');
-        const strengthSlider = document.getElementById('strength');
-        const strengthValue = document.getElementById('strengthValue');
-        
-        let pollInterval = null;
-        let knownImageFilenames = new Set();
-        let lastPreviewStep = -1;
-
-        if (strengthSlider) strengthSlider.addEventListener('input', function() { if (strengthValue) strengthValue.textContent = strengthSlider.value; });
-
-        function useSeed(seed) {
-            var el = document.getElementById('seed'); if (el) el.value = seed;
-        }
-
-        function handleImageFile(file) {
-            var reader = new FileReader();
-            reader.onload = function(e) {
-                currentInputImage = e.target.result;
-                if (previewImg) previewImg.src = currentInputImage;
-                if (uploadPlaceholder) uploadPlaceholder.style.display = 'none';
-                if (imagePreview) imagePreview.style.display = 'block';
-                if (strengthControl) strengthControl.style.display = 'flex';
-                if (aspectModeControl) aspectModeControl.style.display = 'block';
-                };
-                reader.readAsDataURL(file);        }
-        if (uploadArea) {
-            uploadArea.addEventListener('click', function() { if (inputImage) inputImage.click(); });
-            uploadArea.addEventListener('dragover', function(e) { e.preventDefault(); uploadArea.classList.add('dragover'); });
-            uploadArea.addEventListener('dragleave', function() { uploadArea.classList.remove('dragover'); });
-            uploadArea.addEventListener('drop', function(e) {
-                e.preventDefault();
-                uploadArea.classList.remove('dragover');
-                var file = e.dataTransfer.files[0];
-                if (file && file.type.indexOf('image/') === 0) handleImageFile(file);
-            });
-        }
-        if (inputImage) inputImage.addEventListener('change', function(e) { var f = e.target.files[0]; if (f) handleImageFile(f); });
-        if (clearImage) clearImage.addEventListener('click', function(e) {
-            e.stopPropagation();
-            currentInputImage = null;
-            if (previewImg) previewImg.src = '';
-            if (inputImage) inputImage.value = '';
-            if (uploadPlaceholder) uploadPlaceholder.style.display = 'flex';
-            if (imagePreview) imagePreview.style.display = 'none';
-            if (strengthControl) strengthControl.style.display = 'none';
-            if (aspectModeControl) aspectModeControl.style.display = 'none';
-        });
-        var resetBtn = document.getElementById('resetBtn');
-        const spectrumGridEl = document.getElementById('spectrumGrid');
-        const gridContainer = document.getElementById('gridContainer');
-        const gridSelector = document.getElementById('gridSelector');
-        const selectedCells = new Set();
-
-        // Initialize grid
-        if (gridSelector) {
-            for (let i = 0; i < 16; i++) {
-                const cell = document.createElement('div');
-                cell.className = 'grid-cell';
-                // Default to diagonals as before if user just turns it on
-                const r = Math.floor(i / 4);
-                const c = i % 4;
-                if (r === c || r === (3 - c)) {
-                    cell.classList.add('selected');
-                    selectedCells.add(i);
-                }
-                cell.onclick = () => {
-                    cell.classList.toggle('selected');
-                    if (cell.classList.contains('selected')) {
-                        selectedCells.add(i);
-                    } else {
-                        selectedCells.delete(i);
-                    }
-                };
-                gridSelector.appendChild(cell);
-            }
-        }
-
-        if (spectrumGridEl) spectrumGridEl.addEventListener('change', () => {
-            gridContainer.style.display = spectrumGridEl.checked ? 'block' : 'none';
-        });
-
-        const allOrientationsEl = document.getElementById('allOrientations');
-        const orientationSelectEl = document.getElementById('orientation');
-        if (allOrientationsEl && orientationSelectEl) {
-            allOrientationsEl.addEventListener('change', () => {
-                orientationSelectEl.disabled = allOrientationsEl.checked;
-                orientationSelectEl.style.opacity = allOrientationsEl.checked ? '0.5' : '';
-            });
-        }
-
-        if (resetBtn) resetBtn.addEventListener('click', async function() {
-            try {
-                await fetch('/reset', { method: 'POST', headers: getAuthHeaders() });
-            } catch (e) { console.warn('Reset request failed:', e); }
-            var p = document.getElementById('prompt'); if (p) p.value = '';
-            var o = document.getElementById('orientation'); if (o) { o.value = 'landscape'; o.disabled = false; o.style.opacity = ''; }
-            var ao = document.getElementById('allOrientations'); if (ao) ao.checked = false;
-            var s = document.getElementById('size'); if (s) s.value = '1mp';
-            var st = document.getElementById('steps'); if (st) st.value = '25';
-            var sd = document.getElementById('seed'); if (sd) sd.value = '';
-            var gu = document.getElementById('guidance'); if (gu) gu.value = '4';
-            var b = document.getElementById('batch'); if (b) b.value = '1';
-            currentInputImage = null;
-            if (previewImg) previewImg.src = '';
-            if (inputImage) inputImage.value = '';
-            if (uploadPlaceholder) uploadPlaceholder.style.display = 'flex';
-            if (imagePreview) imagePreview.style.display = 'none';
-            if (strengthSlider) strengthSlider.value = '0.5';
-            if (strengthValue) strengthValue.textContent = '0.5';
-            if (strengthControl) strengthControl.style.display = 'none';
-            if (aspectModeControl) aspectModeControl.style.display = 'none';
-            if (aspectModeEl) aspectModeEl.value = 'keep';
-            var sg = document.getElementById('spectrumGrid'); if (sg) sg.checked = false;
-            var sss = document.getElementById('spectrumSameSeed'); if (sss) sss.checked = false;
-            var spv = document.getElementById('showPreview'); if (spv) spv.checked = true;
-            if (gridContainer) gridContainer.style.display = 'none';
-            selectedCells.clear();
-            if (gridSelector) {
-                Array.from(gridSelector.children).forEach((cell, i) => {
-                    const r = Math.floor(i / 4);
-                    const c = i % 4;
-                    if (r === c || r === (3 - c)) {
-                        cell.classList.add('selected');
-                        selectedCells.add(i);
-                    } else {
-                        cell.classList.remove('selected');
-                    }
-                });
-            }
-            // Clear results and status
-            if (imageGrid) imageGrid.innerHTML = '';
-            if (generationInfo) generationInfo.textContent = '';
-            if (result) result.className = 'result';
-            if (status) {
-                status.className = 'status';
-                if (statusText) statusText.textContent = 'Generating...';
-            }
-            if (knownImageFilenames) knownImageFilenames.clear();
-            seenDoneJobIds.clear();
-            lastCompletedJobId = null;
-            const pt = document.getElementById('progressTracker'); if (pt) pt.style.display = 'none';
-            const pb = document.getElementById('progressBar'); if (pb) pb.style.width = '0%';
-        });
-
-        const clearRecentBtn = document.getElementById('clearRecentBtn');
-        if (clearRecentBtn) clearRecentBtn.addEventListener('click', async function() {
-            try {
-                await fetch('/reset', { method: 'POST', headers: getAuthHeaders() });
-            } catch (e) { console.warn('Clear recent request failed:', e); }
-            if (imageGrid) imageGrid.innerHTML = '';
-            if (generationInfo) generationInfo.textContent = '';
-            if (result) result.className = 'result';
-            if (knownImageFilenames) knownImageFilenames.clear();
-            seenDoneJobIds.clear();
-            lastCompletedJobId = null;
-        });
-
-        let lastCompletedJobId = null;
-        let seenDoneJobIds = new Set();
-
-        function renderQueueItem(job, position) {
-            const safePrompt = (job.prompt || '(empty prompt)').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-            const metaParts = [];
-            if (job.orientation) metaParts.push(job.orientation);
-            if (job.size) metaParts.push(job.size);
-            if (job.steps) metaParts.push(`${job.steps} steps`);
-            if (job.batch && job.batch > 1) metaParts.push(`×${job.batch}`);
-            if (job.spectrum_grid) metaParts.push('spectrum');
-            const meta = metaParts.join(' · ');
-            const el = document.createElement('div');
-            el.className = 'queue-item';
-            el.innerHTML = `
-                <span class="pos">#${position}</span>
-                <span class="prompt" title="${safePrompt}">${safePrompt}</span>
-                <span class="meta">${meta}</span>
-                <button class="cancel" data-job-id="${job.id}">Cancel</button>
-            `;
-            el.querySelector('.cancel').addEventListener('click', () => cancelQueuedJob(job.id));
-            return el;
-        }
-
-        function renderQueue(queued) {
-            const panel = document.getElementById('queuePanel');
-            const list = document.getElementById('queueList');
-            const count = document.getElementById('queueCount');
-            if (!panel || !list || !count) return;
-            if (!queued || queued.length === 0) {
-                panel.style.display = 'none';
-                list.innerHTML = '';
-                return;
-            }
-            panel.style.display = 'block';
-            count.textContent = `${queued.length} waiting`;
-            list.innerHTML = '';
-            queued.forEach((job, i) => list.appendChild(renderQueueItem(job, i + 1)));
-        }
-
-        async function cancelQueuedJob(jobId) {
-            try {
-                const res = await fetch(`/jobs/${jobId}/cancel`, {
-                    method: 'POST',
-                    headers: getAuthHeaders(),
-                });
-                if (!res.ok) {
-                    const err = await res.json().catch(() => ({}));
-                    console.warn('Cancel failed:', err.error || res.status);
-                }
-                pollStatus();
-            } catch (e) {
-                console.error('Cancel error:', e);
-            }
-        }
-
-        function renderRunning(running) {
-            const progressTracker = document.getElementById('progressTracker');
-            const progressBar = document.getElementById('progressBar');
-            const progressText = document.getElementById('progressText');
-            const pwrap = document.getElementById('previewWrap');
-
-            if (!running) {
-                status.className = 'status';
-                if (progressTracker) progressTracker.style.display = 'none';
-                if (pwrap) pwrap.style.display = 'none';
-                return;
-            }
-
-            status.className = 'status generating';
-
-            let stepInfo = '';
-            if (running.total_steps > 0 && running.step > 0) {
-                stepInfo = ` (step ${running.step} of ${running.total_steps})`;
-            }
-            const runBatch = Math.max(1, running.batch || 1);
-            if (runBatch > 1) {
-                statusText.textContent = `Generating: ${running.current} / ${runBatch}${stepInfo}...`;
-            } else {
-                statusText.textContent = running.step > 0
-                    ? `Generating: step ${running.step} of ${running.total_steps}...`
-                    : 'Generating...';
-            }
-
-            if (running.total_steps > 0 && progressTracker && progressBar && progressText) {
-                progressTracker.style.display = 'block';
-                const totalStepsAll = running.total_steps * runBatch;
-                const stepsDone = Math.max(0, (running.current - 1)) * running.total_steps + running.step;
-                progressBar.style.width = `${Math.min(100, (stepsDone / Math.max(1, totalStepsAll)) * 100)}%`;
-                const pct = Math.min(100, Math.round((stepsDone / Math.max(1, totalStepsAll)) * 100));
-                progressText.textContent = `${pct}% complete`;
-            } else if (progressTracker) {
-                progressTracker.style.display = 'none';
-            }
-
-            if (running.preview && running.preview_ts && running.preview_ts !== lastPreviewStep) {
-                const pimg = document.getElementById('previewImgLive');
-                if (pwrap && pimg) {
-                    pimg.src = `/images/${running.preview}?t=${running.preview_ts}`;
-                    pwrap.style.display = 'block';
-                }
-                lastPreviewStep = running.preview_ts;
-            }
-
-            if (running.images && running.images.length > 0) {
-                result.className = 'result visible';
-                running.images.forEach((img, i) => {
-                    if (!knownImageFilenames.has(img.filename)) {
-                        addImageToGrid(img, i + 1);
-                        knownImageFilenames.add(img.filename);
-                    }
-                });
-            }
-        }
-
-        function renderRecentDone(recent) {
-            if (!recent || recent.length === 0) return;
-            const latest = recent[0];
-            // Append images from completed jobs we haven't rendered yet, oldest first
-            // so the grid reads chronologically.
-            for (let i = recent.length - 1; i >= 0; i--) {
-                const job = recent[i];
-                if (seenDoneJobIds.has(job.id)) continue;
-                seenDoneJobIds.add(job.id);
-                if (job.state !== 'done') continue;
-                if (job.images) {
-                    job.images.forEach((img, idx) => {
-                        if (!knownImageFilenames.has(img.filename)) {
-                            addImageToGrid(img, idx + 1);
-                            knownImageFilenames.add(img.filename);
-                            result.className = 'result visible';
-                        }
-                    });
-                }
-                if (job.composite && !knownImageFilenames.has(job.composite)) {
-                    addCompositeToGrid(job.composite);
-                    knownImageFilenames.add(job.composite);
-                    result.className = 'result visible';
-                }
-            }
-
-            if (latest.id !== lastCompletedJobId) {
-                lastCompletedJobId = latest.id;
-                if (latest.state === 'done') {
-                    const info = latest.composite
-                        ? `Generated ${(latest.images || []).length} images + 1 composite in ${(latest.generation_time || 0).toFixed(1)}s`
-                        : `Generated ${(latest.images || []).length} image(s) in ${(latest.generation_time || 0).toFixed(1)}s`;
-                    generationInfo.textContent = info;
-                    loadHistory();
-                } else if (latest.state === 'failed') {
-                    status.className = 'status error';
-                    statusText.textContent = 'Error: ' + (latest.error || 'Unknown error');
-                } else if (latest.state === 'canceled') {
-                    generationInfo.textContent = 'Job canceled';
-                }
-            }
-        }
-
-        async function pollStatus() {
-            try {
-                const response = await fetch('/status', { headers: getAuthHeaders() });
-
-                if (response.status === 401) {
-                    if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
-                    status.className = 'status error';
-                    statusText.textContent = 'Error: Unauthorized. Please check your API Key.';
-                    return;
-                }
-
-                if (!response.ok) {
-                    throw new Error(`HTTP error! status: ${response.status}`);
-                }
-
-                const data = await response.json();
-                renderRunning(data.running);
-                renderQueue(data.queued || []);
-                renderRecentDone(data.recent_done || []);
-            } catch (err) {
-                console.error('Polling error:', err);
-            }
-        }
-
-        function addImageToGrid(img, index) {
-            const t = Date.now();
-            const meta = img.guidance != null ? `Guidance: ${img.guidance}${img.strength != null ? ', Strength: ' + img.strength : ''}` : '';
-            const card = document.createElement('div');
-            card.className = 'image-card';
-            card.innerHTML = `
-                <img src="/images/${img.filename}?t=${t}" alt="Generated image ${index}" loading="lazy">
-                <div class="actions">
-                    <a href="/images/${img.filename}" download="${img.filename}">Download</a>
-                    <a href="#" class="seed-btn" onclick="useSeed(${img.seed}); return false;">Use Seed</a>
-                </div>
-                <p class="info">${meta ? meta + ' · Seed: ' + img.seed : 'Seed: ' + img.seed}</p>
-                <div class="timings">
-                    <span class="timing-item"><span class="timing-label">Encode:</span> ${img.timings.encoding}s</span>
-                    <span class="timing-item"><span class="timing-label">Diffuse:</span> ${img.timings.diffusion}s</span>
-                    <span class="timing-item"><span class="timing-label">Save:</span> ${img.timings.save}s</span>
-                    <span class="timing-item timing-total"><span class="timing-label">Total:</span> ${img.timings.total}s</span>
-                </div>
-            `;
-            imageGrid.appendChild(card);
-        }
-
-        function addCompositeToGrid(filename) {
-            const t = Date.now();
-            const compositeCard = document.createElement('div');
-            compositeCard.className = 'image-card composite-card';
-            compositeCard.innerHTML = `
-                <p class="composite-label">Matrix composite (guidance → columns, reference following → rows)</p>
-                <img src="/images/${filename}?t=${t}" alt="Spectrum grid composite" class="composite-img">
-                <div class="actions">
-                    <a href="/images/${filename}" download="${filename}">Download composite</a>
-                </div>
-            `;
-            imageGrid.insertBefore(compositeCard, imageGrid.firstChild);
-        }
-
-        async function doGenerate() {
-            if (!submitBtn || !status || !statusText || !result || !imageGrid || !generationInfo) return;
-            if (submitBtn.disabled) return;
-
-            const seedEl = document.getElementById('seed');
-            const seedValue = seedEl ? seedEl.value.trim() : '';
-            const promptEl = document.getElementById('prompt');
-            const guidanceEl = document.getElementById('guidance');
-            const batchEl = document.getElementById('batch');
-            const orientationEl = document.getElementById('orientation');
-            const sizeEl = document.getElementById('size');
-            const stepsEl = document.getElementById('steps');
-            const spectrumGridEl = document.getElementById('spectrumGrid');
-            const spectrumGrid = spectrumGridEl ? spectrumGridEl.checked : false;
-            const spectrumSameSeedEl = document.getElementById('spectrumSameSeed');
-            const spectrumSameSeed = spectrumSameSeedEl ? spectrumSameSeedEl.checked : true;
-            const showPreviewEl = document.getElementById('showPreview');
-            const showPreview = showPreviewEl ? showPreviewEl.checked : false;
-            const allOrientationsEl = document.getElementById('allOrientations');
-            const allOrientations = allOrientationsEl ? allOrientationsEl.checked : false;
-
-            const baseFormData = {
-                prompt: promptEl ? promptEl.value : '',
-                orientation: orientationEl ? orientationEl.value : 'landscape',
-                size: sizeEl ? sizeEl.value : '1mp',
-                steps: stepsEl ? parseInt(stepsEl.value, 10) : 25,
-                seed: seedValue ? parseInt(seedValue, 10) : null,
-                guidance: guidanceEl && guidanceEl.value ? parseFloat(guidanceEl.value) : null,
-                batch: batchEl ? parseInt(batchEl.value, 10) : 1,
-                spectrum_grid: spectrumGrid,
-                spectrum_same_seed: spectrumSameSeed,
-                show_preview: showPreview,
-                selected_cells: Array.from(selectedCells)
-            };
-            if (currentInputImage && strengthSlider) {
-                baseFormData.input_image = currentInputImage;
-                baseFormData.strength = parseFloat(strengthSlider.value);
-                baseFormData.aspect_mode = aspectModeEl ? aspectModeEl.value : 'keep';
-            }
-
-            const orientationsToQueue = allOrientations
-                ? ['square', 'landscape', 'portrait', 'widescreen', 'extra-tall']
-                : [baseFormData.orientation];
-
-            // Briefly disable to prevent double-submit during the fetch; re-enable on response.
-            submitBtn.disabled = true;
-
-            let firstPosition = null;
-            let submitted = 0;
-            let errorMsg = null;
-            try {
-                for (const orient of orientationsToQueue) {
-                    const formData = Object.assign({}, baseFormData, { orientation: orient });
-                    const response = await fetch('/generate', {
-                        method: 'POST',
-                        headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
-                        body: JSON.stringify(formData)
-                    });
-                    const data = await response.json().catch(() => ({}));
-                    if (response.ok && data.success) {
-                        submitted += 1;
-                        if (firstPosition === null) firstPosition = data.position;
-                    } else {
-                        errorMsg = data.error || `HTTP ${response.status}`;
-                        break;
-                    }
-                }
-
-                if (submitted > 0 && !errorMsg) {
-                    const posMsg = orientationsToQueue.length > 1
-                        ? `Queued ${submitted} jobs (one per orientation)`
-                        : (firstPosition > 1 ? `Queued at position ${firstPosition}` : 'Starting generation...');
-                    status.className = 'status generating';
-                    statusText.textContent = posMsg;
-                    pollStatus();
-                } else if (submitted > 0 && errorMsg) {
-                    status.className = 'status error';
-                    statusText.textContent = `Queued ${submitted}/${orientationsToQueue.length}; stopped: ${errorMsg}`;
-                    pollStatus();
-                } else {
-                    status.className = 'status error';
-                    statusText.textContent = 'Error: ' + (errorMsg || 'submission failed');
-                }
-            } catch (err) {
-                status.className = 'status error';
-                statusText.textContent = 'Error submitting generation: ' + err.message;
-            } finally {
-                submitBtn.disabled = false;
-            }
-        }
-
-        // Handle visibility change for mobile robustness
-        document.addEventListener('visibilitychange', function() {
-            if (document.visibilityState === 'visible') pollStatus();
-        });
-
-        // Always poll so the queue panel and completed jobs update in real time.
-        pollStatus();
-        pollInterval = setInterval(pollStatus, 1500);
-
-        if (submitBtn) submitBtn.addEventListener('click', function(e) { e.preventDefault(); doGenerate(); });
-        if (form) form.addEventListener('submit', function(e) { e.preventDefault(); doGenerate(); });
-        document.addEventListener('keydown', function(e) {
-            if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
-                e.preventDefault();
-                doGenerate();
-            }
-        });
-
-        const historyGrid = document.getElementById('historyGrid');
-        const deleteAllBtn = document.getElementById('deleteAllBtn');
-        async function loadHistory() {
-            try {
-                const response = await fetch('/history', { headers: getAuthHeaders() });
-                const data = await response.json();
-                historyGrid.innerHTML = '';
-                const hasImages = data.images.length > 0;
-                archiveBtn.style.display = hasImages ? 'block' : 'none';
-                if (deleteAllBtn) deleteAllBtn.style.display = hasImages ? 'block' : 'none';
-                if (!hasImages) {
-                    historyGrid.innerHTML = '<p class="history-empty">No images generated today</p>';
-                    return;
-                }
-                data.images.forEach(img => {
-                    const item = document.createElement('div');
-                    item.className = 'history-item';
-                    const safeName = img.filename.replace(/"/g, '&quot;');
-                    item.innerHTML = `
-                        <img src="/images/${img.filename}" alt="${img.prompt || 'Generated image'}" loading="lazy">
-                        <button type="button" class="item-delete" data-filename="${safeName}" title="Delete">X</button>
-                        <div class="overlay">
-                            <span class="time">${img.time}</span>
-                        </div>
-                    `;
-                    item.title = img.prompt || img.filename;
-                    item.addEventListener('click', (e) => {
-                        if (e.target.classList.contains('item-delete')) return;
-                        window.open(`/images/${img.filename}`, '_blank');
-                    });
-                    const delBtn = item.querySelector('.item-delete');
-                    if (delBtn) {
-                        delBtn.addEventListener('click', async (e) => {
-                            e.stopPropagation();
-                            if (!confirm(`Permanently delete this image?\n\n${img.filename}`)) return;
-                            try {
-                                const res = await fetch('/delete', {
-                                    method: 'POST',
-                                    headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
-                                    body: JSON.stringify({ filename: img.filename })
-                                });
-                                const body = await res.json();
-                                if (body.success) { loadHistory(); }
-                                else { alert('Delete failed: ' + (body.error || 'unknown error')); }
-                            } catch (err) { alert('Delete failed: ' + err.message); }
-                        });
-                    }
-                    historyGrid.appendChild(item);
-                });
-            } catch (err) {
-                console.error('Failed to load history:', err);
-                historyGrid.innerHTML = '<p class="history-empty">Failed to load history</p>';
-            }
-        }
-
-        const archiveBtn = document.getElementById('archiveBtn');
-
-        archiveBtn.addEventListener('click', async () => {
-            if (!confirm("Move all of today's images to the archive folder?")) return;
-            archiveBtn.disabled = true;
-            archiveBtn.textContent = 'Archiving...';
-            try {
-                const response = await fetch('/archive', {
-                    method: 'POST',
-                    headers: getAuthHeaders()
-                });
-                const data = await response.json();
-                if (data.success) { loadHistory(); } else { alert('Archive failed: ' + data.error); }
-            } catch (err) { alert('Archive failed: ' + err.message); }
-            archiveBtn.disabled = false;
-            archiveBtn.textContent = 'Archive Today';
-        });
-
-        if (deleteAllBtn) deleteAllBtn.addEventListener('click', async () => {
-            if (!confirm("Permanently DELETE all of today's generated images and prompt files? This cannot be undone.")) return;
-            deleteAllBtn.disabled = true;
-            deleteAllBtn.textContent = 'Deleting...';
-            try {
-                const response = await fetch('/delete', {
-                    method: 'POST',
-                    headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
-                    body: JSON.stringify({})
-                });
-                const data = await response.json();
-                if (data.success) { loadHistory(); } else { alert('Delete failed: ' + data.error); }
-            } catch (err) { alert('Delete failed: ' + err.message); }
-            deleteAllBtn.disabled = false;
-            deleteAllBtn.textContent = 'Delete Today';
-        });
-
-        loadHistory();
-    </script>
-</body>
-</html>
-"""
+# The web UI lives in static/ (index.html + app.css + app.js); it was
+# previously embedded here as one giant string. See static/README note.
 
 
 def _run_job(job: Job):
@@ -1664,6 +217,14 @@ def _run_job(job: Job):
         image_data = base64.b64decode(input_image_b64)
         input_image = Image.open(io.BytesIO(image_data)).convert('RGB')
 
+    # Handle inpaint mask (white = regenerate). FLUX.2 only; needs an input image.
+    mask_image = None
+    mask_b64 = data.get('mask_image')
+    if mask_b64 and input_image is not None and flux_core._flux_version == 2:
+        if ',' in mask_b64:
+            mask_b64 = mask_b64.split(',', 1)[1]
+        mask_image = Image.open(io.BytesIO(base64.b64decode(mask_b64))).convert('L')
+
     # Dimensions
     scale = SIZES.get(size, 1.0)
     aspect_mode = data.get('aspect_mode', 'keep')
@@ -1679,6 +240,14 @@ def _run_job(job: Job):
         base_w, base_h = ORIENTATIONS_1K.get(orientation, ORIENTATIONS_1K['landscape'])
         width, height = int(base_w * scale), int(base_h * scale)
 
+    # Inpainting regenerates only the painted region of the input image, so the
+    # spectrum grid (which sweeps strength/guidance) doesn't apply. Latent tokens
+    # cover 16px blocks, so dimensions must be multiples of 16 for mask alignment.
+    if mask_image is not None:
+        data['spectrum_grid'] = False
+        width = (width // 16) * 16
+        height = (height // 16) * 16
+
     spectrum_grid = data.get('spectrum_grid', False)
     spectrum_same_seed = data.get('spectrum_same_seed', True)
     selected_cells = data.get('selected_cells', []) # Indices 0-15
@@ -1686,6 +255,13 @@ def _run_job(job: Job):
     if spectrum_grid:
         guidance_values = [0] if _schnell else [1.0, 3.0, 5.0, 7.0]
         strength_values = [0.2, 0.4, 0.6, 0.8] if input_image else [0.0, 0.0, 0.0, 0.0] # Dummy if no image
+
+        # The UI selector is always a 4x4 grid (guidance columns x strength rows),
+        # but schnell has a single guidance column (it ignores guidance). Collapse
+        # 4x4 cell indices onto column 0 of their row so the generation loop's
+        # cell_idx (r_idx * 4 + c_idx with c_idx == 0) can actually match them.
+        if _schnell and selected_cells:
+            selected_cells = sorted({(idx // 4) * 4 for idx in selected_cells})
 
         if selected_cells:
             total_batch = len(selected_cells)
@@ -1704,13 +280,24 @@ def _run_job(job: Job):
     preview_state = {"last_decode": 0.0}
 
     def _step_callback(pipe_obj, step_index, timestep, callback_kwargs):
+        # The scheduler holds the *actual* timesteps for this run. For img2img the
+        # pipeline only denoises ~steps*strength of them (and turbo/schnell clamp
+        # the count too), so the requested `steps` overstates the work. Read the
+        # real total from the scheduler the first chance we get so the progress
+        # bar and "step X of Y" reflect what's actually happening.
+        try:
+            ts = getattr(getattr(pipe_obj, "scheduler", None), "timesteps", None)
+            if ts is not None and len(ts) > 0:
+                job.total_steps = len(ts)
+        except Exception:
+            pass
         job.step = step_index + 1
         if show_preview:
             now = time.perf_counter()
-            is_final = (step_index + 1) >= steps
+            is_final = (step_index + 1) >= job.total_steps
             if is_final or (now - preview_state["last_decode"]) >= PREVIEW_MIN_INTERVAL_S:
                 latents = callback_kwargs.get("latents")
-                preview_img = fl24bit.decode_latents_to_preview(
+                preview_img = flux_core.decode_latents_to_preview(
                     pipe_obj, latents, height, width
                 )
                 if preview_img is not None:
@@ -1773,7 +360,7 @@ def _run_job(job: Job):
                 unique_id = uuid.uuid4().hex[:8]
                 g_str = str(g_val).replace('.', '_')
                 s_str = f"str_{s_val}" if s_val is not None else "txt2img"
-                output_filename = f"flux{fl24bit._flux_version}_{timestamp}_g{g_str}_{s_str}_{unique_id}.png"
+                output_filename = f"flux{flux_core._flux_version}_{timestamp}_g{g_str}_{s_str}_{unique_id}.png"
                 output_path = os.path.join(OUTPUT_DIR, output_filename)
                 image.save(output_path)
                 timings['save'] = time.perf_counter() - t_save
@@ -1846,7 +433,7 @@ def _run_job(job: Job):
                 )
                 draw.text((x0 - bbox[0], y0 - bbox[1]), label, fill=(255, 255, 255), font=font)
 
-        comp_filename = f"flux{fl24bit._flux_version}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_spectrum_grid.png"
+        comp_filename = f"flux{flux_core._flux_version}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_spectrum_grid.png"
         composite.save(os.path.join(OUTPUT_DIR, comp_filename))
         job.composite = comp_filename
     else:
@@ -1857,22 +444,23 @@ def _run_job(job: Job):
             image, used_seed, timings = generate_image(
                 prompt, seed=current_seed, steps=steps, width=width, height=height,
                 local_encoder=_local_encoder, input_image=input_image, strength=strength,
-                guidance_scale=guidance_scale,
+                guidance_scale=guidance_scale, mask_image=mask_image,
                 callback_on_step_end=_step_callback
             )
-            
+
             t_save = time.perf_counter()
-            output_filename = f"flux{fl24bit._flux_version}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.png"
+            output_filename = f"flux{flux_core._flux_version}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.png"
             output_path = os.path.join(OUTPUT_DIR, output_filename)
             image.save(output_path)
             timings['save'] = time.perf_counter() - t_save
-            save_prompt_file(output_path, prompt, prompt, width, height, used_seed, steps, timings, guidance_scale, strength if input_image else None)
+            save_prompt_file(output_path, prompt, prompt, width, height, used_seed, steps, timings, guidance_scale, None if mask_image is not None else (strength if input_image else None))
 
             img_data = {
                 'filename': output_filename,
                 'seed': used_seed,
                 'guidance': guidance_scale,
-                'strength': strength if input_image else None,
+                'strength': None if mask_image is not None else (strength if input_image else None),
+                'inpaint': mask_image is not None,
                 'timings': {
                     'encoding': round(timings['encoding'], 2),
                     'diffusion': round(timings['diffusion'], 2),
@@ -1905,6 +493,10 @@ def _queue_worker():
             job.error = str(e)
         finally:
             job.finished_at = time.time()
+            # Finished jobs sit in _recent_done for a while; drop the (large)
+            # base64 image payloads so they don't stay resident in memory.
+            job.params.pop('input_image', None)
+            job.params.pop('mask_image', None)
             with _queue_cv:
                 _running_job = None
                 _recent_done.insert(0, job)
@@ -1920,7 +512,7 @@ def _start_queue_worker():
 
 @app.route('/')
 def index():
-    return HTML_PAGE
+    return app.send_static_file('index.html')
 
 
 @app.route('/ready')
@@ -1934,6 +526,73 @@ def ready():
     })
 
 
+def _validate_generate_params(data):
+    """Validate and normalize a /generate request body in place.
+
+    Returns an error string for a 400 response, or None if the request is
+    valid. Doing this at the API boundary means bad input fails fast with a
+    clear message instead of surfacing later as an opaque failed job.
+    """
+    try:
+        data['steps'] = int(data.get('steps', 25))
+    except (TypeError, ValueError):
+        return "steps must be an integer"
+    if not 1 <= data['steps'] <= 200:
+        return "steps must be between 1 and 200"
+
+    try:
+        data['batch'] = int(data.get('batch', 1))
+    except (TypeError, ValueError):
+        return "batch must be an integer"
+    if not 1 <= data['batch'] <= 128:
+        return "batch must be between 1 and 128"
+
+    try:
+        data['strength'] = float(data.get('strength', 0.5))
+    except (TypeError, ValueError):
+        return "strength must be a number"
+    if not 0.0 <= data['strength'] <= 1.0:
+        return "strength must be between 0.0 and 1.0"
+
+    if data.get('seed') is not None:
+        try:
+            data['seed'] = int(data['seed'])
+        except (TypeError, ValueError):
+            return "seed must be an integer"
+
+    if data.get('guidance') is not None:
+        try:
+            data['guidance'] = float(data['guidance'])
+        except (TypeError, ValueError):
+            return "guidance must be a number"
+        if data['guidance'] < 0:
+            return "guidance must be non-negative"
+
+    if data.get('orientation') is not None and data['orientation'] not in ORIENTATIONS_1K:
+        return f"orientation must be one of {sorted(ORIENTATIONS_1K)}"
+    if data.get('size') is not None and data['size'] not in SIZES:
+        return f"size must be one of {sorted(SIZES)}"
+
+    # Decode images here so a corrupt upload is a 400, not a failed job.
+    for key, label in (('input_image', 'input_image'), ('mask_image', 'mask_image')):
+        b64 = data.get(key)
+        if not b64:
+            continue
+        try:
+            payload = b64.split(',', 1)[1] if ',' in b64 else b64
+            Image.open(io.BytesIO(base64.b64decode(payload))).verify()
+        except Exception:
+            return f"{label} is not a decodable base64 image"
+
+    if data.get('mask_image'):
+        if not data.get('input_image'):
+            return "mask_image requires input_image"
+        if flux_core._flux_version != 2:
+            return "inpainting (mask_image) requires a FLUX.2 server"
+
+    return None
+
+
 @app.route('/generate', methods=['POST'])
 def generate():
     if not _model_ready:
@@ -1943,6 +602,10 @@ def generate():
     prompt = (data.get('prompt') or '').strip()
     if not prompt:
         return jsonify({'success': False, 'error': 'prompt is required'}), 400
+
+    error = _validate_generate_params(data)
+    if error:
+        return jsonify({'success': False, 'error': error}), 400
 
     with _queue_cv:
         if len(_pending) >= QUEUE_MAX_SIZE:
@@ -2004,9 +667,12 @@ def cancel_job(job_id):
 
 @app.route('/model-info')
 def model_info():
-    flux_name = f"FLUX.{fl24bit._flux_version}"
+    flux_name = f"FLUX.{flux_core._flux_version}"
     variant = "-klein" if _klein else "-dev"
-    if _schnell:
+    if _kontext:
+        kontext_prec = "full bf16" if _full_model else "4-bit"
+        model_type = f"FLUX.1-Kontext (editor, {kontext_prec})"
+    elif _schnell:
         model_type = f"{flux_name}-schnell (4-step)"
     elif _gguf_quant:
         model_type = f"{flux_name}-dev GGUF {_gguf_quant.upper()}"
@@ -2015,14 +681,16 @@ def model_info():
     else:
         model_type = f"{flux_name}-dev-bnb-4bit"
     encoder_type = "local encoder" if _local_encoder else "remote encoder"
-    turbo_str = " + Turbo" if fl24bit._turbo_enabled else ""
-    uncensored_str = " + Uncensored" if fl24bit._uncensored_enabled else ""
+    turbo_str = " + Turbo" if flux_core._turbo_enabled else ""
+    uncensored_str = " + Uncensored" if flux_core._uncensored_enabled else ""
     return jsonify({
         'model': model_type,
         'encoder': encoder_type,
-        'turbo': fl24bit._turbo_enabled,
+        'turbo': flux_core._turbo_enabled,
         'schnell': _schnell,
-        'uncensored': fl24bit._uncensored_enabled,
+        'uncensored': flux_core._uncensored_enabled,
+        'kontext': flux_core._kontext_enabled,
+        'flux_version': flux_core._flux_version,
         'hostname': socket.gethostname(),
         'version': VERSION,
         'description': f"{model_type}{turbo_str}{uncensored_str} with {encoder_type}"
@@ -2122,6 +790,36 @@ def delete_today():
     return jsonify({'success': True, 'deleted': deleted})
 
 
+@app.route('/save-hidden', methods=['POST'])
+def save_hidden():
+    """Copy an image (and its .prompt sidecar) into a hidden subdir.
+
+    The `.hidden` dir lives inside OUTPUT_DIR but is excluded from listings,
+    archiving, and delete-today (those only iterate top-level files), so saving
+    an image here preserves it independently of the day's housekeeping.
+    """
+    body = request.get_json(silent=True) or {}
+    target = body.get('filename')
+    if not target or '/' in target or '\\' in target or not target.endswith('.png'):
+        return jsonify({'success': False, 'error': 'Invalid filename'}), 400
+
+    src = os.path.join(OUTPUT_DIR, target)
+    if not os.path.isfile(src):
+        return jsonify({'success': False, 'error': 'File not found'}), 404
+
+    hidden_dir = os.path.join(OUTPUT_DIR, '.hidden')
+    os.makedirs(hidden_dir, exist_ok=True)
+    try:
+        shutil.copy2(src, os.path.join(hidden_dir, target))
+        sidecar = target.rsplit('.', 1)[0] + '.prompt'
+        src_sidecar = os.path.join(OUTPUT_DIR, sidecar)
+        if os.path.isfile(src_sidecar):
+            shutil.copy2(src_sidecar, os.path.join(hidden_dir, sidecar))
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    return jsonify({'success': True, 'saved': target})
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="FLUX Web Server")
     parser.add_argument("--local-encoder", action="store_true", help="Use local text encoder instead of remote API")
@@ -2132,7 +830,8 @@ if __name__ == '__main__':
     parser.add_argument("--klein", action="store_true", help="Use FLUX.2-klein (9B) instead of FLUX.2-dev (32B). Implies --flux2 --full-model")
     parser.add_argument("--turbo", action="store_true", default=None, help="Enable turbo LoRA")
     parser.add_argument("--no-turbo", action="store_true", help="Disable turbo LoRA")
-    parser.add_argument("--uncensored", action="store_true", help="Load Flux-Uncensored-V2 LoRA")
+    parser.add_argument("--uncensored", action="store_true", help="Load Lustly.ai uncensored NSFW LoRA")
+    parser.add_argument("--kontext", action="store_true", help="Use FLUX.1 Kontext, an instruction-based image editor (4-bit; add --full-model for full bf16)")
     parser.add_argument("--port", type=int, default=PORT, help=f"Port (default: {PORT})")
     args = parser.parse_args()
 
@@ -2140,7 +839,8 @@ if __name__ == '__main__':
         args.flux2 = True
         args.full_model = True
     _full_model, _gguf_quant, _flux2, _schnell, _uncensored, _klein = args.full_model, args.gguf, args.flux2, args.schnell, args.uncensored, args.klein
-    _local_encoder = args.local_encoder or args.full_model or args.schnell or args.uncensored
+    _kontext = args.kontext
+    _local_encoder = args.local_encoder or args.full_model or args.schnell or args.uncensored or args.kontext
     if args.uncensored and not args.full_model: _full_model = True
     # Turbo LoRA is a FLUX.2-dev LoRA — don't auto-enable for klein (different architecture)
     _turbo = (args.turbo or (args.flux2 and not _klein)) and not args.no_turbo
@@ -2148,9 +848,10 @@ if __name__ == '__main__':
     def _load_in_background():
         global _model_ready, _model_load_error, _model_load_status
         try:
-            _model_load_status = f"loading {'FLUX.2' if _flux2 else 'FLUX.1'} model"
-            print(f"Loading {'FLUX.2' if _flux2 else 'FLUX.1'}...")
-            load_model(local_encoder=_local_encoder, full_model=_full_model, gguf_quant=_gguf_quant, flux2=_flux2, schnell=_schnell, for_lora=_uncensored, klein=_klein)
+            _model_name = "FLUX.1-Kontext" if _kontext else ("FLUX.2" if _flux2 else "FLUX.1")
+            _model_load_status = f"loading {_model_name} model"
+            print(f"Loading {_model_name}...")
+            load_model(local_encoder=_local_encoder, full_model=_full_model, gguf_quant=_gguf_quant, flux2=_flux2, schnell=_schnell, for_lora=_uncensored, klein=_klein, kontext=_kontext)
             if _turbo:
                 _model_load_status = "loading turbo LoRA"
                 load_turbo_lora()
