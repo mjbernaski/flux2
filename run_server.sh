@@ -137,24 +137,32 @@ start_server() {
 
     kill_existing_server
 
+    if [ ! -f .venv/bin/activate ]; then
+        echo -e "${RED}No .venv found — create it first: python -m venv .venv && uv pip install -r requirements.txt${NC}"
+        return 1
+    fi
     source .venv/bin/activate
 
-    # Save parent PID
+    # Save parent PID; the trap cleans the pidfile up on any exit, including
+    # the max-retries give-up path and the script being killed.
     echo $$ > server.pid
+    trap 'rm -f server.pid' EXIT
 
     # Restart loop
     local attempt=0
+    local first_start=1
     while true; do
         attempt=$((attempt + 1))
         local start_time=$(date +%s)
 
-        if [ $attempt -gt 1 ]; then
+        if [ $first_start -eq 0 ]; then
             echo "" | tee -a "$log_file"
             echo -e "${YELLOW}═══════════════════════════════════════════════════════════${NC}" | tee -a "$log_file"
             echo -e "${YELLOW}[$(date '+%Y-%m-%d %H:%M:%S')] Restart attempt $attempt of $max_retries${NC}" | tee -a "$log_file"
             echo -e "${YELLOW}═══════════════════════════════════════════════════════════${NC}" | tee -a "$log_file"
             echo "" | tee -a "$log_file"
         else
+            first_start=0
             echo -e "${GREEN}[$(date '+%Y-%m-%d %H:%M:%S')] Initial server start${NC}" | tee -a "$log_file"
         fi
 
@@ -211,8 +219,6 @@ start_server() {
             echo ""
         fi
     done
-
-    rm -f server.pid
 }
 
 # Main loop
