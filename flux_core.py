@@ -4,7 +4,7 @@ import os
 import socket
 import logging
 import warnings
-from PIL import Image
+from PIL import Image, ImageFilter
 
 # Suppress CLIP tokenizer truncation warning - expected for long prompts since T5 handles full text
 warnings.filterwarnings("ignore", message="Token indices sequence length is longer than the specified maximum sequence length")
@@ -37,7 +37,7 @@ def _patched_load_file(filename, device="cpu"):
 safetensors.torch.load_file = _patched_load_file
 
 # FLUX.1 classes
-from diffusers import FluxPipeline, FluxImg2ImgPipeline, FluxTransformer2DModel
+from diffusers import FluxPipeline, FluxImg2ImgPipeline, FluxTransformer2DModel, FluxKontextPipeline
 # FLUX.2 classes (different architecture - img2img is built into Flux2Pipeline)
 from diffusers import Flux2Pipeline, Flux2Transformer2DModel
 from huggingface_hub import get_token
@@ -55,6 +55,9 @@ import shutil
 FLUX1_REPO_4BIT = "diffusers/FLUX.1-dev-bnb-4bit"
 FLUX1_REPO_FULL = "black-forest-labs/FLUX.1-dev"
 FLUX1_REPO_SCHNELL = "black-forest-labs/FLUX.1-schnell"
+# FLUX.1 Kontext: instruction-based image editor ("change X, keep the rest").
+# No official bnb-4bit repo exists, so we quantize the full repo on the fly.
+FLUX1_KONTEXT_REPO = "black-forest-labs/FLUX.1-Kontext-dev"
 FLUX1_GGUF_MODELS = {
     "bf16": "https://huggingface.co/city96/FLUX.1-dev-gguf/blob/main/flux1-dev-BF16.gguf",
     "q8": "https://huggingface.co/city96/FLUX.1-dev-gguf/blob/main/flux1-dev-Q8_0.gguf",
@@ -80,6 +83,7 @@ _model_type = None  # Track which model is loaded
 _flux_version = 1  # Track FLUX version (1 or 2)
 _turbo_enabled = False  # Track if turbo LoRA is loaded
 _schnell_enabled = False  # Track if using schnell (4-step) model
+_kontext_enabled = False  # Track if using FLUX.1 Kontext (instruction-based editor)
 _local_encoder_active = False  # Set when local encoders are loaded (incl. remote-encoder fallback)
 
 # Pre-shifted custom sigmas for 8-step turbo inference (FLUX.2 only)
@@ -97,60 +101,92 @@ _retry_strategy = Retry(
 _adapter = HTTPAdapter(max_retries=_retry_strategy)
 _session.mount("https://", _adapter)
 
-# Embedding cache - avoids redundant API calls for same prompts
-_embedding_cache = {}
+# Embedding cache - avoids redundant API calls for same prompts.
+# Bounded LRU: each entry is a GPU tensor, so an unbounded dict leaks VRAM on
+# long-running servers with many unique prompts.
+from collections import OrderedDict
+_embedding_cache = OrderedDict()
+_EMBEDDING_CACHE_MAX = 32
 
 
-def _wrap_vae_for_dtype_safety(pipeline):
-    """Wrap VAE encode/decode methods to handle dtype mismatches automatically.
+def _stabilize_vae_fp32(pipeline):
+    """Run the VAE in float32 to prevent intermittent NaN/black decodes.
 
-    For quantized models (4-bit BNB, GGUF), there can be dtype mismatches:
-    - Pipeline uses torch_dtype (bfloat16) for image preprocessing
-    - VAE may be in float32
-    - Transformer outputs may be in a different dtype
+    The transformer and text encoder run in bfloat16, but the VAE's deep conv
+    stack can overflow in bf16 and emit NaN/Inf (or fully-saturated) values.
+    Downstream, ``(image * 255).round().astype("uint8")`` turns NaN into 0 and
+    clamps saturated values to 0 -> a pure-black image that gets silently saved
+    as a "successful" generation. Upcasting just the VAE to fp32 (~0.6GB) is the
+    standard FLUX stability fix; the transformer stays in bf16 for speed/VRAM.
 
-    This wrapper ensures inputs are cast to match VAE dtype before processing,
-    and outputs are cast back to the expected dtype.
+    Latents arrive from the transformer in bf16, so decode/encode are wrapped to
+    cast their inputs to fp32. The encode wrapper also casts its *output* back to
+    the model dtype: image-conditioning paths (Kontext, img2img) encode a
+    reference image through the VAE and feed the result to the bf16 transformer,
+    so fp32 latents there cause "mat1 and mat2 must have the same dtype". Decode
+    output stays fp32 (it goes straight to the image processor). Idempotent —
+    safe to call repeatedly on a shared VAE (e.g. img2img reuses the txt2img VAE).
     """
     if not hasattr(pipeline, 'vae') or pipeline.vae is None:
         return
-
     vae = pipeline.vae
-
-    # Get VAE's parameter dtype
-    try:
-        vae_dtype = next(vae.parameters()).dtype
-    except StopIteration:
+    if getattr(vae, '_fp32_stabilized', False):
         return
+    vae.to(torch.float32)
 
-    # Only wrap if VAE dtype differs from torch_dtype
-    if vae_dtype == torch_dtype:
-        return  # No wrapping needed
-
-    # Store original methods
     original_encode = vae.encode
     original_decode = vae.decode
 
     def wrapped_encode(x, *args, **kwargs):
-        # Cast input to VAE dtype
-        if x.dtype != vae_dtype:
-            x = x.to(vae_dtype)
-        result = original_encode(x, *args, **kwargs)
-        return result
+        if hasattr(x, 'dtype') and x.dtype != torch.float32:
+            x = x.to(torch.float32)
+        out = original_encode(x, *args, **kwargs)
+        # Cast the encoded distribution back to the model dtype so downstream
+        # conditioning (Kontext/img2img) matches the bf16 transformer.
+        dist = getattr(out, 'latent_dist', None)
+        if dist is not None:
+            for attr in ('parameters', 'mean', 'logvar', 'std', 'var'):
+                v = getattr(dist, attr, None)
+                if v is not None and getattr(v, 'dtype', None) != torch_dtype:
+                    setattr(dist, attr, v.to(torch_dtype))
+        return out
 
     def wrapped_decode(z, *args, **kwargs):
-        # Cast latents to VAE dtype
-        if z.dtype != vae_dtype:
-            z = z.to(vae_dtype)
-        result = original_decode(z, *args, **kwargs)
-        return result
+        if hasattr(z, 'dtype') and z.dtype != torch.float32:
+            z = z.to(torch.float32)
+        return original_decode(z, *args, **kwargs)
 
-    # Apply wrappers
     vae.encode = wrapped_encode
     vae.decode = wrapped_decode
+    vae._fp32_stabilized = True
 
 
-def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=False, schnell=False, for_lora=False, klein=False):
+# Generation can intermittently diverge (bf16 VAE/transformer NaN or saturation)
+# and decode to a pure-black frame. We detect that and retry before giving up.
+_MAX_GEN_RETRIES = 1  # retries after the first attempt (so up to 2 attempts total)
+
+
+class DegenerateImageError(RuntimeError):
+    """Raised when generation yields an all-black (NaN/saturated) image."""
+
+
+def _is_degenerate_image(image):
+    """True if the image is effectively all-black.
+
+    A NaN/Inf or fully-saturated latent decodes to pure black: NaN -> 0 in the
+    uint8 cast, all-negative saturation -> clamped to 0. No real image (even a
+    dark night scene) is uniformly black, so the brightest pixel across all
+    channels being ~0 is an unambiguous failure signal.
+    """
+    try:
+        extrema = image.convert("RGB").getextrema()
+        brightest = max(channel_max for _, channel_max in extrema)
+        return brightest < 2
+    except Exception:
+        return False
+
+
+def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=False, schnell=False, for_lora=False, klein=False, kontext=False):
     """Load the FLUX model components. Call this before generating images.
 
     Args:
@@ -163,10 +199,26 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
         klein: Use FLUX.2-klein (9B) variant instead of FLUX.2-dev (32B). Implies flux2.
             Klein always loads as full bf16 (no quantized variant wired up — NVFP4 blocked by
             diffusers upstream qkv-chunking bug in the Flux2 single-file converter).
+        kontext: Use FLUX.1 Kontext, an instruction-based image editor. FLUX.1 only;
+            loaded 4-bit (quantized on the fly) with local T5+CLIP encoders. Implies a
+            local encoder; ignores flux2/full_model/gguf/schnell.
     """
-    global transformer, pipe, _model_type, _flux_version, _schnell_enabled, _local_encoder_active
+    global transformer, pipe, _model_type, _flux_version, _schnell_enabled, _kontext_enabled, _local_encoder_active
     if pipe is not None:
+        print(f"Warning: model already loaded ({_model_type}); ignoring load_model() "
+              f"request. Restart the process to switch models.")
         return {}  # Already loaded
+
+    # Kontext is a standalone FLUX.1 editor model; it overrides the other variants.
+    if kontext:
+        flux2 = False
+        gguf_quant = None
+        schnell = False
+        local_encoder = True  # Kontext uses local T5+CLIP (no remote API)
+        _kontext_enabled = True
+        # full_model passes through: --kontext --full-model loads the editor in
+        # full bf16 (no 4-bit quantization) for maximum edit fidelity.
+
     _local_encoder_active = local_encoder
 
     # klein implies flux2 + full (bf16). Klein has no working 4-bit/NVFP4 path in current diffusers.
@@ -206,7 +258,11 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
 
     # Determine model type
     klein_tag = "-klein" if klein else "-dev"
-    if schnell and not flux2:
+    if kontext:
+        _model_type = "kontext-full" if full_model else "kontext"
+        model_desc = ("full bf16 FLUX.1-Kontext (editor)" if full_model
+                      else "4-bit FLUX.1-Kontext (editor)")
+    elif schnell and not flux2:
         _model_type = "schnell"
         model_desc = f"FLUX.1-schnell (4-step)"
     elif gguf_quant:
@@ -222,7 +278,68 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
     hostname = socket.gethostname()
     print(f"[{hostname}] Loading {model_desc}...")
 
-    if gguf_quant:
+    if kontext and full_model:
+        # Full-precision (bf16) FLUX.1-Kontext editor. No quantization: maximum
+        # edit fidelity at the cost of VRAM (~24GB transformer + ~9GB T5).
+        # Load the whole pipeline in bf16 and move it to the GPU in one shot.
+        # (Pre-loading the transformer and passing it alongside device_map left
+        # it on CPU while the rest went to cuda:0 -> "tensors on different
+        # devices" at inference. .to(device) keeps everything consistent.)
+        repo_id = FLUX1_KONTEXT_REPO
+        print("Loading FluxKontextPipeline (full bf16)...")
+        t0 = time.perf_counter()
+        pipe = FluxKontextPipeline.from_pretrained(
+            repo_id, torch_dtype=torch_dtype,
+        )
+        load_timings['transformer'] = 0  # loaded as part of the pipeline
+        load_timings['pipeline'] = time.perf_counter() - t0
+        print(f"  Pipeline loaded in {load_timings['pipeline']:.2f}s")
+
+        print("Moving FLUX.1-Kontext to GPU...")
+        t0 = time.perf_counter()
+        pipe = pipe.to(device)
+        load_timings['to_device'] = time.perf_counter() - t0
+        print(f"  Moved to GPU in {load_timings['to_device']:.2f}s")
+
+    elif kontext:
+        # FLUX.1 Kontext editor. No official bnb-4bit repo, so quantize the full
+        # repo on the fly: transformer + T5 to 4-bit NF4, CLIP stays small.
+        from diffusers import BitsAndBytesConfig as DiffusersBnbConfig
+        from transformers import BitsAndBytesConfig as TransformersBnbConfig, T5EncoderModel
+
+        repo_id = FLUX1_KONTEXT_REPO
+        print("Loading FLUX.1-Kontext transformer (4-bit, quantized on load)...")
+        t0 = time.perf_counter()
+        transformer = FluxTransformer2DModel.from_pretrained(
+            repo_id, subfolder="transformer",
+            quantization_config=DiffusersBnbConfig(
+                load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch_dtype),
+            torch_dtype=torch_dtype,
+        )
+        load_timings['transformer'] = time.perf_counter() - t0
+        print(f"  Transformer loaded in {load_timings['transformer']:.2f}s")
+
+        print("Loading FLUX.1-Kontext text encoder (T5, 4-bit)...")
+        text_encoder_2 = T5EncoderModel.from_pretrained(
+            repo_id, subfolder="text_encoder_2",
+            quantization_config=TransformersBnbConfig(
+                load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch_dtype),
+            torch_dtype=torch_dtype,
+        )
+
+        print("Assembling FluxKontextPipeline...")
+        t0 = time.perf_counter()
+        pipe = FluxKontextPipeline.from_pretrained(
+            repo_id, transformer=transformer, text_encoder_2=text_encoder_2,
+            torch_dtype=torch_dtype, device_map="balanced",
+        )
+        load_timings['pipeline'] = time.perf_counter() - t0
+        load_timings['to_device'] = 0  # Already on GPU via device_map
+        print(f"  Pipeline assembled in {load_timings['pipeline']:.2f}s")
+
+    elif gguf_quant:
         # GGUF models - recommended for DGX Spark unified memory systems (FLUX.1 only)
         from diffusers import GGUFQuantizationConfig
 
@@ -398,7 +515,9 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
                 use_safetensors=True,
             )
 
-        load_timings['transformer'] = 0  # Already counted above
+        # FLUX.2 records the transformer time above; FLUX.1 counts it inside
+        # parallel_load, so only default it when nothing recorded it yet.
+        load_timings.setdefault('transformer', 0)
         load_timings['pipeline'] = time.perf_counter() - t0
         load_timings['to_device'] = 0  # Already on GPU via device_map
         print(f"  Pipeline assembled in {load_timings['pipeline']:.2f}s")
@@ -470,6 +589,10 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
         load_timings['to_device'] = 0  # Already on GPU via device_map
         print(f"  Pipeline loaded in {load_timings['pipeline']:.2f}s")
 
+    # Run the VAE in fp32 to avoid intermittent NaN/black decodes (bf16 VAE
+    # overflow). Applies to every config; the transformer stays in bf16.
+    _stabilize_vae_fp32(pipe)
+
     load_timings['total'] = time.perf_counter() - total_start
     print(f"[{hostname}] Model ready in {load_timings['total']:.2f}s (transformer={load_timings['transformer']:.2f}s, pipeline={load_timings['pipeline']:.2f}s)")
 
@@ -508,7 +631,7 @@ def load_turbo_lora():
 _uncensored_enabled = False  # Track if uncensored LoRA is loaded
 
 def load_uncensored_lora():
-    """Load the Flux-Uncensored-V2 LoRA for FLUX.1.
+    """Load the Lustly.ai uncensored NSFW LoRA for FLUX.1.
 
     Only works with FLUX.1. Must be called after load_model().
     """
@@ -525,12 +648,13 @@ def load_uncensored_lora():
         print("Uncensored LoRA already loaded")
         return
 
-    # enhanceaiteam/Flux-Uncensored-V2 was removed from the Hugging Face Hub
-    # (404). aifeifei798/flux-lora-uncensored is an equivalent diffusers-format
-    # FLUX.1-dev LoRA that is still available.
-    print("Loading uncensored LoRA (aifeifei798/flux-lora-uncensored)...")
+    # lustlyai/Flux_Lustly.ai_Uncensored_nsfw_v1 is the most popular dedicated
+    # NSFW FLUX.1-dev LoRA (much stronger than aifeifei798/flux-lora-uncensored,
+    # which produced weak results). FLUX.1-dev trained, so it needs the full
+    # model + real guidance to take full effect (not schnell).
+    print("Loading uncensored LoRA (lustlyai/Flux_Lustly.ai_Uncensored_nsfw_v1)...")
     t0 = time.perf_counter()
-    pipe.load_lora_weights("aifeifei798/flux-lora-uncensored")
+    pipe.load_lora_weights("lustlyai/Flux_Lustly.ai_Uncensored_nsfw_v1")
     load_time = time.perf_counter() - t0
     print(f"  Uncensored LoRA loaded in {load_time:.2f}s")
     _uncensored_enabled = True
@@ -545,6 +669,7 @@ class RemoteEncoderUnavailable(RuntimeError):
 
 def remote_text_encoder(prompt, use_cache=True):
     if use_cache and prompt in _embedding_cache:
+        _embedding_cache.move_to_end(prompt)
         return _embedding_cache[prompt]
 
     response = _session.post(
@@ -579,6 +704,8 @@ def remote_text_encoder(prompt, use_cache=True):
 
     if use_cache:
         _embedding_cache[prompt] = result
+        while len(_embedding_cache) > _EMBEDDING_CACHE_MAX:
+            _embedding_cache.popitem(last=False)
 
     return result
 
@@ -595,6 +722,40 @@ def remote_encoder_available():
     except Exception as e:
         print(f"  Remote text encoder probe failed: {e}")
         return False
+
+def _infer_latent_grid(seq, height, width, cell):
+    """Recover the true (grid_h, grid_w) token grid for ``seq`` packed latents.
+
+    The pipeline snaps the requested height/width to a multiple of ``cell``
+    (it logs "height and width have been adjusted to ..."), so the dimensions
+    the preview decoder is handed can disagree with the actual latents by a row
+    or column. Trusting them makes the unpack reshape fail. Instead, search a
+    small neighborhood around the requested grid for the row count that divides
+    ``seq`` exactly (the column count then follows), preferring the candidate
+    closest to the requested aspect ratio. A no-op when dimensions already
+    match, so non-adjusted FLUX.1/FLUX.2 previews are unchanged.
+    """
+    gh0 = max(1, round(int(height) / cell))
+    gw0 = max(1, round(int(width) / cell))
+    if gh0 * gw0 == seq:
+        return gh0, gw0
+    # Consider every exact factor pair of seq and pick the one whose grid is
+    # closest to the requested one. Kontext can rebucket to a quite different
+    # resolution, so we don't assume the adjustment is small.
+    best = None
+    for gh in range(1, int(seq ** 0.5) + 1):
+        if seq % gh:
+            continue
+        for a, b in ((gh, seq // gh), (seq // gh, gh)):
+            dist = abs(a - gh0) + abs(b - gw0)
+            if best is None or dist < best[0]:
+                best = (dist, a, b)
+    if best is None:
+        raise ValueError(
+            f"cannot factor latent seq {seq} near grid {gh0}x{gw0}"
+        )
+    return best[1], best[2]
+
 
 def decode_latents_to_preview(pipe_obj, latents, height, width, max_size=512):
     """Decode intermediate Flux latents into a PIL preview image.
@@ -614,13 +775,12 @@ def decode_latents_to_preview(pipe_obj, latents, height, width, max_size=512):
                 # FLUX.2: latents are (B, H*W, C*4) with contiguous position ids,
                 # so unpacking is a reshape+permute. Then apply vae.bn stats and
                 # unpatchify before decoding.
-                patch_h = int(height) // (vae_scale_factor * 2)
-                patch_w = int(width) // (vae_scale_factor * 2)
                 B, seq, ch = latents.shape
-                if seq != patch_h * patch_w:
-                    raise ValueError(
-                        f"latent seq {seq} != patch_h*patch_w {patch_h * patch_w}"
-                    )
+                # Recover the true grid from the latents; the pipeline may have
+                # adjusted the requested height/width to fit model requirements.
+                patch_h, patch_w = _infer_latent_grid(
+                    seq, height, width, vae_scale_factor * 2
+                )
                 lat = latents.view(B, patch_h, patch_w, ch).permute(0, 3, 1, 2).contiguous()
                 vae = pipe_obj.vae
                 bn_mean = vae.bn.running_mean.view(1, -1, 1, 1).to(lat.device, lat.dtype)
@@ -633,7 +793,14 @@ def decode_latents_to_preview(pipe_obj, latents, height, width, max_size=512):
             else:
                 # FLUX.1
                 unpack = getattr(pipe_obj, "_unpack_latents", None)
-                lat = unpack(latents, height, width, vae_scale_factor) if unpack is not None else latents
+                if unpack is not None:
+                    # Use the latents' true grid (the pipeline may have adjusted
+                    # the requested height/width), expressed back as pixel dims.
+                    cell = vae_scale_factor * 2
+                    gh, gw = _infer_latent_grid(latents.shape[1], height, width, cell)
+                    lat = unpack(latents, gh * cell, gw * cell, vae_scale_factor)
+                else:
+                    lat = latents
                 vae_cfg = pipe_obj.vae.config
                 lat = (lat / vae_cfg.scaling_factor) + vae_cfg.shift_factor
                 decoded = pipe_obj.vae.decode(lat, return_dict=False)[0]
@@ -651,7 +818,77 @@ def decode_latents_to_preview(pipe_obj, latents, height, width, max_size=512):
         return None
 
 
-def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_encoder=False, input_image=None, strength=0.75, sigmas=None, guidance_scale=None, callback_on_step_end=None):
+def _prepare_flux2_inpaint(pipe_obj, init_image, mask_image, width, height, seed):
+    """Build the tensors needed to inpaint a region of ``init_image`` with FLUX.2.
+
+    FLUX.2 ships no inpainting pipeline, so we re-create the classic masked
+    flow-matching approach on top of the standard ``Flux2Pipeline``: encode the
+    original image to clean packed latents (``x0``), build a packed latent-space
+    mask (1 = regenerate, 0 = keep), and sample a fixed noise tensor used to
+    re-noise the kept region at each step. The actual blending happens in the
+    step callback returned by :func:`_flux2_inpaint_callback`.
+
+    Returns ``(x0, noise, mask)`` — each a packed ``(1, seq, C)`` tensor on the
+    transformer device/dtype (``mask`` is ``(1, seq, 1)``).
+    """
+    import numpy as np
+    from diffusers.utils.torch_utils import randn_tensor
+
+    multiple_of = pipe_obj.vae_scale_factor * 2  # latent token covers a 16px block
+    width = (int(width) // multiple_of) * multiple_of
+    height = (int(height) // multiple_of) * multiple_of
+
+    # Encode the original image to clean, packed latents (x0).
+    img = init_image.convert("RGB").resize((width, height), Image.Resampling.LANCZOS)
+    img_t = pipe_obj.image_processor.preprocess(img, height=height, width=width)
+    img_t = img_t.to(device=device, dtype=pipe_obj.vae.dtype)
+    gen = torch.Generator(device=device).manual_seed(seed)
+    x0 = pipe_obj._encode_vae_image(image=img_t, generator=gen)  # (1, C, h16, w16)
+    x0 = pipe_obj._pack_latents(x0)                              # (1, seq, C)
+
+    # Build a latent-resolution mask. White (255) = regenerate this token.
+    h16, w16 = height // multiple_of, width // multiple_of
+    m = mask_image.convert("L").resize((w16, h16), Image.Resampling.BILINEAR)
+    m = m.filter(ImageFilter.GaussianBlur(radius=0.5))  # soften latent edges
+    m_np = np.asarray(m, dtype=np.float32) / 255.0      # (h16, w16), row-major
+    mask = torch.from_numpy(m_np).reshape(1, h16 * w16, 1)  # matches token order
+
+    dtype = pipe_obj.transformer.dtype
+    x0 = x0.to(device=device, dtype=dtype)
+    mask = mask.to(device=device, dtype=dtype)
+    noise = randn_tensor(
+        x0.shape,
+        generator=torch.Generator(device=device).manual_seed(seed),
+        device=torch.device(device),
+        dtype=dtype,
+    )
+    return x0, noise, mask
+
+
+def _flux2_inpaint_callback(x0, noise, mask, user_callback):
+    """Step callback that pins the unmasked region to the original latents.
+
+    After each scheduler step the kept region (mask==0) is overwritten with the
+    original latents re-noised to the *next* sigma on the flow-matching path, so
+    the model only ever generates inside the painted region while attending to
+    consistent surroundings. ``user_callback`` (e.g. live preview) still runs.
+    """
+    def cb(p, i, t, kwargs):
+        latents = kwargs["latents"]
+        sigmas = p.scheduler.sigmas
+        sigma_next = sigmas[i + 1] if (i + 1) < len(sigmas) else sigmas.new_zeros(())
+        sigma_next = sigma_next.to(latents.device, latents.dtype)
+        noised_orig = (1.0 - sigma_next) * x0 + sigma_next * noise
+        kwargs["latents"] = mask * latents + (1.0 - mask) * noised_orig
+        if user_callback is not None:
+            res = user_callback(p, i, t, kwargs)
+            if res is not None:
+                kwargs = res
+        return kwargs
+    return cb
+
+
+def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_encoder=False, input_image=None, strength=0.75, sigmas=None, guidance_scale=None, callback_on_step_end=None, mask_image=None, _retry_depth=0):
     """Generate an image from a text prompt.
 
     Args:
@@ -667,8 +904,18 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
         guidance_scale: Classifier-free guidance scale (default: 4, turbo uses 2.5)
         callback_on_step_end: Optional callback called after each inference step.
             Signature: callback(pipe, step_index, timestep, callback_kwargs) -> callback_kwargs
+        mask_image: Optional PIL Image (L/RGB) for inpainting. White pixels mark
+            the region to regenerate; black pixels are preserved. Requires
+            input_image and FLUX.2 (the FLUX.2 family has no inpaint pipeline, so
+            this is done via masked latent re-injection on Flux2Pipeline).
     """
     global pipe_img2img
+
+    if mask_image is not None and _flux_version != 2:
+        raise ValueError(
+            "Inpainting (mask_image) is only supported on FLUX.2. "
+            "Start the server/CLI with --flux2."
+        )
 
     if seed is None:
         seed = torch.randint(0, 2**32, (1,)).item()
@@ -689,16 +936,17 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
             steps = 4  # Schnell is optimized for 4 steps txt2img
         guidance_scale = 0  # Always force 0 for schnell
 
-    # Ensure strength won't result in zero pipeline steps for img2img
-    if input_image is not None and strength is not None:
+    # Ensure strength won't result in zero pipeline steps for img2img.
+    # Kontext ignores strength (it edits from the instruction), so skip the check.
+    if input_image is not None and strength is not None and not _kontext_enabled:
         min_strength = 1.0 / steps
         if strength < min_strength:
             print(f"Warning: strength {strength} too low for {steps} steps (minimum {min_strength:.2f}). Using {min_strength:.2f}.")
             strength = min_strength
 
     if guidance_scale is None:
-        # Turbo uses 2.5, others use 4
-        if _turbo_enabled:
+        # Turbo and Kontext use 2.5, others use 4
+        if _turbo_enabled or _kontext_enabled:
             guidance_scale = 2.5
         else:
             guidance_scale = 4
@@ -708,11 +956,101 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
     # Generate with inference_mode for better performance
     with torch.inference_mode():
         if input_image is not None:
-            # Img2img mode
-            if _flux_version == 2:
+            # Img2img / editing mode
+            if _kontext_enabled:
+                # FLUX.1 Kontext: instruction-based editing. The prompt is an
+                # edit instruction ("make the car red") and the image is the
+                # source; Kontext keeps everything the instruction doesn't touch.
+                # No strength — the model decides what to change.
+                #
+                # The Kontext pipeline snaps the *conditioning* image to its
+                # nearest preferred-resolution bucket, but if we don't pass
+                # height/width it defaults the *output* latent to 1024x1024
+                # (square) regardless of the input aspect ratio — so every edit
+                # came out square. Replicate the pipeline's bucket selection here
+                # and pass the matching height/width so the output keeps the
+                # reference image's aspect ratio (and stays consistent with the
+                # resized conditioning).
+                try:
+                    from diffusers.pipelines.flux.pipeline_flux_kontext import (
+                        PREFERRED_KONTEXT_RESOLUTIONS,
+                    )
+                except ImportError:
+                    PREFERRED_KONTEXT_RESOLUTIONS = None
+
+                kontext_dims = {}
+                if PREFERRED_KONTEXT_RESOLUTIONS:
+                    src = input_image.convert("RGB")
+                    in_w, in_h = src.size
+                    aspect_ratio = in_w / in_h
+                    _, best_w, best_h = min(
+                        (abs(aspect_ratio - w / h), w, h)
+                        for w, h in PREFERRED_KONTEXT_RESOLUTIONS
+                    )
+                    multiple_of = 16
+                    kontext_dims = {
+                        "width": (best_w // multiple_of) * multiple_of,
+                        "height": (best_h // multiple_of) * multiple_of,
+                    }
+
+                t0 = time.perf_counter()
+                kontext_kwargs = {
+                    "prompt": prompt,
+                    "image": input_image.convert("RGB"),
+                    "generator": torch.Generator(device=device).manual_seed(seed),
+                    "num_inference_steps": steps,
+                    "guidance_scale": guidance_scale,
+                    "max_sequence_length": 512,
+                    **kontext_dims,
+                }
+                if callback_on_step_end is not None:
+                    kontext_kwargs["callback_on_step_end"] = callback_on_step_end
+                image = pipe(**kontext_kwargs).images[0]
+                timings['diffusion'] = time.perf_counter() - t0
+                timings['encoding'] = 0
+            elif _flux_version == 2 and mask_image is not None:
+                # FLUX.2 inpainting: no dedicated pipeline exists, so we run the
+                # standard txt2img loop and re-inject the original latents outside
+                # the painted mask at every step (flow-matching masked diffusion).
+                multiple_of = pipe.vae_scale_factor * 2
+                width = (width // multiple_of) * multiple_of
+                height = (height // multiple_of) * multiple_of
+
+                x0, noise, mask = _prepare_flux2_inpaint(
+                    pipe, input_image, mask_image, width, height, seed)
+                inpaint_cb = _flux2_inpaint_callback(x0, noise, mask, callback_on_step_end)
+
+                t0 = time.perf_counter()
+                pipe_kwargs = {
+                    "prompt": prompt,
+                    "generator": torch.Generator(device=device).manual_seed(seed),
+                    "num_inference_steps": steps,
+                    "guidance_scale": guidance_scale,
+                    "height": height,
+                    "width": width,
+                    "max_sequence_length": 512,
+                    "callback_on_step_end": inpaint_cb,
+                }
+                if sigmas is not None:
+                    pipe_kwargs["sigmas"] = sigmas
+                image = pipe(**pipe_kwargs).images[0]
+
+                # Paste the untouched original back outside the mask: pinning the
+                # latents preserves structure, but the VAE round-trip can still
+                # shift kept pixels slightly. A feathered pixel composite keeps
+                # everything outside the painted region byte-for-byte original.
+                orig_rgb = input_image.convert("RGB").resize((width, height), Image.Resampling.LANCZOS)
+                mask_px = mask_image.convert("L").resize((width, height), Image.Resampling.BILINEAR)
+                feather = max(1, round(max(width, height) / 256))
+                mask_px = mask_px.filter(ImageFilter.GaussianBlur(radius=feather))
+                image = Image.composite(image, orig_rgb, mask_px)
+
+                timings['diffusion'] = time.perf_counter() - t0
+                timings['encoding'] = 0
+            elif _flux_version == 2:
                 # FLUX.2 has image conditioning built into the main pipeline
                 # (no strength parameter - image is used as reference/conditioning)
-                input_image = input_image.resize((width, height))
+                input_image = input_image.resize((width, height), Image.Resampling.LANCZOS)
 
                 t0 = time.perf_counter()
                 pipe_kwargs = {
@@ -749,10 +1087,11 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
                         )
                     else:
                         pipe_img2img = FluxImg2ImgPipeline.from_pipe(pipe)
-                    # Wrap VAE for dtype safety (handles 4-bit/GGUF dtype mismatches)
-                    _wrap_vae_for_dtype_safety(pipe_img2img)
+                    # Keep the img2img VAE in fp32 too (shares the txt2img VAE,
+                    # so this is a no-op when already stabilized).
+                    _stabilize_vae_fp32(pipe_img2img)
 
-                input_image = input_image.resize((width, height))
+                input_image = input_image.resize((width, height), Image.Resampling.LANCZOS)
 
                 t0 = time.perf_counter()
                 img2img_kwargs = {
@@ -808,6 +1147,25 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
             image = pipe(**remote_pipe_kwargs).images[0]
             timings['diffusion'] = time.perf_counter() - t0
 
+    # A degenerate (all-black) result means the latents/VAE diverged (NaN or
+    # saturation). Retry with a perturbed seed; if it still fails, raise so the
+    # caller surfaces an error instead of silently saving a black image.
+    if _is_degenerate_image(image):
+        if _retry_depth < _MAX_GEN_RETRIES:
+            retry_seed = (seed + 1) % (2 ** 32)
+            print(f"Warning: degenerate (all-black) image from seed {seed}; "
+                  f"retrying with seed {retry_seed} "
+                  f"(attempt {_retry_depth + 2}/{_MAX_GEN_RETRIES + 1})", flush=True)
+            return generate_image(
+                prompt, seed=retry_seed, steps=steps, width=width, height=height,
+                local_encoder=local_encoder, input_image=input_image, strength=strength,
+                sigmas=sigmas, guidance_scale=guidance_scale,
+                callback_on_step_end=callback_on_step_end, mask_image=mask_image,
+                _retry_depth=_retry_depth + 1)
+        raise DegenerateImageError(
+            f"Generation produced an all-black image after {_MAX_GEN_RETRIES + 1} "
+            f"attempts (likely a VAE/transformer NaN); not saving.")
+
     timings['total'] = timings['encoding'] + timings['diffusion']
     return image, seed, timings
 
@@ -857,256 +1215,9 @@ def save_prompt_file(filepath, raw_prompt, prompt, width, height, seed, steps, t
         f.write(f"# Dimensions: {width}x{height}\n")
         f.write(f"# Seed: {seed}\n")
         f.write(f"# Steps: {steps}\n")
-        f.write(f"# Guidance: {guidance_scale if guidance_scale else 'auto'}\n")
+        # guidance_scale == 0 is a real value (schnell forces it), not "auto"
+        f.write(f"# Guidance: {guidance_scale if guidance_scale is not None else 'auto'}\n")
         if strength is not None:
             f.write(f"# Strength: {strength} (img2img)\n")
         f.write(f"# Timings: encoding={timings['encoding']:.2f}s, diffusion={timings['diffusion']:.2f}s, save={timings.get('save', 0):.2f}s\n")
     return prompt_path
-
-
-def main():
-    parser = argparse.ArgumentParser(description="FLUX Image Generator")
-    parser.add_argument("--steps", type=int, default=25, help="Number of inference steps (default: 25)")
-    parser.add_argument("--guidance", type=float, default=None, help="Guidance scale (default: 4 for normal, 2.5 for turbo). Lower values give more variety.")
-    parser.add_argument("--compile", action="store_true", help="Compile model for faster inference (slower startup)")
-    parser.add_argument("--local-encoder", action="store_true", help="Use local text encoder instead of remote API (requires more VRAM)")
-    parser.add_argument("--full-model", action="store_true", help="Use full FLUX model instead of 4-bit quantized (requires more VRAM)")
-    parser.add_argument("--gguf", type=str, choices=["bf16", "q8", "q4"], default=None,
-                        help="Use GGUF model (FLUX.1 only, recommended for DGX Spark). Options: bf16 (full quality), q8 (8-bit), q4 (4-bit smallest)")
-    parser.add_argument("--flux2", action="store_true", help="Use FLUX.2 model instead of FLUX.1 (requires more VRAM)")
-    parser.add_argument("--schnell", action="store_true", help="Use FLUX.1-schnell (fast 4-step model, Apache 2.0 license)")
-    parser.add_argument("--image", type=str, default=None, help="Reference image path for img2img generation")
-    parser.add_argument("--strength", type=float, default=0.75, help="Denoising strength for img2img (0.0-1.0, default: 0.75). Higher = more change from original")
-    args = parser.parse_args()
-
-    # Full model and schnell always use local encoder
-    use_local_encoder = args.local_encoder or args.full_model or args.schnell
-
-    # Load the model
-    load_model(local_encoder=use_local_encoder, full_model=args.full_model, gguf_quant=args.gguf, flux2=args.flux2, schnell=args.schnell)
-
-    if args.compile:
-        compile_pipeline()
-
-    image_count = 0
-    current_prompt = None
-    last_seed = None
-
-    steps = args.steps
-    guidance_scale = args.guidance  # None means use default (4 for normal, 2.5 for turbo)
-    strength = args.strength  # Denoising strength for img2img
-    input_image = None
-    if args.image:
-        try:
-            input_image = Image.open(args.image).convert("RGB")
-            print(f"Loaded reference image: {args.image} ({input_image.size[0]}x{input_image.size[1]})")
-        except Exception as e:
-            print(f"Warning: Could not load reference image '{args.image}': {e}")
-            input_image = None
-
-    # Orientation presets (width, height) at 1K base
-    orientations_1k = {
-        'square': (1024, 1024),
-        'portrait': (768, 1344),
-        'landscape': (1360, 768),  # 16:9
-        'widescreen': (1568, 672),  # ~21:9 extra-wide
-        'extra-tall': (672, 1568),  # ~9:21 mirror of widescreen
-    }
-    # Size presets
-    sizes = {
-        '0.75': 0.75,
-        '1k': 1.0,
-        '2k': 2.0,
-        '4k': 4.0,
-    }
-    orientation = 'landscape'
-    size = '1k'
-    base_w, base_h = orientations_1k[orientation]
-    width, height = int(base_w * sizes[size]), int(base_h * sizes[size])
-
-    flux_name = f"FLUX.{_flux_version}"
-    hostname = socket.gethostname()
-    print(f"\n=== {flux_name} Image Generator on {hostname} ===")
-    if args.gguf:
-        model_mode = f"GGUF {args.gguf.upper()}"
-    elif args.full_model:
-        model_mode = "full model"
-    else:
-        model_mode = "4-bit BNB"
-    encoder_mode = "local encoder" if use_local_encoder else "remote encoder"
-    compiled_str = " (compiled)" if args.compile else ""
-    print(f"Model: {flux_name} {model_mode}, {encoder_mode}{compiled_str}")
-    print(f"Output: {size} {orientation} ({width}x{height}), {steps} steps")
-    print("Commands:")
-    print("  'quit' or 'q' - Exit the program")
-    print("  'same' or 's' - Regenerate with same prompt (uses cached embeddings)")
-    print("  'reseed <number>' - Regenerate with specific seed")
-    print("  '/steps <number>' - Change inference steps (current: {})".format(steps))
-    print("  '/guidance <number>' - Change guidance scale (current: {}, lower=more variety)".format(guidance_scale if guidance_scale else "auto"))
-    print("  '/image <path>' - Load reference image for img2img (use '/image clear' to remove)")
-    print("  '/strength <number>' - Set img2img denoising strength 0.0-1.0 (current: {})".format(strength))
-    print("  '/square' - Set square aspect ratio")
-    print("  '/portrait' - Set portrait aspect ratio")
-    print("  '/landscape' - Set 16:9 landscape aspect ratio")
-    print("  '/widescreen' - Set 21:9 extra-wide aspect ratio")
-    print("  '/extra-tall' - Set 9:21 extra-tall aspect ratio")
-    print("  '/0.75' - Set 0.75K resolution (smaller/faster)")
-    print("  '/1k' - Set 1K resolution (default)")
-    print("  '/2k' - Set 2K resolution")
-    print("  '/4k' - Set 4K resolution")
-    print("  Or enter a prompt (can include modifiers: 'a cat /4k /portrait')\n")
-
-    while True:
-        if current_prompt is None:
-            user_input = input("Enter your prompt: ").strip()
-        else:
-            print(f"\nCurrent prompt: {current_prompt[:80]}{'...' if len(current_prompt) > 80 else ''}")
-            user_input = input("Enter new prompt, modification, or command: ").strip()
-
-        if not user_input:
-            print("Please enter a prompt or command.")
-            continue
-
-        lower_input = user_input.lower()
-
-        if lower_input in ('quit', 'q'):
-            print("Goodbye!")
-            break
-
-        if lower_input.startswith('/steps '):
-            try:
-                new_steps = int(user_input.split()[1])
-                if new_steps < 1:
-                    print("Steps must be at least 1.")
-                    continue
-                steps = new_steps
-                print(f"Inference steps set to {steps}")
-            except (ValueError, IndexError):
-                print("Invalid steps. Usage: /steps 10")
-            continue
-
-        if lower_input.startswith('/guidance '):
-            try:
-                new_guidance = float(user_input.split()[1])
-                if new_guidance < 0:
-                    print("Guidance scale must be non-negative.")
-                    continue
-                guidance_scale = new_guidance
-                print(f"Guidance scale set to {guidance_scale}")
-            except (ValueError, IndexError):
-                print("Invalid guidance scale. Usage: /guidance 3.5")
-            continue
-
-        if lower_input.startswith('/strength '):
-            try:
-                new_strength = float(user_input.split()[1])
-                if new_strength <= 0 or new_strength > 1:
-                    print("Strength must be between 0.01 and 1.0 (0.0 would result in zero pipeline steps).")
-                    continue
-                strength = new_strength
-                print(f"Img2img strength set to {strength}")
-            except (ValueError, IndexError):
-                print("Invalid strength. Usage: /strength 0.75")
-            continue
-
-        if lower_input.startswith('/image '):
-            image_arg = user_input.split(maxsplit=1)[1] if len(user_input.split()) > 1 else ""
-            if image_arg.lower() == 'clear':
-                input_image = None
-                print("Reference image cleared. Using text-to-image mode.")
-            else:
-                try:
-                    input_image = Image.open(image_arg).convert("RGB")
-                    print(f"Loaded reference image: {image_arg} ({input_image.size[0]}x{input_image.size[1]})")
-                except Exception as e:
-                    print(f"Could not load image '{image_arg}': {e}")
-            continue
-
-        if lower_input in ('/square', '/portrait', '/landscape', '/widescreen', '/extra-tall'):
-            orientation = lower_input[1:]  # Remove the leading /
-            base_w, base_h = orientations_1k[orientation]
-            width, height = int(base_w * sizes[size]), int(base_h * sizes[size])
-            print(f"Orientation set to {orientation} ({width}x{height})")
-            continue
-
-        if lower_input in ('/0.75', '/1k', '/2k', '/4k'):
-            size = lower_input[1:]  # Remove the leading /
-            base_w, base_h = orientations_1k[orientation]
-            width, height = int(base_w * sizes[size]), int(base_h * sizes[size])
-            print(f"Size set to {size} ({width}x{height})")
-            continue
-
-        # Parse inline modifiers from prompt (e.g., "a cat /4k /portrait")
-        words = user_input.split()
-        modifiers_found = []
-        prompt_words = []
-        for word in words:
-            lower_word = word.lower()
-            if lower_word in ('/0.75', '/1k', '/2k', '/4k'):
-                size = lower_word[1:]
-                modifiers_found.append(f"size={size}")
-            elif lower_word in ('/square', '/portrait', '/landscape', '/widescreen', '/extra-tall'):
-                orientation = lower_word[1:]
-                modifiers_found.append(f"orientation={orientation}")
-            else:
-                prompt_words.append(word)
-
-        if modifiers_found:
-            base_w, base_h = orientations_1k[orientation]
-            width, height = int(base_w * sizes[size]), int(base_h * sizes[size])
-            print(f"Applied: {', '.join(modifiers_found)} -> {width}x{height}")
-
-        # Reconstruct prompt without modifiers
-        user_input = ' '.join(prompt_words)
-        lower_input = user_input.lower()
-
-        if not user_input:
-            # Input was only modifiers, no prompt
-            continue
-
-        if lower_input in ('same', 's') and current_prompt:
-            prompt = current_prompt
-        elif lower_input.startswith('reseed ') and current_prompt:
-            try:
-                last_seed = int(lower_input.split()[1])
-                prompt = current_prompt
-            except (ValueError, IndexError):
-                print("Invalid seed. Usage: reseed 12345")
-                continue
-        else:
-            prompt = user_input
-            current_prompt = prompt
-            last_seed = None
-
-        # Build generation info string
-        gen_info_parts = [f"{steps} steps", f"{width}x{height}"]
-        if guidance_scale:
-            gen_info_parts.append(f"guidance={guidance_scale}")
-        if input_image:
-            gen_info_parts.append(f"img2img strength={strength}")
-        gen_info = ", ".join(gen_info_parts)
-
-        print(f"\n[{hostname}] Generating: {gen_info}")
-        raw_input = user_input  # Save original input before any processing
-        image, last_seed, timings = generate_image(prompt, last_seed if lower_input.startswith('reseed ') else None, steps, width, height, use_local_encoder, input_image=input_image, strength=strength, guidance_scale=guidance_scale)
-
-        image_count += 1
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        unique_id = uuid.uuid4().hex[:8]
-        filename = f"flux{_flux_version}_{timestamp}_{unique_id}.png"
-
-        t0 = time.perf_counter()
-        image.save(filename)
-        timings['save'] = time.perf_counter() - t0
-
-        # Save prompt file alongside image
-        save_prompt_file(filename, raw_input, prompt, width, height, last_seed, steps, timings, guidance_scale, strength if input_image else None)
-
-        # Clean summary output
-        total_time = timings['total'] + timings['save']
-        print(f"[{hostname}] Saved: {filename}")
-        print(f"  seed={last_seed}, {total_time:.2f}s total (encode={timings['encoding']:.2f}s, diffuse={timings['diffusion']:.2f}s, save={timings['save']:.2f}s)")
-        play_completion_sound()
-
-if __name__ == "__main__":
-    main()
