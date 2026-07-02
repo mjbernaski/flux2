@@ -1,13 +1,22 @@
 #!/usr/bin/env python3
-"""Smoke-test every model option in run_server.sh.
+"""Smoke-test every model option in run_server.sh, with a live HTML tracker.
 
-Loads each menu configuration in-process (same arg derivation as web_server.py),
-generates one sample image with a fixed prompt, then writes an HTML report
-showing pass/fail, timings, and the resulting image for each option.
+Each menu configuration is loaded in an isolated worker subprocess (matching
+how the real server runs: one process per model), generates one sample image
+with a fixed prompt, and reports pass/fail with timings. Kontext (editor)
+options are exercised with a synthetic reference image and an edit instruction.
+
+While the sweep runs, server_smoke_test/index.html is a live tracking page:
+it auto-refreshes and shows each option as pending / running (with phase and
+elapsed time) / pass / fail. When the sweep finishes the page becomes a static
+report.
 
 Usage:
-    python smoke_test_servers.py                # test all menu options
-    python smoke_test_servers.py 1 3 10         # test only options 1, 3, 10
+    python smoke_test_servers.py                # test all 12 menu options
+    python smoke_test_servers.py 1 3 9          # test only options 1, 3, 9
+
+Results merge into prior runs, so re-running a single option updates just its
+card in the report.
 """
 
 import sys
@@ -19,25 +28,30 @@ import datetime
 import traceback
 import subprocess
 
-PROMPT = "a frog on a log in bog"
-WIDTH, HEIGHT = 1024, 768          # landscape smoke-test size
-DEFAULT_STEPS = 20                 # schnell/turbo override this internally
+PROMPT = "a frog on a log in a bog"
+EDIT_PROMPT = "make the red circle blue"   # used for Kontext (editor) options
+WIDTH, HEIGHT = 1024, 768                  # landscape smoke-test size
+DEFAULT_STEPS = 20                         # schnell/turbo override this internally
 OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server_smoke_test")
 RESULTS_JSON = os.path.join(OUT_DIR, "results.json")
+POLL_INTERVAL_S = 2.0
 
 # The menu options exactly as defined in run_server.sh start_server().
 # raw_args are the flags run_server.sh passes to web_server.py.
+# kind: 'txt2img' for normal generation, 'edit' for Kontext instruction editing.
 MENU = [
-    (1,  "FLUX.1 4-bit BNB",       []),
-    (2,  "FLUX.1 Full",            ["--full-model"]),
-    (3,  "FLUX.1 GGUF Q8",         ["--gguf", "q8", "--local-encoder"]),
-    (4,  "FLUX.1-schnell",         ["--schnell", "--local-encoder"]),
-    (5,  "FLUX.2 4-bit BNB",       ["--flux2"]),
-    (6,  "FLUX.2 Full",            ["--flux2", "--full-model"]),
-    (7,  "FLUX.2 Full + Turbo",    ["--flux2", "--full-model", "--turbo"]),
-    (8,  "FLUX.1 + Uncensored",    ["--uncensored"]),
-    (9,  "FLUX.2 Full (no Turbo)", ["--flux2", "--full-model", "--no-turbo"]),
-    (10, "FLUX.2-klein-9B",        ["--klein"]),
+    (1,  "FLUX.1 4-bit BNB",              [],                                        "txt2img"),
+    (2,  "FLUX.1 Full",                   ["--full-model"],                          "txt2img"),
+    (3,  "FLUX.1 GGUF Q8",                ["--gguf", "q8", "--local-encoder"],       "txt2img"),
+    (4,  "FLUX.1-schnell",                ["--schnell", "--local-encoder"],          "txt2img"),
+    (5,  "FLUX.1 + Uncensored",           ["--uncensored"],                          "txt2img"),
+    (6,  "FLUX.2 4-bit BNB",              ["--flux2"],                               "txt2img"),
+    (7,  "FLUX.2 Full + Turbo",           ["--flux2", "--full-model", "--turbo"],    "txt2img"),
+    (8,  "FLUX.2 Full (no Turbo)",        ["--flux2", "--full-model", "--no-turbo"], "txt2img"),
+    (9,  "FLUX.2-klein-9B",               ["--klein"],                               "txt2img"),
+    (10, "FLUX.1 Kontext (editor)",       ["--kontext"],                             "edit"),
+    (11, "FLUX.1 Kontext Full (bf16)",    ["--kontext", "--full-model"],             "edit"),
+    (12, "Kontext Full + Uncensored",     ["--kontext", "--full-model", "--uncensored"], "edit"),
 ]
 
 
@@ -48,6 +62,7 @@ def derive_flags(raw_args):
     schnell = "--schnell" in raw_args
     uncensored = "--uncensored" in raw_args
     klein = "--klein" in raw_args
+    kontext = "--kontext" in raw_args
     local_encoder_flag = "--local-encoder" in raw_args
     turbo_flag = "--turbo" in raw_args
     no_turbo = "--no-turbo" in raw_args
@@ -61,7 +76,7 @@ def derive_flags(raw_args):
         flux2 = True
         full_model = True
 
-    local_encoder = local_encoder_flag or full_model or schnell or uncensored
+    local_encoder = local_encoder_flag or full_model or schnell or uncensored or kontext
     if uncensored and not full_model:
         full_model = True
     # Turbo LoRA is a FLUX.2-dev LoRA; not auto-enabled for klein (different arch)
@@ -74,6 +89,7 @@ def derive_flags(raw_args):
         "schnell": schnell,
         "uncensored": uncensored,
         "klein": klein,
+        "kontext": kontext,
         "local_encoder": local_encoder,
         "turbo": turbo,
     }
@@ -83,40 +99,69 @@ def _worker_result_path(num):
     return os.path.join(OUT_DIR, f"_result_{num:02d}.json")
 
 
-def run_config_inprocess(num, name, raw_args):
+def _worker_progress_path(num):
+    return os.path.join(OUT_DIR, f"_progress_{num:02d}.json")
+
+
+def _report_progress(num, phase):
+    """Worker side: record the current phase so the parent's live page can show it."""
+    try:
+        with open(_worker_progress_path(num), "w") as f:
+            json.dump({"phase": phase, "ts": time.time()}, f)
+    except Exception:
+        pass
+
+
+def _make_edit_reference():
+    """Synthetic reference image for Kontext: a red circle on a plain field."""
+    from PIL import Image, ImageDraw
+    img = Image.new("RGB", (WIDTH, HEIGHT), (235, 235, 220))
+    draw = ImageDraw.Draw(img)
+    cx, cy, r = WIDTH // 2, HEIGHT // 2, min(WIDTH, HEIGHT) // 4
+    draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(200, 30, 30))
+    return img
+
+
+def run_config_inprocess(num, name, raw_args, kind):
     """Load one config and generate the sample image (runs inside a worker
-    subprocess so model/GPU state is fully isolated per config — this matches
-    how the real server runs: one process per model)."""
-    import torch
-    from fl24bit import load_model, generate_image, load_turbo_lora, load_uncensored_lora
+    subprocess so model/GPU state is fully isolated per config)."""
+    _report_progress(num, "importing torch/diffusers")
+    from flux_core import load_model, generate_image, load_turbo_lora, load_uncensored_lora
 
     flags = derive_flags(raw_args)
     cmd = "python web_server.py " + " ".join(raw_args) if raw_args else "python web_server.py"
+    prompt = EDIT_PROMPT if kind == "edit" else PROMPT
     result = {
-        "num": num, "name": name, "command": cmd, "flags": flags,
-        "status": "fail", "error": None, "image": None,
+        "num": num, "name": name, "command": cmd, "flags": flags, "kind": kind,
+        "prompt": prompt, "status": "fail", "error": None, "image": None,
         "load_time": None, "gen_time": None, "seed": None, "steps": None,
     }
 
     print(f"\n{'='*64}\n[{num}] {name}\n  {cmd}\n  flags: {flags}\n{'='*64}")
     try:
+        _report_progress(num, "loading model")
         t0 = time.perf_counter()
         load_model(
             local_encoder=flags["local_encoder"], full_model=flags["full_model"],
             gguf_quant=flags["gguf_quant"], flux2=flags["flux2"],
-            schnell=flags["schnell"], for_lora=flags["uncensored"], klein=flags["klein"],
+            schnell=flags["schnell"], for_lora=flags["uncensored"],
+            klein=flags["klein"], kontext=flags["kontext"],
         )
         if flags["turbo"]:
+            _report_progress(num, "loading turbo LoRA")
             load_turbo_lora()
         if flags["uncensored"]:
+            _report_progress(num, "loading uncensored LoRA")
             load_uncensored_lora()
         result["load_time"] = time.perf_counter() - t0
         print(f"  loaded in {result['load_time']:.1f}s")
 
+        input_image = _make_edit_reference() if kind == "edit" else None
+        _report_progress(num, "generating")
         t0 = time.perf_counter()
         image, seed, _ = generate_image(
-            PROMPT, steps=DEFAULT_STEPS, width=WIDTH, height=HEIGHT,
-            local_encoder=flags["local_encoder"],
+            prompt, steps=DEFAULT_STEPS, width=WIDTH, height=HEIGHT,
+            local_encoder=flags["local_encoder"], input_image=input_image,
         )
         result["gen_time"] = time.perf_counter() - t0
         result["seed"] = seed
@@ -135,29 +180,51 @@ def run_config_inprocess(num, name, raw_args):
     return result
 
 
-def test_one(num, name, raw_args):
-    """Parent side: run one config in an isolated subprocess and return its
-    result. A crash (OOM kill, segfault) is captured as a failure rather than
-    taking down the whole sweep."""
+def _fallback_result(num, name, raw_args, kind, error):
     flags = derive_flags(raw_args)
     cmd = "python web_server.py " + " ".join(raw_args) if raw_args else "python web_server.py"
+    return {
+        "num": num, "name": name, "command": cmd, "flags": flags, "kind": kind,
+        "prompt": EDIT_PROMPT if kind == "edit" else PROMPT,
+        "status": "fail", "error": error, "image": None,
+        "load_time": None, "gen_time": None, "seed": None, "steps": None,
+    }
+
+
+def test_one(num, name, raw_args, kind, by_num, planned):
+    """Parent side: run one config in an isolated subprocess, keeping the live
+    HTML tracker updated while it runs. A crash (OOM kill, segfault) is
+    captured as a failure rather than taking down the whole sweep."""
     rpath = _worker_result_path(num)
-    if os.path.exists(rpath):
-        os.remove(rpath)
+    ppath = _worker_progress_path(num)
+    for p in (rpath, ppath):
+        if os.path.exists(p):
+            os.remove(p)
     logpath = os.path.join(OUT_DIR, f"_worker_{num:02d}.log")
 
     print(f"\n>>> [{num}] {name} — launching isolated worker...")
+    started = time.time()
     with open(logpath, "w") as logf:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             [sys.executable, os.path.abspath(__file__), "--worker", str(num)],
             stdout=logf, stderr=subprocess.STDOUT,
         )
+        while proc.poll() is None:
+            phase = "starting worker"
+            try:
+                with open(ppath) as f:
+                    phase = json.load(f).get("phase", phase)
+            except Exception:
+                pass
+            running = {"num": num, "phase": phase, "elapsed": time.time() - started}
+            write_html(by_num, planned, running=running)
+            time.sleep(POLL_INTERVAL_S)
 
     if os.path.exists(rpath):
         with open(rpath) as f:
             return json.load(f)
 
-    # Worker died before writing a result (OOM/segfault). Salvage the tail.
+    # Worker died before writing a result (OOM/segfault). Salvage the log tail.
     tail = ""
     try:
         with open(logpath) as f:
@@ -165,13 +232,9 @@ def test_one(num, name, raw_args):
     except Exception:
         pass
     sig = f"worker exited with code {proc.returncode}"
-    if proc.returncode == -9 or proc.returncode == 137:
+    if proc.returncode in (-9, 137):
         sig = "worker killed (OOM, exit 137)"
-    return {
-        "num": num, "name": name, "command": cmd, "flags": flags,
-        "status": "fail", "error": f"{sig}. Last output:\n{tail}",
-        "image": None, "load_time": None, "gen_time": None, "seed": None, "steps": None,
-    }
+    return _fallback_result(num, name, raw_args, kind, f"{sig}. Last output:\n{tail}")
 
 
 def gpu_name():
@@ -187,58 +250,94 @@ def gpu_name():
         return "GPU"
 
 
-def write_html(results):
-    generated = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    gpu = gpu_name()
-    n_pass = sum(1 for r in results if r["status"] == "pass")
+_GPU_NAME = None
 
-    cards = []
-    for r in results:
-        ok = r["status"] == "pass"
-        badge = "PASS" if ok else "FAIL"
-        badge_cls = "pass" if ok else "fail"
 
-        if ok and r["image"]:
-            media = f'<img src="{html.escape(r["image"])}" alt="{html.escape(r["name"])}">'
-        else:
-            media = (
-                '<div class="err"><div class="errlabel">ERROR</div>'
-                f'<pre>{html.escape(r["error"] or "unknown error")}</pre></div>'
-            )
+def _card_for(entry, result, running):
+    """Render one option card in whichever state it is in."""
+    num, name, raw_args, kind = entry
+    cmd = "python web_server.py " + " ".join(raw_args) if raw_args else "python web_server.py"
 
-        meta_rows = [("Command", r["command"])]
-        if r["load_time"] is not None:
-            meta_rows.append(("Load time", f"{r['load_time']:.1f}s"))
-        if r["gen_time"] is not None:
-            meta_rows.append(("Generate", f"{r['gen_time']:.1f}s"))
-        if r["seed"] is not None:
-            meta_rows.append(("Seed", str(r["seed"])))
-        meta_rows.append(("Encoder", "local" if r["flags"]["local_encoder"] else "remote API"))
-        flag_bits = [k for k in ("turbo", "uncensored", "schnell", "klein") if r["flags"][k]]
-        if r["flags"]["gguf_quant"]:
-            flag_bits.append(f"gguf:{r['flags']['gguf_quant']}")
-        meta_rows.append(("Extras", ", ".join(flag_bits) if flag_bits else "—"))
-
-        meta_html = "".join(
-            f'<tr><td class="k">{html.escape(k)}</td><td class="v">{html.escape(str(v))}</td></tr>'
-            for k, v in meta_rows
+    if running and running["num"] == num:
+        state, badge = "running", "RUNNING"
+        media = (
+            '<div class="run"><div class="spinner"></div>'
+            f'<div class="phase">{html.escape(running["phase"])}</div>'
+            f'<div class="elapsed">{running["elapsed"]:.0f}s elapsed</div></div>'
         )
+        meta_rows = [("Command", cmd)]
+    elif result is None:
+        state, badge = "pending", "PENDING"
+        media = '<div class="pend">waiting…</div>'
+        meta_rows = [("Command", cmd)]
+    elif result["status"] == "pass":
+        state, badge = "pass", "PASS"
+        media = f'<img src="{html.escape(result["image"])}" alt="{html.escape(name)}">'
+        meta_rows = [("Command", result["command"])]
+        if result.get("load_time") is not None:
+            meta_rows.append(("Load time", f"{result['load_time']:.1f}s"))
+        if result.get("gen_time") is not None:
+            meta_rows.append(("Generate", f"{result['gen_time']:.1f}s"))
+        if result.get("seed") is not None:
+            meta_rows.append(("Seed", str(result["seed"])))
+        flags = result["flags"]
+        meta_rows.append(("Encoder", "local" if flags["local_encoder"] else "remote API"))
+        flag_bits = [k for k in ("turbo", "uncensored", "schnell", "klein", "kontext") if flags.get(k)]
+        if flags.get("gguf_quant"):
+            flag_bits.append(f"gguf:{flags['gguf_quant']}")
+        meta_rows.append(("Extras", ", ".join(flag_bits) if flag_bits else "—"))
+    else:
+        state, badge = "fail", "FAIL"
+        media = (
+            '<div class="err"><div class="errlabel">ERROR</div>'
+            f'<pre>{html.escape(result.get("error") or "unknown error")}</pre></div>'
+        )
+        meta_rows = [("Command", result["command"])]
 
-        cards.append(f"""
-        <div class="card {badge_cls}">
+    if kind == "edit":
+        meta_rows.append(("Mode", "instruction edit (synthetic reference)"))
+
+    meta_html = "".join(
+        f'<tr><td class="k">{html.escape(k)}</td><td class="v">{html.escape(str(v))}</td></tr>'
+        for k, v in meta_rows
+    )
+    return f"""
+        <div class="card {state}">
           <div class="head">
-            <span class="num">{r['num']}</span>
-            <span class="title">{html.escape(r['name'])}</span>
-            <span class="badge {badge_cls}">{badge}</span>
+            <span class="num">{num}</span>
+            <span class="title">{html.escape(name)}</span>
+            <span class="badge {state}">{badge}</span>
           </div>
           <div class="media">{media}</div>
           <table class="meta">{meta_html}</table>
-        </div>""")
+        </div>"""
+
+
+def write_html(by_num, planned, running=None, done=False):
+    """(Re)write the tracking page. While the sweep runs (done=False) the page
+    auto-refreshes every few seconds; the final write drops the refresh."""
+    global _GPU_NAME
+    if _GPU_NAME is None:
+        _GPU_NAME = gpu_name()
+
+    generated = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cards = [_card_for(entry, by_num.get(entry[0]), running) for entry in planned]
+
+    results = [by_num[n] for n in sorted(by_num)]
+    n_pass = sum(1 for r in results if r["status"] == "pass")
+    n_fail = sum(1 for r in results if r["status"] != "pass")
+    n_left = sum(1 for entry in planned if entry[0] not in by_num)
+    if done:
+        state_line = f"<b>{n_pass} passed</b>, {n_fail} failed — sweep complete"
+    else:
+        state_line = f"<b>{n_pass} passed</b>, {n_fail} failed, {n_left} to go — <b class='live'>RUNNING</b>"
+    refresh = "" if done else '<meta http-equiv="refresh" content="3">'
 
     doc = f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
+{refresh}
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>FLUX server smoke test</title>
 <style>
@@ -248,11 +347,14 @@ def write_html(results):
   h1 {{ margin:0 0 4px; font-size:22px; }}
   .sub {{ color:#9aa4b2; margin-bottom:20px; }}
   .sub b {{ color:#e6e6e6; }}
+  .sub b.live {{ color:#6ab7ff; }}
   .grid {{ display:grid; gap:18px;
            grid-template-columns:repeat(auto-fill,minmax(340px,1fr)); }}
   .card {{ background:#171a21; border:1px solid #262b36; border-radius:12px;
            overflow:hidden; display:flex; flex-direction:column; }}
   .card.fail {{ border-color:#5a2230; }}
+  .card.running {{ border-color:#1f4468; }}
+  .card.pending {{ opacity:.65; }}
   .head {{ display:flex; align-items:center; gap:10px; padding:12px 14px;
            border-bottom:1px solid #262b36; }}
   .num {{ width:24px; height:24px; flex:0 0 auto; border-radius:6px; background:#262b36;
@@ -261,11 +363,22 @@ def write_html(results):
   .badge {{ font-size:11px; font-weight:700; letter-spacing:.5px; padding:3px 8px; border-radius:999px; }}
   .badge.pass {{ background:#10391f; color:#5fd98a; }}
   .badge.fail {{ background:#3d1620; color:#ff7a93; }}
+  .badge.running {{ background:#12314d; color:#6ab7ff; }}
+  .badge.pending {{ background:#262b36; color:#8b94a3; }}
   .media {{ background:#0b0d11; aspect-ratio:4/3; display:flex; align-items:center; justify-content:center; }}
   .media img {{ width:100%; height:100%; object-fit:cover; display:block; }}
   .err {{ padding:16px; width:100%; box-sizing:border-box; }}
   .errlabel {{ color:#ff7a93; font-weight:700; font-size:12px; margin-bottom:8px; }}
   .err pre {{ margin:0; white-space:pre-wrap; word-break:break-word; color:#ffb3c1; font-size:12px; }}
+  .pend {{ color:#5c6676; font-size:13px; }}
+  .run {{ text-align:center; }}
+  .run .phase {{ color:#9fc9f2; margin-top:10px; }}
+  .run .elapsed {{ color:#5c88b3; font-size:12px; margin-top:2px;
+                   font-variant-numeric:tabular-nums; }}
+  .spinner {{ width:28px; height:28px; margin:0 auto; border-radius:50%;
+              border:3px solid #1f4468; border-top-color:#6ab7ff;
+              animation:spin 1s linear infinite; }}
+  @keyframes spin {{ to {{ transform:rotate(360deg); }} }}
   table.meta {{ width:100%; border-collapse:collapse; }}
   table.meta td {{ padding:6px 14px; border-top:1px solid #20242e; vertical-align:top; }}
   td.k {{ color:#8b94a3; width:90px; }}
@@ -275,10 +388,11 @@ def write_html(results):
 <body>
   <h1>FLUX server smoke test</h1>
   <div class="sub">
-    Prompt: <b>&ldquo;{html.escape(PROMPT)}&rdquo;</b> &nbsp;·&nbsp;
+    Prompt: <b>&ldquo;{html.escape(PROMPT)}&rdquo;</b>
+    (edits: &ldquo;{html.escape(EDIT_PROMPT)}&rdquo;) &nbsp;·&nbsp;
     {WIDTH}&times;{HEIGHT} &nbsp;·&nbsp;
-    <b>{n_pass}/{len(results)}</b> options passed &nbsp;·&nbsp;
-    {html.escape(gpu)} &nbsp;·&nbsp; {generated}
+    {state_line} &nbsp;·&nbsp;
+    {html.escape(_GPU_NAME)} &nbsp;·&nbsp; {generated}
   </div>
   <div class="grid">{''.join(cards)}</div>
 </body>
@@ -319,17 +433,24 @@ def main():
                 by_num = {r["num"]: r for r in json.load(f)}
         except Exception:
             by_num = {}
+    # Re-selected options run fresh; drop their stale result from the tracker.
+    for num, *_ in selected:
+        by_num.pop(num, None)
 
-    print(f"Smoke-testing {len(selected)} option(s). Output -> {OUT_DIR}")
-    for num, name, raw_args in selected:
-        by_num[num] = test_one(num, name, raw_args)
-        # Persist + rewrite the full report after each config so partial
-        # progress is viewable and re-runs merge into prior results.
+    # The tracking page always shows the full menu, so a partial sweep still
+    # renders prior/pending state for the other options.
+    planned = MENU
+
+    print(f"Smoke-testing {len(selected)} option(s). Live report -> {os.path.join(OUT_DIR, 'index.html')}")
+    write_html(by_num, planned)
+    for num, name, raw_args, kind in selected:
+        by_num[num] = test_one(num, name, raw_args, kind, by_num, planned)
         results = [by_num[n] for n in sorted(by_num)]
         with open(RESULTS_JSON, "w") as f:
             json.dump(results, f, indent=2)
-        report = write_html(results)
+        write_html(by_num, planned)
 
+    report = write_html(by_num, planned, done=True)
     results = [by_num[n] for n in sorted(by_num)]
     print("\n" + "=" * 64)
     print("SUMMARY")
