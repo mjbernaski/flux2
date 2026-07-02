@@ -72,10 +72,15 @@ if (apiKeyInput) {
             var h = document.getElementById('hostname'); if (h) h.textContent = data.hostname || '';
             var v = document.getElementById('version'); if (v) v.textContent = 'v' + (data.version || '');
             window.__fluxVersion = data.flux_version || null;
+            window.__inpaintCapable = !!data.inpaint;
             if (typeof refreshInpaintAvailability === 'function') refreshInpaintAvailability();
             if (data.schnell) {
                 var s = document.getElementById('steps'); if (s) { s.disabled = true; s.title = 'Schnell uses fixed 4 steps'; }
                 var g = document.getElementById('guidance'); if (g) { g.disabled = true; g.title = 'Schnell requires guidance_scale=0'; }
+            }
+            if (data.negative_prompt) {
+                var np = document.getElementById('negativePromptGroup');
+                if (np) np.style.display = 'block';
             }
         })
         .catch(function() { clearTimeout(timeout); el.textContent = 'Model info unavailable (use server URL, e.g. http://localhost:2222)'; });
@@ -92,10 +97,14 @@ const generationInfo = document.getElementById('generationInfo');
 const uploadArea = document.getElementById('uploadArea');
 const inputImage = document.getElementById('inputImage');
 const uploadPlaceholder = document.getElementById('uploadPlaceholder');
-const imagePreview = document.getElementById('imagePreview');
-const previewImg = document.getElementById('previewImg');
-const clearImage = document.getElementById('clearImage');
+const refThumbs = document.getElementById('refThumbs');
+const multiRefHint = document.getElementById('multiRefHint');
 
+const MAX_REFERENCE_IMAGES = 3;
+// Data URLs of the uploaded references, in order. The first is the primary
+// (drives output aspect ratio and inpainting). currentInputImage mirrors the
+// primary for the inpaint code paths, which only ever work on one image.
+let currentInputImages = [];
 let currentInputImage = null;
 const strengthControl = document.getElementById('strengthControl');
 const aspectModeControl = document.getElementById('aspectModeControl');
@@ -228,18 +237,78 @@ async function saveHidden(el, filename) {
     }
 }
 
+// Re-render the reference thumbnails and every control whose visibility
+// depends on how many references are loaded.
+function syncRefUI() {
+    currentInputImage = currentInputImages[0] || null;
+    if (refThumbs) {
+        refThumbs.innerHTML = '';
+        currentInputImages.forEach(function(dataUrl, i) {
+            const thumb = document.createElement('div');
+            thumb.className = 'ref-thumb';
+            const img = document.createElement('img');
+            img.src = dataUrl;
+            img.alt = 'Reference ' + (i + 1);
+            const badge = document.createElement('span');
+            badge.className = 'ref-badge';
+            badge.textContent = i + 1;
+            const rm = document.createElement('button');
+            rm.type = 'button';
+            rm.className = 'clear-btn';
+            rm.textContent = 'X';
+            rm.title = 'Remove this reference';
+            rm.addEventListener('click', function(e) {
+                e.stopPropagation();
+                currentInputImages.splice(i, 1);
+                syncRefUI();
+            });
+            thumb.appendChild(img);
+            thumb.appendChild(badge);
+            thumb.appendChild(rm);
+            refThumbs.appendChild(thumb);
+        });
+    }
+    const n = currentInputImages.length;
+    if (uploadArea) uploadArea.style.display = n >= MAX_REFERENCE_IMAGES ? 'none' : 'block';
+    if (uploadPlaceholder) {
+        const span = uploadPlaceholder.querySelector('span');
+        if (span) span.textContent = n === 0
+            ? 'Click or drag up to 3 images here'
+            : `+ Add image (${n}/${MAX_REFERENCE_IMAGES})`;
+    }
+    // Strength only applies to single-image FLUX.1 img2img; multi-reference
+    // runs through Kontext/FLUX.2 conditioning, which ignores it.
+    if (strengthControl) strengthControl.style.display = n === 1 ? 'flex' : 'none';
+    if (aspectModeControl) aspectModeControl.style.display = n > 0 ? 'block' : 'none';
+    if (multiRefHint) multiRefHint.style.display = n > 1 ? 'block' : 'none';
+    if (inputImage) inputImage.value = '';
+    if (typeof refreshInpaintAvailability === 'function') refreshInpaintAvailability();
+}
+
 function handleImageFile(file) {
+    if (currentInputImages.length >= MAX_REFERENCE_IMAGES) return;
     var reader = new FileReader();
     reader.onload = function(e) {
-        currentInputImage = e.target.result;
-        if (previewImg) previewImg.src = currentInputImage;
-        if (uploadPlaceholder) uploadPlaceholder.style.display = 'none';
-        if (imagePreview) imagePreview.style.display = 'block';
-        if (strengthControl) strengthControl.style.display = 'flex';
-        if (aspectModeControl) aspectModeControl.style.display = 'block';
-        if (typeof refreshInpaintAvailability === 'function') refreshInpaintAvailability();
-        };
-        reader.readAsDataURL(file);        }
+        if (currentInputImages.length >= MAX_REFERENCE_IMAGES) return;
+        currentInputImages.push(e.target.result);
+        syncRefUI();
+    };
+    reader.readAsDataURL(file);
+}
+
+function addImageFiles(fileList) {
+    Array.from(fileList || [])
+        .filter(function(f) { return f && f.type.indexOf('image/') === 0; })
+        .slice(0, Math.max(0, MAX_REFERENCE_IMAGES - currentInputImages.length))
+        .forEach(handleImageFile);
+}
+
+function clearRefs() {
+    currentInputImages = [];
+    syncRefUI();
+    if (typeof resetInpaint === 'function') resetInpaint();
+}
+
 if (uploadArea) {
     uploadArea.addEventListener('click', function() { if (inputImage) inputImage.click(); });
     uploadArea.addEventListener('dragover', function(e) { e.preventDefault(); uploadArea.classList.add('dragover'); });
@@ -247,22 +316,10 @@ if (uploadArea) {
     uploadArea.addEventListener('drop', function(e) {
         e.preventDefault();
         uploadArea.classList.remove('dragover');
-        var file = e.dataTransfer.files[0];
-        if (file && file.type.indexOf('image/') === 0) handleImageFile(file);
+        addImageFiles(e.dataTransfer.files);
     });
 }
-if (inputImage) inputImage.addEventListener('change', function(e) { var f = e.target.files[0]; if (f) handleImageFile(f); });
-if (clearImage) clearImage.addEventListener('click', function(e) {
-    e.stopPropagation();
-    currentInputImage = null;
-    if (previewImg) previewImg.src = '';
-    if (inputImage) inputImage.value = '';
-    if (uploadPlaceholder) uploadPlaceholder.style.display = 'flex';
-    if (imagePreview) imagePreview.style.display = 'none';
-    if (strengthControl) strengthControl.style.display = 'none';
-    if (aspectModeControl) aspectModeControl.style.display = 'none';
-    if (typeof resetInpaint === 'function') resetInpaint();
-});
+if (inputImage) inputImage.addEventListener('change', function(e) { addImageFiles(e.target.files); });
 
 // ---- Inpainting brush (FLUX.2 only) ----
 const inpaintControl = document.getElementById('inpaintControl');
@@ -281,7 +338,9 @@ let lastPt = null;
 
 function refreshInpaintAvailability() {
     if (!inpaintControl) return;
-    const ok = !!currentInputImage && window.__fluxVersion === 2;
+    // Inpainting works on exactly one image (the mask applies to the primary).
+    const ok = currentInputImages.length === 1
+        && (window.__fluxVersion === 2 || window.__inpaintCapable);
     inpaintControl.style.display = ok ? 'block' : 'none';
     if (!ok && inpaintMode && inpaintMode.checked) {
         inpaintMode.checked = false;
@@ -373,7 +432,7 @@ if (inpaintCanvas) {
 }
 
 function inpaintActive() {
-    return !!(inpaintMode && inpaintMode.checked && currentInputImage && window.__fluxVersion === 2);
+    return !!(inpaintMode && inpaintMode.checked && currentInputImages.length === 1 && window.__fluxVersion === 2);
 }
 // Returns a black/white mask data URL (white = regenerate), or null if nothing painted.
 function getMaskDataURL() {
@@ -451,17 +510,10 @@ if (resetBtn) resetBtn.addEventListener('click', async function() {
     var sd = document.getElementById('seed'); if (sd) sd.value = '';
     var gu = document.getElementById('guidance'); if (gu) gu.value = '4';
     var b = document.getElementById('batch'); if (b) b.value = '1';
-    currentInputImage = null;
-    if (previewImg) previewImg.src = '';
-    if (inputImage) inputImage.value = '';
-    if (uploadPlaceholder) uploadPlaceholder.style.display = 'flex';
-    if (imagePreview) imagePreview.style.display = 'none';
     if (strengthSlider) strengthSlider.value = '0.5';
     if (strengthValue) strengthValue.textContent = '0.5';
-    if (strengthControl) strengthControl.style.display = 'none';
-    if (aspectModeControl) aspectModeControl.style.display = 'none';
     if (aspectModeEl) aspectModeEl.value = 'keep';
-    if (typeof resetInpaint === 'function') resetInpaint();
+    clearRefs();
     var sg = document.getElementById('spectrumGrid'); if (sg) sg.checked = false;
     var sss = document.getElementById('spectrumSameSeed'); if (sss) sss.checked = false;
     var spv = document.getElementById('showPreview'); if (spv) spv.checked = true;
@@ -517,6 +569,7 @@ function renderQueueItem(job, position) {
     if (job.size) metaParts.push(job.size);
     if (job.steps) metaParts.push(`${job.steps} steps`);
     if (job.batch && job.batch > 1) metaParts.push(`×${job.batch}`);
+    if (job.refs > 0) metaParts.push(`${job.refs} ref${job.refs > 1 ? 's' : ''}`);
     if (job.spectrum_grid) metaParts.push('spectrum');
     const meta = metaParts.join(' · ');
     const el = document.createElement('div');
@@ -768,8 +821,11 @@ async function doGenerate() {
     const allOrientationsEl = document.getElementById('allOrientations');
     const allOrientations = allOrientationsEl ? allOrientationsEl.checked : false;
 
+    const negativeEl = document.getElementById('negativePrompt');
     const baseFormData = {
         prompt: promptEl ? promptEl.value : '',
+        // SDXL only; the field is hidden (and stays empty) on FLUX servers.
+        negative_prompt: negativeEl && negativeEl.value.trim() ? negativeEl.value.trim() : null,
         orientation: orientationEl ? orientationEl.value : 'landscape',
         size: sizeEl ? sizeEl.value : '1mp',
         steps: stepsEl ? parseInt(stepsEl.value, 10) : 25,
@@ -781,9 +837,12 @@ async function doGenerate() {
         show_preview: showPreview,
         selected_cells: Array.from(selectedCells)
     };
-    if (currentInputImage && strengthSlider) {
-        baseFormData.input_image = currentInputImage;
-        baseFormData.strength = parseFloat(strengthSlider.value);
+    if (currentInputImages.length > 0) {
+        baseFormData.input_images = currentInputImages.slice(0, MAX_REFERENCE_IMAGES);
+        // Legacy single-image field too, so this UI still works against an
+        // older server that predates input_images (new servers ignore it).
+        baseFormData.input_image = currentInputImages[0];
+        if (strengthSlider) baseFormData.strength = parseFloat(strengthSlider.value);
         baseFormData.aspect_mode = aspectModeEl ? aspectModeEl.value : 'keep';
     }
 
@@ -797,11 +856,14 @@ async function doGenerate() {
             statusText.textContent = 'Inpaint: paint a region to regenerate first.';
             return;
         }
-        baseFormData.input_image = currentInputImage;
+        baseFormData.input_images = [currentInputImage];
+        baseFormData.input_image = currentInputImage;  // legacy-server compat
         baseFormData.mask_image = maskUrl;
         baseFormData.aspect_mode = 'keep';
         baseFormData.spectrum_grid = false;
-        delete baseFormData.strength;
+        // FLUX.2's masked diffusion ignores strength; SDXL inpainting uses it
+        // as the denoise level for the masked region, so keep the slider value.
+        if (window.__fluxVersion === 2) delete baseFormData.strength;
         inpaintOn = true;
     }
 
@@ -1002,4 +1064,291 @@ if (promptAutoGrow) {
 }
 
 loadHistory();
+
+// ---- Edit loop ----
+// Iteratively: generate an edit from the first reference image, ask the
+// server's /critique endpoint (local vision model) whether it landed, revise
+// the instruction, repeat. Runs through the normal generation queue, so the
+// main status panel shows live progress and outputs land in history as usual.
+const loopStartBtn = document.getElementById('loopStartBtn');
+const loopStopBtn = document.getElementById('loopStopBtn');
+const loopContinueBtn = document.getElementById('loopContinueBtn');
+const loopAcceptBtn = document.getElementById('loopAcceptBtn');
+const loopStatusEl = document.getElementById('loopStatus');
+const loopCards = document.getElementById('loopCards');
+const loopControls = document.getElementById('loopControls');
+const loopNextPrompt = document.getElementById('loopNextPrompt');
+
+let loopRun = null;  // { stop, decision } — state of the active loop
+
+function loopSetStatus(msg, cls) {
+    if (!loopStatusEl) return;
+    loopStatusEl.style.display = msg ? 'block' : 'none';
+    loopStatusEl.textContent = msg || '';
+    loopStatusEl.className = 'edit-loop-status' + (cls ? ' ' + cls : '');
+}
+
+async function loopSubmitJob(prompt, refDataUrl) {
+    const stepsEl = document.getElementById('steps');
+    const guidanceEl = document.getElementById('guidance');
+    const showPreviewEl = document.getElementById('showPreview');
+    const response = await fetch('/generate', {
+        method: 'POST',
+        headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({
+            prompt: prompt,
+            input_images: [refDataUrl],
+            input_image: refDataUrl,   // legacy-server compat
+            batch: 1,
+            steps: stepsEl ? parseInt(stepsEl.value, 10) : 25,
+            guidance: guidanceEl && guidanceEl.value ? parseFloat(guidanceEl.value) : null,
+            aspect_mode: 'keep',
+            show_preview: showPreviewEl ? showPreviewEl.checked : false
+        })
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.success) throw new Error(data.error || `HTTP ${response.status}`);
+    return data.job_id;
+}
+
+async function loopAwaitJob(jobId) {
+    for (;;) {
+        await new Promise(r => setTimeout(r, 2000));
+        const res = await fetch('/status', { headers: getAuthHeaders() });
+        const st = await res.json();
+        const done = (st.recent_done || []).find(j => j.id === jobId);
+        if (done) {
+            if (done.state !== 'done' || done.error) {
+                throw new Error(done.error || `job ${done.state}`);
+            }
+            return done.images[0].filename;
+        }
+        if (loopRun && loopRun.stop) {
+            // Cancel if it's still queued; a running job has to finish on its own.
+            await fetch('/jobs/' + jobId + '/cancel', {
+                method: 'POST', headers: getAuthHeaders()
+            }).catch(() => {});
+            throw new Error('stopped');
+        }
+    }
+}
+
+async function loopFetchAsDataUrl(filename) {
+    const res = await fetch('/images/' + filename, { headers: getAuthHeaders() });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const blob = await res.blob();
+    return await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = e => resolve(e.target.result);
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+    });
+}
+
+function loopAddCard(iter, prompt, filename) {
+    const card = document.createElement('div');
+    card.className = 'loop-card';
+    const img = document.createElement('img');
+    img.src = '/images/' + filename;
+    img.alt = 'Iteration ' + iter;
+    img.addEventListener('click', () => window.open('/images/' + filename, '_blank'));
+    const body = document.createElement('div');
+    body.className = 'loop-card-body';
+    const title = document.createElement('div');
+    title.className = 'loop-card-title';
+    title.textContent = `Iteration ${iter}`;
+    const promptLine = document.createElement('div');
+    promptLine.className = 'loop-card-prompt';
+    promptLine.textContent = prompt;
+    const verdict = document.createElement('div');
+    verdict.className = 'loop-card-verdict';
+    verdict.textContent = 'Looking at the result…';
+    // Backtrack: make this iteration's output the base for the next one
+    // (e.g. go back two versions after a chain went off the rails).
+    const baseBtn = document.createElement('button');
+    baseBtn.type = 'button';
+    baseBtn.className = 'loop-base-btn';
+    baseBtn.textContent = '⏪ Base for next iteration';
+    baseBtn.addEventListener('click', function() {
+        if (!loopRun) return;
+        loopRun.nextRefFilename = filename;
+        document.querySelectorAll('.loop-card.base-selected')
+            .forEach(c => c.classList.remove('base-selected'));
+        card.classList.add('base-selected');
+        loopSetStatus(`Next iteration will start from iteration ${iter}'s output.`);
+    });
+    body.appendChild(title);
+    body.appendChild(promptLine);
+    body.appendChild(verdict);
+    body.appendChild(baseBtn);
+    card.appendChild(img);
+    card.appendChild(body);
+    loopCards.appendChild(card);
+    card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    return verdict;
+}
+
+// Pause until the user picks: continue (with possibly edited instruction),
+// accept, or stop. Resolves to 'continue' | 'accept' | 'stop'.
+function loopAwaitDecision() {
+    loopControls.style.display = 'block';
+    return new Promise(resolve => {
+        loopRun.decision = resolve;
+    }).finally(() => {
+        loopControls.style.display = 'none';
+        if (loopRun) loopRun.decision = null;
+    });
+}
+
+async function runEditLoop() {
+    const direction = (document.getElementById('loopDirection').value || '').trim();
+    const maxIter = parseInt(document.getElementById('loopIterations').value, 10);
+    const auto = document.getElementById('loopAuto').checked;
+    const chain = document.getElementById('loopChain').checked;
+
+    if (!direction) { alert('Enter an edit direction first.'); return; }
+    if (!currentInputImages.length) {
+        alert('Upload a reference image first (the loop edits the first one).');
+        return;
+    }
+
+    loopRun = { stop: false, decision: null, nextRefFilename: null };
+    loopStartBtn.style.display = 'none';
+    loopStopBtn.style.display = 'inline-block';
+    loopCards.innerHTML = '';
+
+    const originalRef = currentInputImages[0];
+    let refDataUrl = originalRef;
+    let prompt = direction;
+    const completed = [];   // {filename, prompt} per finished iteration
+    let makeStrip = false;  // set on Accept & finish or natural completion
+    try {
+        for (let i = 1; i <= maxIter && !loopRun.stop; i++) {
+            loopSetStatus(`Iteration ${i}/${maxIter}: generating…`);
+            const jobId = await loopSubmitJob(prompt, refDataUrl);
+            const filename = await loopAwaitJob(jobId);
+            completed.push({ filename: filename, prompt: prompt });
+            const verdictEl = loopAddCard(i, prompt, filename);
+
+            loopSetStatus(`Iteration ${i}/${maxIter}: comparing input and output…`);
+            let critique = null;
+            try {
+                const res = await fetch('/critique', {
+                    method: 'POST',
+                    headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+                    body: JSON.stringify({
+                        direction: direction,
+                        prompt: prompt,
+                        ref_image: refDataUrl,
+                        output_filename: filename
+                    })
+                });
+                critique = await res.json();
+                if (!res.ok || !critique.success) throw new Error(critique.error || `HTTP ${res.status}`);
+            } catch (err) {
+                critique = null;
+                verdictEl.textContent = 'Critique unavailable: ' + err.message;
+            }
+
+            let nextPrompt = prompt;
+            if (critique) {
+                const appliedTxt = critique.applied === null ? ''
+                    : (critique.applied ? '✔ edit applied — ' : '✘ edit NOT applied — ');
+                verdictEl.textContent = appliedTxt + (critique.critique || '') +
+                    ' [' + (critique.metrics_text || '') + ']';
+                verdictEl.classList.add(critique.applied === false ? 'not-applied' : 'applied');
+                nextPrompt = critique.revised_prompt || prompt;
+            }
+            loopNextPrompt.value = nextPrompt;
+
+            if (loopRun.stop) break;
+            if (i === maxIter) { makeStrip = true; break; }
+
+            if (auto) {
+                prompt = nextPrompt;
+            } else {
+                loopSetStatus(`Iteration ${i}/${maxIter} done — adjust the next instruction or continue.`);
+                const decision = await loopAwaitDecision();
+                if (decision === 'accept') { makeStrip = true; break; }
+                if (decision === 'stop') break;
+                prompt = (loopNextPrompt.value || '').trim() || nextPrompt;
+            }
+            // Base for the next round: an explicit backtrack pick wins, then
+            // chain mode follows the newest output, else stay on the original.
+            if (loopRun.nextRefFilename) {
+                refDataUrl = loopRun.nextRefFilename === '__original__'
+                    ? originalRef
+                    : await loopFetchAsDataUrl(loopRun.nextRefFilename);
+                loopRun.nextRefFilename = null;
+            } else if (chain) {
+                refDataUrl = await loopFetchAsDataUrl(filename);
+            }
+        }
+
+        if (makeStrip && completed.length) {
+            loopSetStatus('Saving iterations and creating film strip…');
+            try {
+                const res = await fetch('/loop-strip', {
+                    method: 'POST',
+                    headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+                    body: JSON.stringify({
+                        direction: direction,
+                        ref_image: originalRef,
+                        filenames: completed.map(c => c.filename),
+                        prompts: completed.map(c => c.prompt)
+                    })
+                });
+                const body = await res.json();
+                if (!res.ok || !body.success) throw new Error(body.error || `HTTP ${res.status}`);
+                const stripCard = document.createElement('div');
+                stripCard.className = 'loop-strip';
+                const title = document.createElement('div');
+                title.className = 'loop-card-title';
+                title.textContent = 'Film strip — input plus each edit in sequence (iterations preserved in .hidden)';
+                const img = document.createElement('img');
+                img.src = '/images/' + body.filename;
+                img.alt = 'Edit loop film strip';
+                img.addEventListener('click', () => window.open('/images/' + body.filename, '_blank'));
+                stripCard.appendChild(title);
+                stripCard.appendChild(img);
+                loopCards.appendChild(stripCard);
+                stripCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            } catch (err) {
+                loopSetStatus('Film strip failed: ' + err.message, 'error');
+            }
+        }
+        loopSetStatus(loopRun.stop ? 'Loop stopped.' : 'Loop finished — outputs are in the history below.', 'done');
+    } catch (err) {
+        loopSetStatus(err.message === 'stopped' ? 'Loop stopped.' : 'Loop error: ' + err.message,
+                      err.message === 'stopped' ? 'done' : 'error');
+    } finally {
+        loopControls.style.display = 'none';
+        loopStopBtn.style.display = 'none';
+        loopStartBtn.style.display = 'inline-block';
+        loopRun = null;
+        loadHistory();
+    }
+}
+
+if (loopStartBtn) loopStartBtn.addEventListener('click', runEditLoop);
+if (loopStopBtn) loopStopBtn.addEventListener('click', function() {
+    if (!loopRun) return;
+    loopRun.stop = true;
+    if (loopRun.decision) loopRun.decision('stop');
+    loopSetStatus('Stopping after the current step…');
+});
+if (loopContinueBtn) loopContinueBtn.addEventListener('click', function() {
+    if (loopRun && loopRun.decision) loopRun.decision('continue');
+});
+const loopBaseOriginalBtn = document.getElementById('loopBaseOriginalBtn');
+if (loopBaseOriginalBtn) loopBaseOriginalBtn.addEventListener('click', function() {
+    if (!loopRun) return;
+    loopRun.nextRefFilename = '__original__';
+    document.querySelectorAll('.loop-card.base-selected')
+        .forEach(c => c.classList.remove('base-selected'));
+    loopSetStatus('Next iteration will start from the original image.');
+});
+if (loopAcceptBtn) loopAcceptBtn.addEventListener('click', function() {
+    if (loopRun && loopRun.decision) loopRun.decision('accept');
+});
 

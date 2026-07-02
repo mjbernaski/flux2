@@ -254,6 +254,7 @@ button:disabled {
     display: flex;
     gap: 20px;
     align-items: flex-start;
+    flex-wrap: wrap;
 }
 .image-upload-area {
     flex: 0 0 200px;
@@ -277,16 +278,52 @@ button:disabled {
     text-align: center;
     padding: 10px;
 }
-.image-preview {
-    width: 100%;
-    height: 100%;
-    position: relative;
+.ref-strip {
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+    flex-wrap: wrap;
 }
-.image-preview img {
+.ref-thumbs {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+.ref-thumb {
+    position: relative;
+    width: 150px;
+    height: 150px;
+    border: 1px solid #333;
+    border-radius: 8px;
+    overflow: hidden;
+    background: #0a0a15;
+}
+.ref-thumb img {
     width: 100%;
     height: 100%;
     object-fit: contain;
-    background: #0a0a15;
+}
+.ref-badge {
+    position: absolute;
+    top: 5px;
+    left: 5px;
+    width: 22px;
+    height: 22px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 212, 255, 0.85);
+    color: #000;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: bold;
+}
+.multi-ref-hint {
+    flex-basis: 100%;
+    font-size: 12px;
+    color: #888;
+    margin-top: 8px;
+    line-height: 1.5;
 }
 .clear-btn {
     position: absolute;
@@ -633,6 +670,104 @@ button:disabled {
     align-items: center;
     gap: 8px;
 }
+/* Edit loop */
+.edit-loop-section {
+    margin: 20px 0;
+    padding: 15px;
+    background: #2d2d44;
+    border-radius: 8px;
+    border: 1px solid #3d3d5c;
+}
+.edit-loop-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    cursor: pointer;
+}
+.edit-loop-title {
+    color: #00d4ff;
+    font-size: 14px;
+    font-weight: bold;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.edit-loop-hint {
+    font-size: 12px;
+    color: #aaa;
+    margin: 0 0 12px;
+}
+.edit-loop-status {
+    margin: 12px 0;
+    padding: 8px 12px;
+    border-radius: 6px;
+    background: #1f1f33;
+    color: #ccc;
+    font-size: 13px;
+}
+.edit-loop-status.done { color: #7fdc9a; }
+.edit-loop-status.error { color: #ff8a8a; }
+.loop-card {
+    display: flex;
+    gap: 12px;
+    margin-top: 12px;
+    padding: 10px;
+    background: #1f1f33;
+    border-radius: 8px;
+    border: 1px solid #3d3d5c;
+}
+.loop-card img {
+    max-width: 180px;
+    max-height: 240px;
+    border-radius: 6px;
+    cursor: pointer;
+    object-fit: contain;
+    align-self: flex-start;
+}
+.loop-card-body { flex: 1; min-width: 0; }
+.loop-card-title { font-weight: bold; color: #00d4ff; font-size: 13px; }
+.loop-card-prompt { color: #ddd; font-size: 13px; margin: 6px 0; }
+.loop-card-verdict { color: #aaa; font-size: 12px; }
+.loop-card-verdict.applied { color: #7fdc9a; }
+.loop-card-verdict.not-applied { color: #ffb86b; }
+.edit-loop-controls {
+    margin-top: 12px;
+    padding: 12px;
+    background: #1f1f33;
+    border-radius: 8px;
+    border: 1px solid #00d4ff44;
+}
+.edit-loop-controls textarea { width: 100%; }
+.loop-strip {
+    margin-top: 12px;
+    padding: 10px;
+    background: #1f1f33;
+    border-radius: 8px;
+    border: 1px solid #3d3d5c;
+}
+.loop-strip img {
+    width: 100%;
+    border-radius: 6px;
+    cursor: pointer;
+    margin-top: 6px;
+}
+.loop-base-btn {
+    margin-top: 8px;
+    padding: 4px 10px;
+    font-size: 12px;
+    background: #2d2d44;
+    color: #ccc;
+    border: 1px solid #3d3d5c;
+    border-radius: 5px;
+    cursor: pointer;
+}
+.loop-base-btn:hover { border-color: #00d4ff; color: #fff; }
+.loop-card.base-selected { border-color: #00d4ff; }
+.loop-card.base-selected .loop-base-btn {
+    border-color: #00d4ff;
+    color: #00d4ff;
+}
+
 .loading-overlay {
     position: fixed;
     inset: 0;

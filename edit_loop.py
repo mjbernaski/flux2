@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+"""Iterative image-edit loop against the FLUX web server.
+
+Takes an input image and an edit direction, runs the edit through the server
+(Kontext or FLUX.2), inspects the output, revises the instruction, and tries
+again — up to N iterations, stoppable between any two.
+
+The "look at the output" step is pluggable:
+  - a local ollama vision model (--vlm, default gemma4:e2b) compares the
+    reference and the output and proposes a revised instruction, entirely
+    on-box (no cloud), so any content stays local;
+  - with --vlm none (or if ollama is unreachable) the loop falls back to
+    pixel metrics plus your own typed feedback.
+
+Each iteration re-edits the ORIGINAL image with a refined instruction, so
+failed attempts don't compound. Pass --chain to instead feed each output in
+as the next iteration's input (for progressive multi-step edits).
+
+Usage:
+  python edit_loop.py photo.png "make her hair brown" -n 5
+  python edit_loop.py photo.png "remove the background clutter" --auto
+  python edit_loop.py photo.png "add sunglasses" --chain --vlm none
+"""
+
+import argparse
+import base64
+import io
+import json
+import os
+import re
+import shutil
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
+
+from PIL import Image
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SESSIONS_DIR = os.path.join(SCRIPT_DIR, "edit-loop-sessions")
+
+KONTEXT_PROMPT_TIPS = (
+    "Kontext instruction tips: use a direct imperative ('Change X to Y', "
+    "'Remove X'), name the subject concretely, describe the desired result "
+    "explicitly rather than what to undo, and end with 'keep everything else "
+    "exactly the same' to preserve the rest of the scene."
+)
+
+SDXL_PROMPT_TIPS = (
+    "SDXL prompt tips: this model has NO instruction understanding — the "
+    "prompt must be a DESCRIPTION of the desired final image (subject, "
+    "setting, clothing/appearance, lighting, 'photorealistic'), never a "
+    "command like 'remove X' or 'change Y'. Naming an object in the prompt "
+    "pulls it INTO the image, so describe what should be there instead of "
+    "what to take away."
+)
+
+PROMPT_TIPS = {"instruction": KONTEXT_PROMPT_TIPS, "description": SDXL_PROMPT_TIPS}
+
+
+def load_api_key():
+    key = os.environ.get("FLUX_API_KEY")
+    if key:
+        return key
+    env_path = os.path.join(SCRIPT_DIR, ".env")
+    if os.path.exists(env_path):
+        for line in open(env_path):
+            if line.startswith("FLUX_API_KEY="):
+                return line.split("=", 1)[1].strip()
+    return None
+
+
+def api(server, path, key, payload=None, timeout=30):
+    req = urllib.request.Request(
+        server.rstrip("/") + path,
+        data=json.dumps(payload).encode() if payload is not None else None,
+        headers={"Content-Type": "application/json", "X-API-Key": key},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
+def fetch_image(server, filename, key):
+    req = urllib.request.Request(
+        server.rstrip("/") + "/images/" + filename,
+        headers={"X-API-Key": key},
+    )
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return Image.open(io.BytesIO(r.read())).convert("RGB")
+
+
+def submit_edit(server, key, prompt, image, steps, guidance, seed):
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    payload = {
+        "prompt": prompt,
+        "input_images": [base64.b64encode(buf.getvalue()).decode()],
+        "steps": steps,
+        "batch": 1,
+    }
+    if guidance is not None:
+        payload["guidance"] = guidance
+    if seed is not None:
+        payload["seed"] = seed
+    resp = api(server, "/generate", key, payload)
+    if not resp.get("success"):
+        raise RuntimeError(f"generate failed: {resp.get('error')}")
+    return resp["job_id"]
+
+
+def wait_for_job(server, key, job_id, poll=5):
+    """Poll /status until the job finishes; returns the job record."""
+    spinner = "|/-\\"
+    tick = 0
+    while True:
+        st = api(server, "/status", key)
+        for j in st.get("recent_done") or []:
+            if j["id"] == job_id:
+                print()  # end the progress line
+                if j.get("state") != "done" or j.get("error"):
+                    raise RuntimeError(f"job {job_id} {j.get('state')}: {j.get('error')}")
+                return j
+        running = st.get("running")
+        if running and running.get("id") == job_id:
+            step, total = running.get("step", 0), running.get("total_steps", 0)
+            msg = f"generating {step}/{total}"
+        else:
+            pos = next((i + 1 for i, q in enumerate(st.get("queued") or [])
+                        if q.get("id") == job_id), None)
+            msg = f"queued (position {pos})" if pos else "waiting"
+        print(f"\r  {spinner[tick % 4]} {msg}   ", end="", flush=True)
+        tick += 1
+        time.sleep(poll)
+
+
+def edit_metrics(reference, output):
+    """Cheap structural metrics: how anchored is the output, how much changed."""
+    import numpy as np
+
+    small = (64, 64)
+    a = np.asarray(reference.resize(small).convert("L"), float).ravel()
+    b = np.asarray(output.resize(small).convert("L"), float).ravel()
+    corr = float(np.corrcoef(a, b)[0, 1])
+
+    out_r = output.resize(reference.size)
+    diff = abs(
+        np.asarray(reference, float) - np.asarray(out_r, float)
+    ).mean(axis=2)
+    changed_pct = float((diff > 20).mean() * 100)
+    return {"anchoring": round(corr, 3), "changed_pct": round(changed_pct, 1)}
+
+
+def describe_metrics(m):
+    notes = []
+    if m["changed_pct"] < 1.0:
+        notes.append("the output is nearly identical to the input — the edit "
+                      "was likely NOT applied")
+    elif m["anchoring"] < 0.5:
+        notes.append("the output shares little structure with the input — it "
+                      "looks regenerated rather than edited")
+    else:
+        notes.append("the output is anchored to the input with a localized change")
+    return f"{m['changed_pct']}% of pixels changed, structural anchoring " \
+           f"{m['anchoring']} (1.0 = identical layout). " + "; ".join(notes)
+
+
+def img_b64(image, max_side=896):
+    im = image.copy()
+    im.thumbnail((max_side, max_side))
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def vlm_critique(model, direction, prompt, reference, output, metrics,
+                 ollama_url="http://127.0.0.1:11434", style="instruction"):
+    """Ask a local ollama vision model whether the edit landed and how to
+    rephrase the prompt. `style` picks the prompting idiom of the backend:
+    'instruction' (Kontext edit commands) or 'description' (SDXL scene
+    descriptions). Returns dict or None on any failure."""
+    if style == "description":
+        backend_line = ("You are refining a prompt for SDXL img2img: the FIRST "
+                        "image is the starting image; the SECOND is the result "
+                        "of re-rendering it with the prompt.")
+        revised_hint = ("<improved DESCRIPTIVE prompt of the desired final "
+                        "image to try next; one sentence, no commands>")
+    else:
+        backend_line = ("You are refining an edit instruction for an "
+                        "instruction-based image editor (FLUX.1-Kontext). The "
+                        "FIRST image is the reference; the SECOND is the "
+                        "editor's output.")
+        revised_hint = ("<improved instruction to try next; keep it one "
+                        "imperative sentence>")
+    ask = (
+        f"{backend_line}\n"
+        f"The user's goal: {direction}\n"
+        f"The prompt used: {prompt}\n"
+        f"Pixel metrics: {describe_metrics(metrics)}\n"
+        f"{PROMPT_TIPS.get(style, KONTEXT_PROMPT_TIPS)}\n"
+        "Compare the images. Reply with STRICT JSON only, no prose:\n"
+        '{"applied": true|false, "critique": "<one sentence: what did or '
+        f'did not change vs the goal>", "revised_prompt": "{revised_hint}"}}'
+    )
+    payload = {
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": ask,
+            "images": [img_b64(reference), img_b64(output)],
+        }],
+        "stream": False,
+        "options": {"temperature": 0.3},
+    }
+    try:
+        req = urllib.request.Request(
+            ollama_url.rstrip("/") + "/api/chat",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=300) as r:
+            text = json.loads(r.read().decode())["message"]["content"]
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        result = json.loads(match.group(0)) if match else None
+        if result and result.get("revised_prompt"):
+            return result
+        print(f"  (VLM reply had no usable JSON: {text[:200]})")
+    except Exception as e:
+        print(f"  (VLM critique unavailable: {e})")
+    return None
+
+
+def _label_font(size):
+    from PIL import ImageFont
+    for path in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    ):
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                pass
+    return ImageFont.load_default()
+
+
+def build_film_strip(frames, frame_h=512, gap=8):
+    """Compose labeled frames into one horizontal film strip.
+
+    frames: list of (label, PIL.Image) in sequence order — typically
+    ('input', original) followed by ('1', ...), ('2', ...). Frames are scaled
+    to a common height, preserving each aspect ratio.
+    """
+    from PIL import ImageDraw
+
+    scaled = [(label, im.resize((max(1, round(im.width * frame_h / im.height)), frame_h)))
+              for label, im in frames]
+    total_w = sum(im.width for _, im in scaled) + gap * (len(scaled) + 1)
+    strip = Image.new("RGB", (total_w, frame_h + 2 * gap), (16, 16, 26))
+    draw = ImageDraw.Draw(strip)
+    font = _label_font(24)
+    x = gap
+    for label, im in scaled:
+        strip.paste(im, (x, gap))
+        bbox = draw.textbbox((0, 0), label, font=font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        pad = 5
+        draw.rectangle([x + 6 - pad, gap + 6 - pad, x + 6 + tw + pad, gap + 6 + th + pad],
+                       fill=(0, 0, 0))
+        draw.text((x + 6 - bbox[0], gap + 6 - bbox[1]), label,
+                  fill=(255, 255, 255), font=font)
+        x += im.width + gap
+    return strip
+
+
+def heuristic_revision(direction, prompt, metrics):
+    """No-VLM fallback: nudge the instruction based on pixel metrics."""
+    revised = prompt
+    if metrics["changed_pct"] < 1.0:
+        base = direction.rstrip(". ")
+        revised = (f"{base}. Make this change clearly and strongly visible in "
+                   "the result, keep everything else exactly the same")
+    elif metrics["anchoring"] < 0.5 and "keep everything else" not in prompt.lower():
+        revised = prompt.rstrip(". ") + ", keep everything else exactly the same"
+    return revised
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("image", help="input image to edit")
+    ap.add_argument("direction", help="what you want changed, in plain words")
+    ap.add_argument("-n", "--iterations", type=int, default=5,
+                    help="max iterations (default 5)")
+    ap.add_argument("--server", default="http://127.0.0.1:2222")
+    ap.add_argument("--vlm", default="gemma4:e2b",
+                    help="ollama vision model for critique, or 'none' (default gemma4:e2b)")
+    ap.add_argument("--ollama", default="http://127.0.0.1:11434",
+                    help="ollama endpoint")
+    ap.add_argument("--auto", action="store_true",
+                    help="don't pause for confirmation between iterations")
+    ap.add_argument("--chain", action="store_true",
+                    help="feed each output in as the next iteration's input "
+                         "(default: always re-edit the original)")
+    ap.add_argument("--steps", type=int, default=25)
+    ap.add_argument("--guidance", type=float, default=None,
+                    help="guidance scale (default: server default, 2.5 for Kontext)")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="fixed seed (default: vary per iteration)")
+    args = ap.parse_args()
+
+    key = load_api_key()
+    if not key:
+        sys.exit("FLUX_API_KEY not set (env or .env)")
+
+    prompt_style = "instruction"
+    try:
+        info = api(args.server, "/model-info", key)
+        print(f"Server model: {info.get('description', 'unknown')}")
+        if info.get("sd"):
+            prompt_style = "description"
+            print("  SDXL backend: prompts are treated as scene descriptions, "
+                  "not edit instructions.")
+        elif not info.get("kontext") and info.get("flux_version") != 2:
+            print("  WARNING: loaded model is not an instruction editor "
+                  "(Kontext) or FLUX.2 — plain FLUX.1 does strength-based "
+                  "img2img, so results will drift from the input.")
+    except Exception as e:
+        sys.exit(f"Cannot reach server at {args.server}: {e}")
+
+    original = Image.open(args.image).convert("RGB")
+    session = os.path.join(SESSIONS_DIR, datetime.now().strftime("%Y%m%d_%H%M%S"))
+    os.makedirs(session, exist_ok=True)
+    original.save(os.path.join(session, "iter_00_input.png"))
+
+    log = {"direction": args.direction, "image": os.path.abspath(args.image),
+           "chain": args.chain, "iterations": []}
+    reference = original
+    versions = [original]  # versions[0] = input, versions[i] = iteration i output
+    prompt = args.direction
+    use_vlm = args.vlm.lower() != "none"
+
+    for i in range(1, args.iterations + 1):
+        print(f"\n=== Iteration {i}/{args.iterations} ===")
+        print(f"  instruction: {prompt}")
+        job_id = submit_edit(args.server, key, prompt, reference,
+                             args.steps, args.guidance, args.seed)
+        job = wait_for_job(args.server, key, job_id)
+        filename = job["images"][0]["filename"]
+        output = fetch_image(args.server, filename, key)
+
+        out_path = os.path.join(session, f"iter_{i:02d}.png")
+        output.save(out_path)
+        metrics = edit_metrics(reference, output)
+        print(f"  output: {out_path}")
+        print(f"  {describe_metrics(metrics)}")
+
+        critique = None
+        if use_vlm:
+            print(f"  asking {args.vlm} to compare input and output...")
+            critique = vlm_critique(args.vlm, args.direction, prompt,
+                                    reference, output, metrics, args.ollama,
+                                    style=prompt_style)
+        if critique:
+            print(f"  VLM: edit applied={critique.get('applied')} — "
+                  f"{critique.get('critique', '')}")
+            next_prompt = critique["revised_prompt"]
+        else:
+            next_prompt = heuristic_revision(args.direction, prompt, metrics)
+        if next_prompt != prompt:
+            print(f"  proposed next instruction: {next_prompt}")
+
+        log["iterations"].append({
+            "prompt": prompt, "filename": filename, "output": out_path,
+            "metrics": metrics, "critique": critique,
+        })
+        with open(os.path.join(session, "session.json"), "w") as f:
+            json.dump(log, f, indent=2)
+
+        if i == args.iterations:
+            break
+
+        versions.append(output)
+        backtrack = None
+        stop = False
+        if args.auto:
+            prompt = next_prompt
+        else:
+            print("\n  [Enter] retry with proposed instruction   "
+                  "[type text] your own feedback/instruction   "
+                  "[b N] backtrack: base next round on version N "
+                  f"(0=original, 1..{i}=iterations)   "
+                  "[a] accept this result and stop   [q] quit")
+            while True:
+                try:
+                    answer = input("  > ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    stop = True
+                    break
+                if answer.lower() == "q":
+                    stop = True
+                    break
+                if answer.lower() == "a":
+                    print(f"  accepted: {out_path}")
+                    stop = True
+                    break
+                if answer.lower().startswith("b"):
+                    parts = answer.split()
+                    if len(parts) == 2 and parts[1].isdigit() and int(parts[1]) < len(versions):
+                        k = int(parts[1])
+                        backtrack = versions[k]
+                        print(f"  next round will edit {'the original' if k == 0 else f'iteration {k}'}"
+                              " — now pick the instruction ([Enter] for proposed).")
+                        continue
+                    print(f"  usage: b N with N in 0..{len(versions) - 1}")
+                    continue
+                prompt = answer if answer else next_prompt
+                break
+        if stop:
+            break
+
+        if backtrack is not None:
+            reference = backtrack
+        elif args.chain:
+            reference = output
+
+    if log["iterations"]:
+        frames = [("input", original)] + [
+            (str(i + 1), Image.open(it["output"]).convert("RGB"))
+            for i, it in enumerate(log["iterations"])]
+        strip_path = os.path.join(session, "filmstrip.png")
+        build_film_strip(frames).save(strip_path)
+        print(f"\n  film strip: {strip_path}")
+
+    print(f"\nSession saved: {session}")
+    print(f"  {len(log['iterations'])} iteration(s); session.json has prompts, "
+          "metrics, and critiques.")
+
+
+if __name__ == "__main__":
+    main()

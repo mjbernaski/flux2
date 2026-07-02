@@ -43,18 +43,30 @@
             <textarea id="prompt" name="prompt" rows="5" placeholder="A majestic mountain landscape at sunset..." required></textarea>
         </div>
 
+        <!-- SDXL only (shown when the server reports negative-prompt support) -->
+        <div class="form-group" id="negativePromptGroup" style="display: none;">
+            <label for="negativePrompt">Negative prompt (what to avoid — leave empty for a sensible default)</label>
+            <textarea id="negativePrompt" name="negativePrompt" rows="2" placeholder="worst quality, low quality, watermark, extra limbs..."></textarea>
+        </div>
+
         <div class="form-group">
-            <label>Reference Image (optional - guides generation)</label>
+            <label>Reference Images (optional — up to 3; the first sets the output aspect)</label>
             <div class="image-input-container">
-                <div class="image-upload-area" id="uploadArea">
-                    <input type="file" id="inputImage" accept="image/*" style="display: none;">
-                    <div class="upload-placeholder" id="uploadPlaceholder">
-                        <span>Click or drag image here</span>
+                <div class="ref-strip" id="refStrip">
+                    <div class="ref-thumbs" id="refThumbs"></div>
+                    <div class="image-upload-area" id="uploadArea">
+                        <input type="file" id="inputImage" accept="image/*" multiple style="display: none;">
+                        <div class="upload-placeholder" id="uploadPlaceholder">
+                            <span>Click or drag up to 3 images here</span>
+                        </div>
                     </div>
-                    <div class="image-preview" id="imagePreview" style="display: none;">
-                        <img id="previewImg" src="">
-                        <button type="button" class="clear-btn" id="clearImage">X</button>
-                    </div>
+                </div>
+                <div class="multi-ref-hint" id="multiRefHint" style="display: none;">
+                    Multiple references: FLUX.2 uses each image directly. The Kontext
+                    editor stitches them side-by-side — write the instruction using
+                    positions, e.g. "give the person in the left image the jacket
+                    from the right image", and add "produce one single unified image"
+                    so the side-by-side layout doesn't appear in the result.
                 </div>
                 <div class="strength-control" id="strengthControl" style="display: none;">
                     <label for="strength">Reference following (strength): <span id="strengthValue">0.5</span></label>
@@ -70,7 +82,7 @@
                 </div>
                 <div class="inpaint-control" id="inpaintControl" style="display: none;">
                     <label class="inpaint-toggle">
-                        <input type="checkbox" id="inpaintMode"> Inpaint &mdash; paint the area to regenerate (FLUX.2)
+                        <input type="checkbox" id="inpaintMode"> Inpaint &mdash; paint the area to regenerate (FLUX.2 / SDXL)
                     </label>
                     <div class="inpaint-tools" id="inpaintTools" style="display: none;">
                         <div class="inpaint-stage" id="inpaintStage">
@@ -82,7 +94,7 @@
                             <button type="button" id="inpaintEraser">Eraser</button>
                             <button type="button" id="inpaintClear">Clear mask</button>
                         </div>
-                        <div class="strength-hint">Paint over what FLUX.2 should regenerate; everything else stays unchanged. Your prompt describes the new content for the painted area.</div>
+                        <div class="strength-hint">Paint over what should be regenerated; everything else stays unchanged. Your prompt describes the new content for the painted area. On SDXL, the strength slider sets how strongly the painted area is repainted (~0.4&ndash;0.7 for edits, higher to fully replace).</div>
                     </div>
                 </div>
             </div>
@@ -135,14 +147,14 @@
             <div class="form-group">
                 <label for="guidance">Guidance Scale</label>
                 <select id="guidance" name="guidance">
-                    <option value="">Auto</option>
+                    <option value="" selected>Auto (model default: FLUX 2.5&ndash;4, SDXL 6)</option>
                     <option value="1">1.0 (high variety)</option>
                     <option value="1.5">1.5</option>
                     <option value="2">2.0</option>
                     <option value="2.5">2.5</option>
                     <option value="3">3.0</option>
                     <option value="3.5">3.5</option>
-                    <option value="4" selected>4.0 (default)</option>
+                    <option value="4">4.0</option>
                     <option value="4.5">4.5</option>
                     <option value="5">5.0</option>
                     <option value="5.5">5.5</option>
@@ -204,6 +216,72 @@
             <button type="button" class="reset-btn" id="resetBtn">Reset</button>
         </div>
     </form>
+
+    <div class="edit-loop-section" id="editLoopSection">
+        <div class="edit-loop-header" onclick="document.getElementById('editLoopContent').style.display = document.getElementById('editLoopContent').style.display === 'none' ? 'block' : 'none'">
+            <div class="edit-loop-title">
+                <span>&#8635; Edit Loop</span>
+            </div>
+            <span style="font-size: 12px; color: #888;">Click to toggle</span>
+        </div>
+        <div id="editLoopContent" style="display: none; padding-top: 10px;">
+            <p class="edit-loop-hint">
+                Iteratively refine an edit. Uses the <strong>first reference image
+                above</strong>: applies your direction, has a local vision model
+                compare input and output, then retries with a revised instruction.
+                Pause between rounds to steer, or let it run.
+            </p>
+            <div class="form-group">
+                <label for="loopDirection">Edit direction</label>
+                <input type="text" id="loopDirection" placeholder="e.g. give the woman round black-rimmed glasses">
+            </div>
+            <div class="row">
+                <div class="form-group">
+                    <label for="loopIterations">Max iterations</label>
+                    <select id="loopIterations">
+                        <option value="1">1</option>
+                        <option value="2">2</option>
+                        <option value="3">3</option>
+                        <option value="5" selected>5</option>
+                        <option value="8">8</option>
+                        <option value="10">10</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label class="checkbox-label" style="margin-top: 24px;">
+                        <input type="checkbox" id="loopAuto">
+                        Auto-continue (no pause)
+                    </label>
+                </div>
+                <div class="form-group">
+                    <label class="checkbox-label" style="margin-top: 24px;">
+                        <input type="checkbox" id="loopChain">
+                        Chain outputs (edit previous result, not the original)
+                    </label>
+                </div>
+            </div>
+            <div class="button-row">
+                <button type="button" id="loopStartBtn">Start Edit Loop</button>
+                <button type="button" class="reset-btn" id="loopStopBtn" style="display: none;">Stop loop</button>
+            </div>
+            <div class="edit-loop-status" id="loopStatus" style="display: none;"></div>
+            <div id="loopCards"></div>
+            <div class="edit-loop-controls" id="loopControls" style="display: none;">
+                <label for="loopNextPrompt">Next instruction (edit before continuing)</label>
+                <textarea id="loopNextPrompt" rows="2"></textarea>
+                <div class="button-row">
+                    <button type="button" id="loopContinueBtn">Continue</button>
+                    <button type="button" class="reset-btn" id="loopBaseOriginalBtn" title="Backtrack: next iteration edits the original image again">⏮ Base: original</button>
+                    <button type="button" class="reset-btn" id="loopAcceptBtn">Accept &amp; finish</button>
+                </div>
+                <div class="edit-loop-hint" style="margin-top: 8px;">
+                    Backtrack: click "⏪ Base for next iteration" on any earlier
+                    result (or "⏮ Base: original") to continue from that version
+                    instead of the latest one.
+                </div>
+            </div>
+        </div>
+    </div>
 
     <div class="status" id="status">
         <span class="spinner"></span>

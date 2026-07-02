@@ -6,7 +6,7 @@ three entry points:
 
 | Entry point | What it is | Port |
 |---|---|---|
-| `web_server.py` | Web UI + JSON API with a generation queue, live latent previews, img2img, inpainting (FLUX.2), spectrum grids, history | 2222 |
+| `web_server.py` | Web UI + JSON API with a generation queue, live latent previews, img2img, multi-reference editing (up to 3 images), inpainting (FLUX.2), spectrum grids, history | 2222 |
 | `flux_cli.py` | Interactive CLI (REPL) on top of `flux_core.py`, the shared model-loading/generation core the other apps import | — |
 | `image_manager.py` | Browser tool to browse/crop/organize everything under `web-generated/` | 2223 |
 
@@ -45,9 +45,26 @@ python flux_cli.py --kontext --image photo.png   # instruction editing
 ```
 
 The REPL supports `/help`, `same`, `reseed <n>`, `/steps`, `/guidance`,
-`/strength`, `/image <path>`, aspect presets (`/square`, `/portrait`,
-`/landscape`, `/widescreen`, `/extra-tall`) and sizes (`/0.75`, `/1k`, `/2k`,
-`/4k`), inline in prompts too: `a cat /4k /portrait`.
+`/strength`, `/image <path> [path2] [path3]`, aspect presets (`/square`,
+`/portrait`, `/landscape`, `/widescreen`, `/extra-tall`) and sizes (`/0.75`,
+`/1k`, `/2k`, `/4k`), inline in prompts too: `a cat /4k /portrait`.
+
+## Reference images (up to 3)
+
+Both the web UI and the CLI accept up to 3 reference images per generation
+(`input_images` in the JSON API). The first image is the primary — it sets the
+output aspect ratio. How they're used depends on the model:
+
+- **FLUX.2 (incl. klein)** conditions on all references natively (each is
+  encoded separately and attended to), e.g. "put the object from the first
+  image into the scene from the second".
+- **Kontext** conditions on a single image, so multiple references are
+  stitched side-by-side into one canvas — write the instruction positionally:
+  "give the person in the left image the jacket from the right image".
+- **FLUX.1 img2img** takes a single reference; multiple are rejected with a 400.
+
+Strength only applies to single-image FLUX.1 img2img; inpainting requires
+exactly one reference.
 
 ## Web frontend
 

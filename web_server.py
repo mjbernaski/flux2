@@ -23,9 +23,28 @@ load_dotenv()
 # Version number - update this when releasing new versions
 VERSION = "1.1.1"
 
-# Import model components from flux_core (model loading + generation)
-import flux_core
-from flux_core import load_model, generate_image, device, save_prompt_file, load_turbo_lora, load_uncensored_lora
+# Import model components from flux_core (model loading + generation).
+# `--sdxl` swaps in sd_core, the uncensored Stable Diffusion XL backend —
+# it mirrors the slice of flux_core's surface this server uses, so every
+# flux_core.* reference below resolves against whichever core is active.
+import sys
+_SDXL_ACTIVE = '--sdxl' in sys.argv
+if _SDXL_ACTIVE:
+    import sd_core as flux_core
+else:
+    import flux_core
+load_model = flux_core.load_model
+generate_image = flux_core.generate_image
+device = flux_core.device
+save_prompt_file = flux_core.save_prompt_file
+load_turbo_lora = flux_core.load_turbo_lora
+load_uncensored_lora = flux_core.load_uncensored_lora
+MAX_REFERENCE_IMAGES = flux_core.MAX_REFERENCE_IMAGES
+
+
+def _output_prefix():
+    """Filename prefix for generated images: sdxl_... or flux{1|2}_..."""
+    return getattr(flux_core, 'OUTPUT_PREFIX', None) or f"flux{flux_core._flux_version}"
 
 app = Flask(__name__)
 # Bound request bodies (base64 input images are the largest legitimate payload).
@@ -98,6 +117,10 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 QUEUE_MAX_SIZE = 10
 RECENT_DONE_MAX = 10
 
+# Edit-loop critique (local ollama vision model; see /critique)
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
+CRITIQUE_MODEL = os.environ.get("CRITIQUE_MODEL", "gemma4:e2b")
+
 PREVIEW_FILENAME = "_preview_current.png"
 PREVIEW_MIN_INTERVAL_S = 0.75  # throttle: skip decode if last preview was this recent
 
@@ -141,6 +164,9 @@ class Job:
             'batch': self.params.get('batch', 1),
             'seed': self.params.get('seed'),
             'spectrum_grid': bool(self.params.get('spectrum_grid', False)),
+            # Note: reference payloads are dropped from finished jobs, so this
+            # is only meaningful while the job is queued/running.
+            'refs': len(self.params.get('input_images') or []),
         }
 
     def full(self) -> dict:
@@ -207,20 +233,30 @@ def _run_job(job: Job):
     guidance_scale = data.get('guidance')
     batch = min(max(int(data.get('batch', 1)), 1), 128)
 
-    # Handle input image
-    input_image = None
-    strength = float(data.get('strength', 0.5))
-    input_image_b64 = data.get('input_image')
-    if input_image_b64:
-        if ',' in input_image_b64:
-            input_image_b64 = input_image_b64.split(',', 1)[1]
-        image_data = base64.b64decode(input_image_b64)
-        input_image = Image.open(io.BytesIO(image_data)).convert('RGB')
+    # negative_prompt is SDXL-only (validated at the boundary); pass it as an
+    # extra kwarg only on cores that take it, so flux_core's signature is
+    # untouched.
+    _neg_kwargs = {}
+    if getattr(flux_core, 'SUPPORTS_NEGATIVE_PROMPT', False):
+        _neg_kwargs['negative_prompt'] = (data.get('negative_prompt') or '').strip() or None
 
-    # Handle inpaint mask (white = regenerate). FLUX.2 only; needs an input image.
+    # Reference images (validated and normalized to `input_images` by /generate).
+    # The first is the primary — it drives output dimensions and inpainting;
+    # generate_image handles the multi-reference semantics per model family.
+    strength = float(data.get('strength', 0.5))
+    input_images = []
+    for b64 in data.get('input_images') or []:
+        if ',' in b64:
+            b64 = b64.split(',', 1)[1]
+        input_images.append(Image.open(io.BytesIO(base64.b64decode(b64))).convert('RGB'))
+    input_image = input_images[0] if input_images else None
+    gen_input = input_images if len(input_images) > 1 else input_image
+
+    # Handle inpaint mask (white = regenerate). FLUX.2 or SDXL; needs an input image.
     mask_image = None
     mask_b64 = data.get('mask_image')
-    if mask_b64 and input_image is not None and flux_core._flux_version == 2:
+    _inpaint_ok = flux_core._flux_version == 2 or getattr(flux_core, 'SUPPORTS_INPAINT', False)
+    if mask_b64 and input_image is not None and _inpaint_ok:
         if ',' in mask_b64:
             mask_b64 = mask_b64.split(',', 1)[1]
         mask_image = Image.open(io.BytesIO(base64.b64decode(mask_b64))).convert('L')
@@ -275,6 +311,19 @@ def _run_job(job: Job):
 
     job.batch = total_batch
     job.total_steps = steps
+
+    # Encode the prompt once for the whole job: every image in a batch shares
+    # the prompt, and re-encoding costs a full text-encoder forward per image
+    # (the FLUX.2 encoders are LLM-sized — seconds each). None means the
+    # config pre-encoding doesn't apply to (remote encoder) or it failed;
+    # generate_image then encodes per-call as before.
+    prompt_embeds_kwargs = None
+    if total_batch > 1:
+        t_enc = time.perf_counter()
+        prompt_embeds_kwargs = flux_core.encode_prompt_once(prompt)
+        if prompt_embeds_kwargs is not None:
+            print(f"[queue] prompt encoded once for {total_batch} images "
+                  f"in {time.perf_counter() - t_enc:.2f}s", flush=True)
 
     show_preview = bool(data.get('show_preview', False))
     preview_state = {"last_decode": 0.0}
@@ -350,17 +399,19 @@ def _run_job(job: Job):
 
                 image, used_seed, timings = generate_image(
                     prompt, seed=current_seed, steps=steps, width=width, height=height,
-                    local_encoder=_local_encoder, input_image=input_image,
+                    local_encoder=_local_encoder, input_image=gen_input,
                     strength=(s_val if input_image else 0.5),
                     guidance_scale=g_val,
-                    callback_on_step_end=_step_callback
-                )                    
+                    callback_on_step_end=_step_callback,
+                    prompt_embeds_kwargs=prompt_embeds_kwargs,
+                    **_neg_kwargs
+                )
                 t_save = time.perf_counter()
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 unique_id = uuid.uuid4().hex[:8]
                 g_str = str(g_val).replace('.', '_')
                 s_str = f"str_{s_val}" if s_val is not None else "txt2img"
-                output_filename = f"flux{flux_core._flux_version}_{timestamp}_g{g_str}_{s_str}_{unique_id}.png"
+                output_filename = f"{_output_prefix()}_{timestamp}_g{g_str}_{s_str}_{unique_id}.png"
                 output_path = os.path.join(OUTPUT_DIR, output_filename)
                 image.save(output_path)
                 timings['save'] = time.perf_counter() - t_save
@@ -433,7 +484,7 @@ def _run_job(job: Job):
                 )
                 draw.text((x0 - bbox[0], y0 - bbox[1]), label, fill=(255, 255, 255), font=font)
 
-        comp_filename = f"flux{flux_core._flux_version}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_spectrum_grid.png"
+        comp_filename = f"{_output_prefix()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_spectrum_grid.png"
         composite.save(os.path.join(OUTPUT_DIR, comp_filename))
         job.composite = comp_filename
     else:
@@ -443,13 +494,15 @@ def _run_job(job: Job):
             current_seed = (seed + i) if seed is not None else None
             image, used_seed, timings = generate_image(
                 prompt, seed=current_seed, steps=steps, width=width, height=height,
-                local_encoder=_local_encoder, input_image=input_image, strength=strength,
+                local_encoder=_local_encoder, input_image=gen_input, strength=strength,
                 guidance_scale=guidance_scale, mask_image=mask_image,
-                callback_on_step_end=_step_callback
+                callback_on_step_end=_step_callback,
+                prompt_embeds_kwargs=prompt_embeds_kwargs,
+                **_neg_kwargs
             )
 
             t_save = time.perf_counter()
-            output_filename = f"flux{flux_core._flux_version}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.png"
+            output_filename = f"{_output_prefix()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.png"
             output_path = os.path.join(OUTPUT_DIR, output_filename)
             image.save(output_path)
             timings['save'] = time.perf_counter() - t_save
@@ -496,6 +549,7 @@ def _queue_worker():
             # Finished jobs sit in _recent_done for a while; drop the (large)
             # base64 image payloads so they don't stay resident in memory.
             job.params.pop('input_image', None)
+            job.params.pop('input_images', None)
             job.params.pop('mask_image', None)
             with _queue_cv:
                 _running_job = None
@@ -568,27 +622,53 @@ def _validate_generate_params(data):
         if data['guidance'] < 0:
             return "guidance must be non-negative"
 
+    if data.get('negative_prompt'):
+        if not isinstance(data['negative_prompt'], str):
+            return "negative_prompt must be a string"
+        if not getattr(flux_core, 'SUPPORTS_NEGATIVE_PROMPT', False):
+            return "negative_prompt requires the SDXL backend (start the server with --sdxl)"
+
     if data.get('orientation') is not None and data['orientation'] not in ORIENTATIONS_1K:
         return f"orientation must be one of {sorted(ORIENTATIONS_1K)}"
     if data.get('size') is not None and data['size'] not in SIZES:
         return f"size must be one of {sorted(SIZES)}"
 
-    # Decode images here so a corrupt upload is a 400, not a failed job.
-    for key, label in (('input_image', 'input_image'), ('mask_image', 'mask_image')):
-        b64 = data.get(key)
-        if not b64:
-            continue
+    def _decodable(b64):
         try:
             payload = b64.split(',', 1)[1] if ',' in b64 else b64
             Image.open(io.BytesIO(base64.b64decode(payload))).verify()
+            return True
         except Exception:
-            return f"{label} is not a decodable base64 image"
+            return False
+
+    # Reference images: `input_images` (a list, up to MAX_REFERENCE_IMAGES) is
+    # canonical; the legacy single `input_image` field is folded into it here so
+    # the rest of the server only ever sees the list form. Decode images at the
+    # boundary so a corrupt upload is a 400, not a failed job.
+    imgs = data.get('input_images')
+    if imgs is not None and not isinstance(imgs, list):
+        return "input_images must be a list of base64 images"
+    imgs = list(imgs or [])
+    if not imgs and data.get('input_image'):
+        imgs = [data['input_image']]
+    if len(imgs) > MAX_REFERENCE_IMAGES:
+        return f"at most {MAX_REFERENCE_IMAGES} reference images are supported"
+    for i, b64 in enumerate(imgs):
+        if not isinstance(b64, str) or not _decodable(b64):
+            return f"input_images[{i}] is not a decodable base64 image"
+    if len(imgs) > 1 and not (flux_core._kontext_enabled or flux_core._flux_version == 2):
+        return ("multiple reference images require the Kontext editor or a "
+                "FLUX.2 server; this server's FLUX.1 img2img takes one image")
+    data['input_images'] = imgs
+    data.pop('input_image', None)
 
     if data.get('mask_image'):
-        if not data.get('input_image'):
-            return "mask_image requires input_image"
-        if flux_core._flux_version != 2:
-            return "inpainting (mask_image) requires a FLUX.2 server"
+        if not isinstance(data['mask_image'], str) or not _decodable(data['mask_image']):
+            return "mask_image is not a decodable base64 image"
+        if len(imgs) != 1:
+            return "inpainting (mask_image) requires exactly one input image"
+        if flux_core._flux_version != 2 and not getattr(flux_core, 'SUPPORTS_INPAINT', False):
+            return "inpainting (mask_image) requires a FLUX.2 or SDXL server"
 
     return None
 
@@ -669,7 +749,9 @@ def cancel_job(job_id):
 def model_info():
     flux_name = f"FLUX.{flux_core._flux_version}"
     variant = "-klein" if _klein else "-dev"
-    if _kontext:
+    if _SDXL_ACTIVE:
+        model_type = f"SDXL ({flux_core.model_name()})"
+    elif _kontext:
         kontext_prec = "full bf16" if _full_model else "4-bit"
         model_type = f"FLUX.1-Kontext (editor, {kontext_prec})"
     elif _schnell:
@@ -680,7 +762,8 @@ def model_info():
         model_type = f"{flux_name}{variant} (full)"
     else:
         model_type = f"{flux_name}-dev-bnb-4bit"
-    encoder_type = "local encoder" if _local_encoder else "remote encoder"
+    encoder_type = ("local CLIP encoders" if _SDXL_ACTIVE
+                    else "local encoder" if _local_encoder else "remote encoder")
     turbo_str = " + Turbo" if flux_core._turbo_enabled else ""
     uncensored_str = " + Uncensored" if flux_core._uncensored_enabled else ""
     return jsonify({
@@ -691,10 +774,116 @@ def model_info():
         'uncensored': flux_core._uncensored_enabled,
         'kontext': flux_core._kontext_enabled,
         'flux_version': flux_core._flux_version,
+        'sd': _SDXL_ACTIVE,
+        'negative_prompt': getattr(flux_core, 'SUPPORTS_NEGATIVE_PROMPT', False),
+        'inpaint': flux_core._flux_version == 2 or getattr(flux_core, 'SUPPORTS_INPAINT', False),
         'hostname': socket.gethostname(),
         'version': VERSION,
         'description': f"{model_type}{turbo_str}{uncensored_str} with {encoder_type}"
     })
+
+
+@app.route('/critique', methods=['POST'])
+def critique():
+    """Compare an edit output against its reference and propose a revised
+    instruction — the "look at the output" step of the edit loop (UI panel
+    and edit_loop.py). Vision critique runs on the local ollama daemon
+    (OLLAMA_URL / CRITIQUE_MODEL env vars); when it's unavailable the
+    response falls back to pixel-metric heuristics."""
+    from edit_loop import (vlm_critique, edit_metrics, heuristic_revision,
+                           describe_metrics)
+
+    data = request.json or {}
+    direction = (data.get('direction') or '').strip()
+    prompt = (data.get('prompt') or direction).strip()
+    out_filename = os.path.basename(data.get('output_filename') or '')
+    ref_b64 = data.get('ref_image') or ''
+    if not direction or not out_filename or not ref_b64:
+        return jsonify({'success': False,
+                        'error': 'direction, ref_image, and output_filename are required'}), 400
+
+    out_path = os.path.join(OUTPUT_DIR, out_filename)
+    if not os.path.exists(out_path):
+        return jsonify({'success': False, 'error': f'unknown output image {out_filename}'}), 404
+    try:
+        if ref_b64.startswith('data:'):
+            ref_b64 = ref_b64.split(',', 1)[1]
+        reference = Image.open(io.BytesIO(base64.b64decode(ref_b64))).convert('RGB')
+    except Exception:
+        return jsonify({'success': False, 'error': 'ref_image is not a decodable base64 image'}), 400
+
+    output = Image.open(out_path).convert('RGB')
+    metrics = edit_metrics(reference, output)
+    model = data.get('model') or CRITIQUE_MODEL
+    style = ("description" if getattr(flux_core, 'OUTPUT_PREFIX', '') == 'sdxl'
+             else "instruction")
+    result = vlm_critique(model, direction, prompt, reference, output, metrics,
+                          ollama_url=OLLAMA_URL, style=style)
+    if result:
+        return jsonify({'success': True, 'vlm': True, 'metrics': metrics,
+                        'metrics_text': describe_metrics(metrics),
+                        'applied': bool(result.get('applied')),
+                        'critique': result.get('critique', ''),
+                        'revised_prompt': result.get('revised_prompt')})
+    return jsonify({'success': True, 'vlm': False, 'metrics': metrics,
+                    'metrics_text': describe_metrics(metrics),
+                    'applied': None,
+                    'critique': 'Vision model unavailable — revision based on pixel metrics only.',
+                    'revised_prompt': heuristic_revision(direction, prompt, metrics)})
+
+
+@app.route('/loop-strip', methods=['POST'])
+def loop_strip():
+    """Finish an edit-loop run: preserve every iteration image in `.hidden`
+    (so Archive/Delete Today don't remove them) and compose a film strip of
+    the reference plus each edit in sequence, saved as a regular output so it
+    appears in history."""
+    from edit_loop import build_film_strip
+
+    data = request.get_json(silent=True) or {}
+    filenames = [os.path.basename(f or '') for f in (data.get('filenames') or [])]
+    filenames = [f for f in filenames if f.endswith('.png')]
+    if not filenames:
+        return jsonify({'success': False, 'error': 'filenames is required'}), 400
+    direction = (data.get('direction') or '').strip()
+    prompts = data.get('prompts') or []
+
+    frames = []
+    ref_b64 = data.get('ref_image') or ''
+    if ref_b64:
+        try:
+            if ref_b64.startswith('data:'):
+                ref_b64 = ref_b64.split(',', 1)[1]
+            frames.append(('input', Image.open(io.BytesIO(base64.b64decode(ref_b64))).convert('RGB')))
+        except Exception:
+            return jsonify({'success': False, 'error': 'ref_image is not a decodable base64 image'}), 400
+
+    hidden_dir = os.path.join(OUTPUT_DIR, '.hidden')
+    os.makedirs(hidden_dir, exist_ok=True)
+    for i, fn in enumerate(filenames, start=1):
+        path = os.path.join(OUTPUT_DIR, fn)
+        if not os.path.isfile(path):
+            return jsonify({'success': False, 'error': f'unknown image {fn}'}), 404
+        frames.append((str(i), Image.open(path).convert('RGB')))
+        shutil.copy2(path, os.path.join(hidden_dir, fn))
+        sidecar = fn.rsplit('.', 1)[0] + '.prompt'
+        if os.path.isfile(os.path.join(OUTPUT_DIR, sidecar)):
+            shutil.copy2(os.path.join(OUTPUT_DIR, sidecar), os.path.join(hidden_dir, sidecar))
+
+    strip = build_film_strip(frames)
+    strip_name = f"{_output_prefix()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_editloop_strip.png"
+    strip.save(os.path.join(OUTPUT_DIR, strip_name))
+    sidecar_path = os.path.join(OUTPUT_DIR, strip_name.rsplit('.', 1)[0] + '.prompt')
+    with open(sidecar_path, 'w') as f:
+        f.write(f"# Prompt: Edit loop film strip: {direction}\n")
+        for i, fn in enumerate(filenames):
+            p = prompts[i] if i < len(prompts) else ''
+            f.write(f"# Iteration {i + 1}: {fn} — {p}\n")
+    # The strip itself survives housekeeping too.
+    shutil.copy2(os.path.join(OUTPUT_DIR, strip_name), os.path.join(hidden_dir, strip_name))
+    shutil.copy2(sidecar_path, os.path.join(hidden_dir, os.path.basename(sidecar_path)))
+
+    return jsonify({'success': True, 'filename': strip_name, 'kept': filenames})
 
 
 @app.route('/history')
@@ -832,6 +1021,13 @@ if __name__ == '__main__':
     parser.add_argument("--no-turbo", action="store_true", help="Disable turbo LoRA")
     parser.add_argument("--uncensored", action="store_true", help="Load Lustly.ai uncensored NSFW LoRA")
     parser.add_argument("--kontext", action="store_true", help="Use FLUX.1 Kontext, an instruction-based image editor (4-bit; add --full-model for full bf16)")
+    parser.add_argument("--sdxl", nargs='?', const='', default=None, metavar='MODEL',
+                        help="Serve an uncensored Stable Diffusion XL checkpoint instead of FLUX. "
+                             "Optional MODEL is an HF repo id, local diffusers dir, or single-file "
+                             ".safetensors (e.g. a Civitai download); default is "
+                             "the LUSTIFY! NSFW/SFW merge (or the SD_MODEL env var). "
+                             "Enables negative prompts; ignores the FLUX model flags.")
+    parser.add_argument("--compile", action="store_true", help="torch.compile the transformer after load: the first generation per resolution is much slower (compilation), later ones ~10-25%% faster. Best when generating at consistent resolutions")
     parser.add_argument("--port", type=int, default=PORT, help=f"Port (default: {PORT})")
     args = parser.parse_args()
 
@@ -842,22 +1038,33 @@ if __name__ == '__main__':
     _kontext = args.kontext
     _local_encoder = args.local_encoder or args.full_model or args.schnell or args.uncensored or args.kontext
     if args.uncensored and not args.full_model: _full_model = True
-    # Turbo LoRA is a FLUX.2-dev LoRA — don't auto-enable for klein (different architecture)
-    _turbo = (args.turbo or (args.flux2 and not _klein)) and not args.no_turbo
+    # Turbo LoRA is a FLUX.2-dev LoRA — don't auto-enable for klein (different
+    # architecture) or the SDXL backend.
+    _turbo = (args.turbo or (args.flux2 and not _klein)) and not args.no_turbo and not _SDXL_ACTIVE
 
     def _load_in_background():
         global _model_ready, _model_load_error, _model_load_status
         try:
-            _model_name = "FLUX.1-Kontext" if _kontext else ("FLUX.2" if _flux2 else "FLUX.1")
-            _model_load_status = f"loading {_model_name} model"
-            print(f"Loading {_model_name}...")
-            load_model(local_encoder=_local_encoder, full_model=_full_model, gguf_quant=_gguf_quant, flux2=_flux2, schnell=_schnell, for_lora=_uncensored, klein=_klein, kontext=_kontext)
+            if _SDXL_ACTIVE:
+                _model_load_status = "loading SDXL model"
+                print("Loading SDXL...")
+                load_model(model_id=args.sdxl or None)
+            else:
+                _model_name = "FLUX.1-Kontext" if _kontext else ("FLUX.2" if _flux2 else "FLUX.1")
+                _model_load_status = f"loading {_model_name} model"
+                print(f"Loading {_model_name}...")
+                load_model(local_encoder=_local_encoder, full_model=_full_model, gguf_quant=_gguf_quant, flux2=_flux2, schnell=_schnell, for_lora=_uncensored, klein=_klein, kontext=_kontext)
             if _turbo:
                 _model_load_status = "loading turbo LoRA"
                 load_turbo_lora()
-            if _uncensored:
+            if _uncensored and not _SDXL_ACTIVE:
                 _model_load_status = "loading uncensored LoRA"
                 load_uncensored_lora()
+            if args.compile:
+                # Wraps the transformer; actual compilation happens lazily on
+                # the first forward pass (so the first generation is slow).
+                _model_load_status = "wrapping transformer with torch.compile"
+                flux_core.compile_pipeline()
             _model_load_status = "ready"
             _model_ready = True
             print("Model ready.")
