@@ -254,16 +254,27 @@ def generate_image(prompt, seed=None, steps=25, width=1024, height=1024,
     with torch.inference_mode():
         if mask_image is not None:
             # Masked edit via the dedicated inpainting checkpoint: white mask
-            # areas are repainted from the prompt, the rest is untouched.
-            # Denoising ~0.7 rewrites the masked region while still reading
-            # its context; callers can pass strength for subtler edits.
+            # areas are repainted from the prompt. Denoising ~0.7 rewrites the
+            # masked region while still reading its context; callers can pass
+            # strength for subtler edits.
+            base = input_image.convert("RGB").resize((width, height))
+            mask_l = mask_image.convert("L").resize((width, height))
             image = _get_inpaint_pipe()(
-                image=input_image.convert("RGB").resize((width, height)),
-                mask_image=mask_image.convert("L").resize((width, height)),
+                image=base,
+                mask_image=mask_l,
                 width=width, height=height,
                 strength=strength if strength is not None else 0.7,
                 **common,
             ).images[0]
+            # The inpaint UNet only *approximately* preserves the unmasked
+            # region (everything rides through the VAE and denoiser, so faces
+            # and backgrounds drift). Composite the result back onto the
+            # source so unmasked pixels are literally the original; a
+            # feathered mask edge hides the seam.
+            from PIL import ImageFilter
+            feather = max(4, min(width, height) // 128)
+            image = Image.composite(
+                image, base, mask_l.filter(ImageFilter.GaussianBlur(feather)))
         elif input_image is not None:
             image = pipe_img2img(
                 image=input_image.convert("RGB").resize((width, height)),
