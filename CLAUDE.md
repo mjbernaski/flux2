@@ -4,82 +4,73 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-FLUX Image Generator - An interactive CLI tool for generating images using FLUX.1 or FLUX.2 diffusion models via the diffusers library. Supports 4-bit quantized, GGUF (FLUX.1 only), and full precision models. Uses a remote text encoder API from Hugging Face for prompt embeddings (or local encoder for full model).
+FLUX Image Generator — self-hosted image generation on FLUX.1/FLUX.2 diffusion
+models via `diffusers`, tuned for DGX Spark / unified-memory systems. Three
+entry points share one model core:
 
-## Running the Application
+- **`flux_core.py`** — the model core (loading, generation, LoRAs, latent
+  previews, FLUX.2 inpainting). `web_server.py`, `flux_cli.py`, and the smoke
+  test import from it; functions like `load_turbo_lora`,
+  `decode_latents_to_preview`, and the inpaint helpers are only exercised by
+  the server, so don't assume code unused by the CLI is dead.
+- **`flux_cli.py`** — the interactive CLI REPL front end for `flux_core`.
+- **`web_server.py`** — Flask API + single-worker generation queue on port
+  2222. Auth via `FLUX_API_KEY` (X-API-Key header / `api_key` param). The UI is
+  static files in `static/` (index.html, app.css, app.js) — no build step.
+- **`image_manager.py`** — separate Flask gallery/crop tool on port 2223 over
+  the same `web-generated/` tree.
 
-```bash
-# Basic usage (FLUX.1 4-bit)
-python fl24bit.py
-
-# FLUX.2 model
-python fl24bit.py --flux2
-
-# Full precision model
-python fl24bit.py --full-model
-python fl24bit.py --flux2 --full-model
-
-# GGUF quantized (FLUX.1 only, recommended for DGX Spark)
-python fl24bit.py --gguf q8
-
-# With more inference steps
-python fl24bit.py --steps 10
-
-# With torch.compile for faster inference (slower startup)
-python fl24bit.py --compile
-```
-
-## Web Server
+## Running
 
 ```bash
-# FLUX.1 servers
-./run_flux1_4bit_server.sh      # 4-bit quantized
-./run_flux1_full_server.sh      # Full precision
-./run_flux1_gguf_server.sh      # GGUF Q8 (DGX Spark optimized)
-
-# FLUX.2 servers
-./run_flux2_4bit_server.sh      # 4-bit quantized
-./run_flux2_full_server.sh      # Full precision
+./run_server.sh          # interactive menu of 12 model configs (see SERVER_OPTIONS.md)
+./run_server.sh 9        # launch config 9 (FLUX.2-klein, the default) directly
+./kill_flux.sh           # stop the supervisor and server
+python flux_cli.py [--flux2|--gguf q8|--schnell|--kontext|--full-model] [--image path]
 ```
+
+`run_server.sh` is also a supervisor: logs to `server.log`, auto-restarts on
+crash/OOM (max 5 retries). SERVER_OPTIONS.md documents each menu number and
+must stay in sync with the `case` statement in `run_server.sh`.
+
+## Testing
+
+```bash
+python smoke_test_servers.py        # all 12 configs, isolated subprocesses
+python smoke_test_servers.py 9 10   # subset
+```
+
+Writes a live-updating HTML tracker to `server_smoke_test/index.html`.
+Requires GPU + model downloads; there are no pure unit tests.
 
 ## Dependencies
 
-Uses `uv pip` for package management. Key dependencies:
-- torch (with CUDA support)
-- diffusers (FluxPipeline, FluxImg2ImgPipeline, FluxTransformer2DModel)
-- huggingface_hub (for authentication and model downloads)
-- requests (for remote text encoder API)
+Uses `uv pip` against `.venv` with `requirements.txt`. Key deps: torch (CUDA),
+diffusers, transformers, flask, python-dotenv, huggingface_hub, requests.
 
-## Architecture
+## Architecture notes
 
-Single-file application (`fl24bit.py`) with:
-
-- **Model Loading**: Supports both FLUX.1 and FLUX.2 models:
-  - FLUX.1: `diffusers/FLUX.1-dev-bnb-4bit`, `black-forest-labs/FLUX.1-dev`, GGUF variants
-  - FLUX.2: `diffusers/FLUX.2-dev-bnb-4bit`, `black-forest-labs/FLUX.2-dev`
-- **Remote Text Encoding**: Uses Hugging Face's remote text encoder API (4-bit mode only)
-- **Img2Img Support**: FluxImg2ImgPipeline for image-to-image generation
-- **Embedding Cache**: Caches prompt embeddings in memory to avoid redundant API calls
-- **Connection Pooling**: Uses requests Session with retry strategy for reliable API communication
-- **Interactive CLI**: REPL-style interface with commands for regeneration, reseeding, changing steps, and adjusting output dimensions
-
-## Interactive Commands
-
-- `quit`/`q` - Exit
-- `same`/`s` - Regenerate with same prompt (uses cached embeddings)
-- `reseed <number>` - Regenerate with specific seed
-- `/steps <number>` - Change inference steps (default: 25)
-- `/square`, `/portrait`, `/landscape` - Change aspect ratio (default: landscape)
-- `/1k`, `/2k`, `/4k` - Change resolution multiplier (default: 1k)
-
-**Inline modifiers**: Commands can be embedded in prompts, e.g., `a cat /4k /portrait` will apply settings and generate with "a cat".
-
-## Output
-
-Generated images are saved as `flux{version}_{timestamp}_{uuid}.png` in the working directory (e.g., `flux1_...` or `flux2_...`).
+- **Model variants** (all selected via flags on `load_model`): FLUX.1
+  4-bit/full/GGUF/schnell, FLUX.1-Kontext editor (4-bit or full bf16), FLUX.2
+  4-bit/full (32B), FLUX.2-klein (9B). Turbo LoRA (FLUX.2-dev only) and
+  uncensored LoRA (FLUX.1 only) load on top.
+- **Text encoding**: FLUX.1 4-bit can use HF's remote text-encoder API (with
+  bounded LRU embedding cache and automatic fallback to local encoders when the
+  endpoint is down); everything else uses local encoders. FLUX.2 has no remote
+  API (Mistral3/Qwen3 encoders).
+- **Stability**: the VAE always runs in fp32 (`_stabilize_vae_fp32`) to prevent
+  bf16 NaN → black-image decodes; generation retries once on a degenerate
+  (all-black) result.
+- **Web queue**: one worker thread, `QUEUE_MAX_SIZE=10`, jobs carry progress
+  state polled by the UI via `/status`. `/generate` validates all params at the
+  API boundary and returns 400s.
+- **Output convention**: `flux{1|2}_{YYYYMMDD_HHMMSS}_{8hex}.png` plus a
+  `.prompt` sidecar with the generation metadata, in `web-generated/` (server)
+  or the CWD (CLI). `image_manager.py` parses the `# Prompt:` sidecar line —
+  keep the format stable.
 
 ## Requirements
 
-- CUDA-capable GPU
-- Hugging Face token (via `huggingface-cli login` or `HF_TOKEN` env var)
-- FLUX.2 requires more VRAM than FLUX.1 (32B vs 12B parameters)
+- CUDA GPU; Hugging Face token (`huggingface-cli login` or `HF_TOKEN`)
+- `FLUX_API_KEY` env var (or `.env`) for the web server
+- FLUX.2-dev (32B) needs far more VRAM than FLUX.1 (12B) or klein (9B)

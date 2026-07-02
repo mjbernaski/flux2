@@ -48,14 +48,15 @@ wheels/
 
 # OS
 .DS_Store
+._.DS_Store
 Thumbs.db
+
+# Runtime artifacts
 nohup.out
-nohup.out
-.env
 server.log
 server.pid
-._.DS_Store
 
 # Generated image artifacts
 web-generated/
 server_smoke_test/
+debug-gallery/

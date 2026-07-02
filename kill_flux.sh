@@ -36,9 +36,9 @@ else
     log "No server.pid file found"
 fi
 
-# Kill any run_server.sh or run_flux*_server.sh processes
-log "Searching for supervisor bash scripts (run_server.sh, run_flux*_server.sh) via pgrep..."
-SUPERVISORS=$(pgrep -f "bash.*(run_server\.sh|run_flux.*_server\.sh)" 2>/dev/null)
+# Kill any run_server.sh supervisor processes
+log "Searching for supervisor bash scripts (run_server.sh) via pgrep..."
+SUPERVISORS=$(pgrep -f "bash.*run_server\.sh" 2>/dev/null)
 if [ -n "$SUPERVISORS" ]; then
     log "Found supervisor script PIDs: $SUPERVISORS"
     log "These are the bash processes that run the restart loop — killing them prevents the python server from being respawned"
@@ -69,7 +69,7 @@ else
     sleep 1
     # Verify everything is dead
     log "Checking if any processes survived the SIGTERM..."
-    REMAINING=$(pgrep -f "(run_server\.sh|run_flux.*_server\.sh|python.*web_server\.py)" 2>/dev/null)
+    REMAINING=$(pgrep -f "(run_server\.sh|python.*web_server\.py)" 2>/dev/null)
     if [ -n "$REMAINING" ]; then
         log "Processes still alive: $REMAINING — escalating to SIGKILL (force kill, cannot be caught)"
         echo "Force-killing remaining processes: $REMAINING"
