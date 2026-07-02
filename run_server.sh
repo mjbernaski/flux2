@@ -56,6 +56,9 @@ show_menu() {
     echo -e "   ${GREEN}11)${NC} Kontext Full     Instruction editing (FLUX.1, full bf16)"
     echo -e "   ${GREEN}12)${NC} Kontext Uncens.  Kontext Full + Uncensored LoRA (edit refs)"
     echo ""
+    echo -e "  ${YELLOW}Stable Diffusion (SDXL)${NC}"
+    echo -e "   ${GREEN}13)${NC} SDXL Uncensored  LUSTIFY! checkpoint, negative prompts"
+    echo ""
     echo -e "    ${RED}q)${NC} Quit"
     echo ""
 }
@@ -122,6 +125,12 @@ start_server() {
             args="--kontext --full-model --uncensored"
             desc="FLUX.1 Kontext Full + Uncensored LoRA"
             ;;
+        13)
+            # Uncensored SDXL checkpoint (sd_core.py backend). Override the
+            # checkpoint with SD_MODEL=<repo-or-path> before launching.
+            args="--sdxl"
+            desc="SDXL Uncensored (LUSTIFY!)"
+            ;;
         *)
             echo -e "${RED}Invalid selection${NC}"
             return 1
@@ -169,7 +178,9 @@ start_server() {
         # Run the server and append output to log
         # We use 'tee -a' for the script's own messages, but we want the python output 
         # to go to the log file. We also want to see it in the terminal.
-        python web_server.py $args "$@" 2>&1 | tee -a "$log_file"
+        # -u: unbuffered stdout so print() diagnostics land in the log/terminal
+        # immediately (block-buffering through the tee pipe delays them by KBs).
+        python -u web_server.py $args "$@" 2>&1 | tee -a "$log_file"
         exit_code=${PIPESTATUS[0]}
 
         local end_time=$(date +%s)
@@ -224,7 +235,7 @@ start_server() {
 # Main loop
 main() {
     # Check if a number was passed as argument
-    if [ -n "$1" ] && [[ "$1" =~ ^([1-9]|1[0-2])$ ]]; then
+    if [ -n "$1" ] && [[ "$1" =~ ^([1-9]|1[0-3])$ ]]; then
         start_server "$@"
         exit $?
     fi
@@ -237,7 +248,7 @@ main() {
 
     while true; do
         show_menu
-        echo -ne "${CYAN}Select configuration [1-12, default=9, q to quit]: ${NC}"
+        echo -ne "${CYAN}Select configuration [1-13, default=9, q to quit]: ${NC}"
         read -r choice
         # Empty input → run default (klein)
         if [ -z "$choice" ]; then
@@ -245,7 +256,7 @@ main() {
         fi
 
         case $choice in
-            [1-9]|1[0-2])
+            [1-9]|1[0-3])
                 start_server "$choice"
                 exit $?
                 ;;

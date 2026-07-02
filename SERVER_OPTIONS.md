@@ -32,9 +32,23 @@ Run with `./run_server.sh` for an interactive menu, or `./run_server.sh <number>
 | **11** | FLUX.1 Kontext Full | `--kontext --full-model` | The Kontext editor in full bf16 (no quantization) for maximum edit fidelity. Substantially more VRAM (~24GB transformer + ~9GB T5). |
 | **12** | Kontext Full + Uncensored | `--kontext --full-model --uncensored` | Kontext Full with the uncensored LoRA loaded, for editing reference images without content filters. |
 
+## Stable Diffusion (SDXL)
+
+| # | Name | Flags | Description |
+|---|------|-------|-------------|
+| **13** | SDXL Uncensored | `--sdxl` | Uncensored Stable Diffusion XL via the `sd_core.py` backend (default checkpoint `John6666/lustify-sdxl-nsfwsfw-v2-sdxl`, the photorealistic LUSTIFY! NSFW/SFW merge, bf16, ~7GB). Unlike FLUX, SDXL checkpoints have no instruction-refusal behavior — but they also have **no instruction understanding**: prompts must *describe the desired final image*, not command an edit. Enables the **negative prompt** field in the UI (a quality-boilerplate default applies when left empty); guidance defaults to 6.0 (real CFG); dimensions snap to SDXL's 64-px training buckets. The shipped scheduler config of auto-converted Civitai repos is corrected at load (EDM → Euler Ancestral; the EDM config produces pure noise). Supports txt2img, single-image img2img via the strength slider, and **masked inpainting** — the paint-a-mask UI works here too, lazy-loading the dedicated LUSTIFY v2.0 INPAINTING checkpoint (`SD_INPAINT_MODEL`, default `andro-flock/LUSTIFY-SDXL-NSFW-checkpoint-v2-0-INPAINTING`, ~7GB on first masked job); in inpaint mode the strength slider is the denoise level for the painted region (~0.4–0.7 edits, higher replaces). No Kontext-style instruction editing. Override the base checkpoint with `SD_MODEL=<hf-repo-or-path>` or `./run_server.sh 13 --sdxl /path/to/checkpoint.safetensors` (single-file Civitai downloads work). Outputs are named `sdxl_*.png`. |
+
 ## Notes
 
 - All servers launch on **port 2222** with a web UI
+- Extra flags pass through the launcher, e.g. `./run_server.sh 9 --compile`:
+  torch.compile makes the first generation per resolution much slower but
+  later ones ~10-25% faster — best for sessions at a consistent resolution
+- Batch jobs encode the prompt once and reuse the embeddings for every image;
+  LoRAs (turbo/uncensored) are fused into the base weights at load
+- Up to **3 reference images** per generation: FLUX.2 (6-9) uses them natively;
+  Kontext (10-12) stitches them side-by-side (address them as left/middle/right
+  in the instruction); FLUX.1 img2img (1-5) takes a single reference
 - Auto-restart is enabled (up to 5 retries on crash, including OOM kills)
 - FLUX.2 models require substantially more VRAM than FLUX.1
 - GGUF and schnell modes are FLUX.1 only; the uncensored LoRA is also FLUX.1 only
