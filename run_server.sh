@@ -51,6 +51,11 @@ show_menu() {
     echo -e "    ${GREEN}8)${NC} Full (no Turbo)  Max quality, slower"
     echo -e "    ${GREEN}9)${NC} klein-9B         ${YELLOW}[default]${NC} faster 9B"
     echo ""
+    echo -e "  ${YELLOW}Editing${NC}"
+    echo -e "   ${GREEN}10)${NC} Kontext          Instruction editing (FLUX.1, 4-bit)"
+    echo -e "   ${GREEN}11)${NC} Kontext Full     Instruction editing (FLUX.1, full bf16)"
+    echo -e "   ${GREEN}12)${NC} Kontext Uncens.  Kontext Full + Uncensored LoRA (edit refs)"
+    echo ""
     echo -e "    ${RED}q)${NC} Quit"
     echo ""
 }
@@ -104,6 +109,18 @@ start_server() {
         9)
             args="--klein"
             desc="FLUX.2-klein-9B"
+            ;;
+        10)
+            args="--kontext"
+            desc="FLUX.1 Kontext (editor)"
+            ;;
+        11)
+            args="--kontext --full-model"
+            desc="FLUX.1 Kontext Full (editor, bf16)"
+            ;;
+        12)
+            args="--kontext --full-model --uncensored"
+            desc="FLUX.1 Kontext Full + Uncensored LoRA"
             ;;
         *)
             echo -e "${RED}Invalid selection${NC}"
@@ -201,7 +218,7 @@ start_server() {
 # Main loop
 main() {
     # Check if a number was passed as argument
-    if [ -n "$1" ] && [[ "$1" =~ ^[1-9]$ ]]; then
+    if [ -n "$1" ] && [[ "$1" =~ ^([1-9]|1[0-2])$ ]]; then
         start_server "$@"
         exit $?
     fi
@@ -214,7 +231,7 @@ main() {
 
     while true; do
         show_menu
-        echo -ne "${CYAN}Select configuration [1-9, default=9, q to quit]: ${NC}"
+        echo -ne "${CYAN}Select configuration [1-12, default=9, q to quit]: ${NC}"
         read -r choice
         # Empty input → run default (klein)
         if [ -z "$choice" ]; then
@@ -222,7 +239,7 @@ main() {
         fi
 
         case $choice in
-            [1-9])
+            [1-9]|1[0-2])
                 start_server "$choice"
                 exit $?
                 ;;
