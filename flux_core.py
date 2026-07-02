@@ -1,4 +1,5 @@
 import argparse
+import inspect
 import torch
 import os
 import socket
@@ -625,7 +626,25 @@ def load_turbo_lora():
     )
     load_time = time.perf_counter() - t0
     print(f"  Turbo LoRA loaded in {load_time:.2f}s")
+    _fuse_loaded_lora()
     _turbo_enabled = True
+
+
+def _fuse_loaded_lora():
+    """Fuse the just-loaded LoRA into the base weights.
+
+    Unfused adapters add extra matmuls to every transformer forward (~5-10%
+    per step). A server process is locked to one model config for its
+    lifetime, so nothing ever needs to detach the adapter — fusing is a pure
+    win. Falls back to running unfused if fusing isn't supported (e.g. on a
+    quantized base model).
+    """
+    try:
+        t0 = time.perf_counter()
+        pipe.fuse_lora()
+        print(f"  LoRA fused into base weights in {time.perf_counter() - t0:.2f}s")
+    except Exception as e:
+        print(f"  Warning: could not fuse LoRA, running unfused: {e}")
 
 
 _uncensored_enabled = False  # Track if uncensored LoRA is loaded
@@ -657,6 +676,7 @@ def load_uncensored_lora():
     pipe.load_lora_weights("lustlyai/Flux_Lustly.ai_Uncensored_nsfw_v1")
     load_time = time.perf_counter() - t0
     print(f"  Uncensored LoRA loaded in {load_time:.2f}s")
+    _fuse_loaded_lora()
     _uncensored_enabled = True
 
 
@@ -723,6 +743,56 @@ def remote_encoder_available():
         print(f"  Remote text encoder probe failed: {e}")
         return False
 
+def encode_prompt_once(prompt):
+    """Pre-encode ``prompt`` and return pipeline kwargs reusable across calls.
+
+    Generating a batch re-runs the text encoder for every image even though
+    the prompt is identical — and FLUX.2's encoders are LLM-sized (Mistral3 /
+    Qwen3), so that's seconds of redundant work per image. Callers with a
+    multi-image job encode once here and pass the result to generate_image()
+    as ``prompt_embeds_kwargs``.
+
+    Returns None when pre-encoding doesn't apply (the FLUX.1 remote-encoder
+    path, which already has its own embedding cache) or fails (callers fall
+    back to normal per-call encoding).
+    """
+    if pipe is None:
+        raise RuntimeError("Model must be loaded before encoding prompts")
+    if _flux_version == 1 and not (_local_encoder_active or _kontext_enabled):
+        return None
+    try:
+        with torch.inference_mode():
+            if _flux_version == 2:
+                prompt_embeds, _ = pipe.encode_prompt(
+                    prompt=prompt, device=device, max_sequence_length=512)
+                kwargs = {"prompt_embeds": prompt_embeds}
+                # Klein-style pipelines run true CFG with an empty negative
+                # prompt unless the checkpoint is distilled (klein-9B is);
+                # pre-encode the negative too so CFG runs skip both passes.
+                if ("negative_prompt_embeds" in inspect.signature(pipe.__call__).parameters
+                        and not getattr(pipe.config, "is_distilled", True)):
+                    neg_embeds, _ = pipe.encode_prompt(
+                        prompt="", device=device, max_sequence_length=512)
+                    kwargs["negative_prompt_embeds"] = neg_embeds
+                return kwargs
+            # FLUX.1 / Kontext: T5 + CLIP
+            prompt_embeds, pooled_prompt_embeds, _ = pipe.encode_prompt(
+                prompt=prompt, prompt_2=None, device=device, max_sequence_length=512)
+            return {"prompt_embeds": prompt_embeds,
+                    "pooled_prompt_embeds": pooled_prompt_embeds}
+    except Exception as e:
+        print(f"Warning: prompt pre-encoding failed ({e}); using per-image encoding")
+        return None
+
+
+def _apply_prompt_embeds(pipe_kwargs, prompt_embeds_kwargs):
+    """Swap a kwargs dict from raw-prompt to precomputed-embeddings form."""
+    if prompt_embeds_kwargs:
+        pipe_kwargs.pop("prompt", None)
+        pipe_kwargs.update(prompt_embeds_kwargs)
+    return pipe_kwargs
+
+
 def _infer_latent_grid(seq, height, width, cell):
     """Recover the true (grid_h, grid_w) token grid for ``seq`` packed latents.
 
@@ -757,12 +827,33 @@ def _infer_latent_grid(seq, height, width, cell):
     return best[1], best[2]
 
 
+def _shrink_latents_for_preview(lat, vae_scale_factor, max_size):
+    """Spatially downsample latents so the decoded preview is ~max_size px.
+
+    VAE decode cost scales with output area; a full-resolution fp32 decode of
+    a 1-2MP image costs hundreds of ms, which at the preview interval can add
+    30-50% to generation time. Previews get downscaled to max_size anyway, so
+    decode small instead: shrinking the latents first cuts decode work by the
+    square of the scale (4x for 1MP, ~8x for 2MP) for a slightly softer
+    preview. No hardcoded per-model constants — works for any conv VAE.
+    """
+    if not max_size:
+        return lat
+    out_px = max(lat.shape[-2:]) * vae_scale_factor
+    if out_px <= max_size:
+        return lat
+    return torch.nn.functional.interpolate(
+        lat, scale_factor=max_size / out_px, mode="area")
+
+
 def decode_latents_to_preview(pipe_obj, latents, height, width, max_size=512):
     """Decode intermediate Flux latents into a PIL preview image.
 
     Handles both FLUX.1 (scaling_factor/shift_factor + _unpack_latents) and
-    FLUX.2 (batch-norm stats + _unpatchify_latents). Returns None on any
-    failure so callers can treat previews as best-effort.
+    FLUX.2 (batch-norm stats + _unpatchify_latents). Latents are spatially
+    downsampled before decoding so the preview never pays for a full-res
+    decode. Returns None on any failure so callers can treat previews as
+    best-effort.
     """
     if pipe_obj is None or latents is None:
         return None
@@ -789,6 +880,7 @@ def decode_latents_to_preview(pipe_obj, latents, height, width, max_size=512):
                 ).to(lat.device, lat.dtype)
                 lat = lat * bn_std + bn_mean
                 lat = unpatchify(lat)
+                lat = _shrink_latents_for_preview(lat, vae_scale_factor, max_size)
                 decoded = vae.decode(lat, return_dict=False)[0]
             else:
                 # FLUX.1
@@ -801,6 +893,8 @@ def decode_latents_to_preview(pipe_obj, latents, height, width, max_size=512):
                     lat = unpack(latents, gh * cell, gw * cell, vae_scale_factor)
                 else:
                     lat = latents
+                if lat.dim() == 4:
+                    lat = _shrink_latents_for_preview(lat, vae_scale_factor, max_size)
                 vae_cfg = pipe_obj.vae.config
                 lat = (lat / vae_cfg.scaling_factor) + vae_cfg.shift_factor
                 decoded = pipe_obj.vae.decode(lat, return_dict=False)[0]
@@ -888,7 +982,36 @@ def _flux2_inpaint_callback(x0, noise, mask, user_callback):
     return cb
 
 
-def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_encoder=False, input_image=None, strength=0.75, sigmas=None, guidance_scale=None, callback_on_step_end=None, mask_image=None, _retry_depth=0):
+MAX_REFERENCE_IMAGES = 3
+
+
+def _stitch_references(images, gap=16):
+    """Combine multiple reference images into one side-by-side canvas.
+
+    FLUX.1 Kontext conditions on a single image (diffusers' pipeline treats a
+    list as a batch and only uses the first), so multi-reference editing uses
+    the standard stitching technique: normalize heights, lay the images out
+    left-to-right with a thin white divider, and let the edit instruction
+    refer to them positionally ("the person in the left image", "the style of
+    the right image"). FLUX.2 doesn't need this — its pipeline conditions on a
+    list of images natively.
+    """
+    imgs = [im.convert("RGB") for im in images]
+    target_h = min(max(im.height for im in imgs), 1024)
+    resized = []
+    for im in imgs:
+        w = max(1, round(im.width * target_h / im.height))
+        resized.append(im.resize((w, target_h), Image.Resampling.LANCZOS))
+    total_w = sum(im.width for im in resized) + gap * (len(resized) - 1)
+    canvas = Image.new("RGB", (total_w, target_h), (255, 255, 255))
+    x = 0
+    for im in resized:
+        canvas.paste(im, (x, 0))
+        x += im.width + gap
+    return canvas
+
+
+def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_encoder=False, input_image=None, strength=0.75, sigmas=None, guidance_scale=None, callback_on_step_end=None, mask_image=None, prompt_embeds_kwargs=None, _retry_depth=0):
     """Generate an image from a text prompt.
 
     Args:
@@ -898,7 +1021,12 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
         width: Output image width
         height: Output image height
         local_encoder: Use local text encoder instead of remote API
-        input_image: Optional PIL Image for img2img generation
+        input_image: Optional PIL Image — or a list of up to MAX_REFERENCE_IMAGES
+            of them — used as reference(s). The first image is the primary (it
+            drives the output aspect ratio). Multiple references need FLUX.2
+            (conditions on the list natively) or Kontext (references are
+            stitched into one canvas; address them as left/middle/right in the
+            instruction). FLUX.1 img2img takes a single image.
         strength: Denoising strength for img2img (0.0-1.0, higher = more change)
         sigmas: Custom noise schedule (for turbo LoRA, use TURBO_SIGMAS)
         guidance_scale: Classifier-free guidance scale (default: 4, turbo uses 2.5)
@@ -908,6 +1036,10 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
             the region to regenerate; black pixels are preserved. Requires
             input_image and FLUX.2 (the FLUX.2 family has no inpaint pipeline, so
             this is done via masked latent re-injection on Flux2Pipeline).
+        prompt_embeds_kwargs: Optional dict from encode_prompt_once(prompt) —
+            precomputed text embeddings for this same prompt, used instead of
+            re-encoding. Callers generating batches pass this to skip a
+            text-encoder forward per image. Ignored on the remote-encoder path.
     """
     global pipe_img2img
 
@@ -916,6 +1048,28 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
             "Inpainting (mask_image) is only supported on FLUX.2. "
             "Start the server/CLI with --flux2."
         )
+
+    # Normalize the reference input to a list. The first image is the primary
+    # reference; extra images are only meaningful for FLUX.2 (native
+    # multi-reference) and Kontext (stitched into one conditioning canvas).
+    if isinstance(input_image, (list, tuple)):
+        ref_images = [im for im in input_image if im is not None]
+    elif input_image is not None:
+        ref_images = [input_image]
+    else:
+        ref_images = []
+    input_image = ref_images[0] if ref_images else None
+
+    if len(ref_images) > MAX_REFERENCE_IMAGES:
+        raise ValueError(f"At most {MAX_REFERENCE_IMAGES} reference images are supported.")
+    if len(ref_images) > 1:
+        if mask_image is not None:
+            raise ValueError("Inpainting (mask_image) uses exactly one input image.")
+        if not (_kontext_enabled or _flux_version == 2):
+            raise ValueError(
+                "Multiple reference images require the Kontext editor or FLUX.2; "
+                "FLUX.1 img2img takes a single image."
+            )
 
     if seed is None:
         seed = torch.randint(0, 2**32, (1,)).item()
@@ -993,10 +1147,16 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
                         "height": (best_h // multiple_of) * multiple_of,
                     }
 
+                # Multiple references get stitched into one canvas; the output
+                # dims above still come from the primary image, so the edit
+                # result keeps the primary's aspect ratio.
+                cond_image = (_stitch_references(ref_images)
+                              if len(ref_images) > 1 else input_image.convert("RGB"))
+
                 t0 = time.perf_counter()
                 kontext_kwargs = {
                     "prompt": prompt,
-                    "image": input_image.convert("RGB"),
+                    "image": cond_image,
                     "generator": torch.Generator(device=device).manual_seed(seed),
                     "num_inference_steps": steps,
                     "guidance_scale": guidance_scale,
@@ -1005,7 +1165,7 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
                 }
                 if callback_on_step_end is not None:
                     kontext_kwargs["callback_on_step_end"] = callback_on_step_end
-                image = pipe(**kontext_kwargs).images[0]
+                image = pipe(**_apply_prompt_embeds(kontext_kwargs, prompt_embeds_kwargs)).images[0]
                 timings['diffusion'] = time.perf_counter() - t0
                 timings['encoding'] = 0
             elif _flux_version == 2 and mask_image is not None:
@@ -1033,7 +1193,7 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
                 }
                 if sigmas is not None:
                     pipe_kwargs["sigmas"] = sigmas
-                image = pipe(**pipe_kwargs).images[0]
+                image = pipe(**_apply_prompt_embeds(pipe_kwargs, prompt_embeds_kwargs)).images[0]
 
                 # Paste the untouched original back outside the mask: pinning the
                 # latents preserves structure, but the VAE round-trip can still
@@ -1049,13 +1209,20 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
                 timings['encoding'] = 0
             elif _flux_version == 2:
                 # FLUX.2 has image conditioning built into the main pipeline
-                # (no strength parameter - image is used as reference/conditioning)
-                input_image = input_image.resize((width, height), Image.Resampling.LANCZOS)
+                # (no strength parameter - image is used as reference/conditioning).
+                # It accepts a list of references natively: each is VAE-encoded
+                # separately (the pipeline caps them at ~1MP) and their tokens
+                # are concatenated, so pass multiple images through as-is. A
+                # single reference keeps the resize-to-output behavior.
+                if len(ref_images) > 1:
+                    pipe_image = [im.convert("RGB") for im in ref_images]
+                else:
+                    pipe_image = input_image.resize((width, height), Image.Resampling.LANCZOS)
 
                 t0 = time.perf_counter()
                 pipe_kwargs = {
                     "prompt": prompt,
-                    "image": input_image,
+                    "image": pipe_image,
                     "generator": torch.Generator(device=device).manual_seed(seed),
                     "num_inference_steps": steps,
                     "guidance_scale": guidance_scale,
@@ -1067,7 +1234,7 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
                     pipe_kwargs["sigmas"] = sigmas
                 if callback_on_step_end is not None:
                     pipe_kwargs["callback_on_step_end"] = callback_on_step_end
-                image = pipe(**pipe_kwargs).images[0]
+                image = pipe(**_apply_prompt_embeds(pipe_kwargs, prompt_embeds_kwargs)).images[0]
                 timings['diffusion'] = time.perf_counter() - t0
                 timings['encoding'] = 0
             else:
@@ -1105,7 +1272,7 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
                 }
                 if callback_on_step_end is not None:
                     img2img_kwargs["callback_on_step_end"] = callback_on_step_end
-                image = pipe_img2img(**img2img_kwargs).images[0]
+                image = pipe_img2img(**_apply_prompt_embeds(img2img_kwargs, prompt_embeds_kwargs)).images[0]
                 timings['diffusion'] = time.perf_counter() - t0
                 timings['encoding'] = 0
         elif local_encoder or _local_encoder_active or _flux_version == 2:
@@ -1124,7 +1291,7 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
                 pipe_kwargs["sigmas"] = sigmas
             if callback_on_step_end is not None:
                 pipe_kwargs["callback_on_step_end"] = callback_on_step_end
-            image = pipe(**pipe_kwargs).images[0]
+            image = pipe(**_apply_prompt_embeds(pipe_kwargs, prompt_embeds_kwargs)).images[0]
             timings['diffusion'] = time.perf_counter() - t0
             timings['encoding'] = 0  # Included in diffusion for local
         else:
@@ -1158,9 +1325,12 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
                   f"(attempt {_retry_depth + 2}/{_MAX_GEN_RETRIES + 1})", flush=True)
             return generate_image(
                 prompt, seed=retry_seed, steps=steps, width=width, height=height,
-                local_encoder=local_encoder, input_image=input_image, strength=strength,
+                local_encoder=local_encoder,
+                input_image=(ref_images if len(ref_images) > 1 else input_image),
+                strength=strength,
                 sigmas=sigmas, guidance_scale=guidance_scale,
                 callback_on_step_end=callback_on_step_end, mask_image=mask_image,
+                prompt_embeds_kwargs=prompt_embeds_kwargs,
                 _retry_depth=_retry_depth + 1)
         raise DegenerateImageError(
             f"Generation produced an all-black image after {_MAX_GEN_RETRIES + 1} "

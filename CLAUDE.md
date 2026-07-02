@@ -61,9 +61,22 @@ diffusers, transformers, flask, python-dotenv, huggingface_hub, requests.
 - **Stability**: the VAE always runs in fp32 (`_stabilize_vae_fp32`) to prevent
   bf16 NaN → black-image decodes; generation retries once on a degenerate
   (all-black) result.
+- **Reference images**: `generate_image` accepts one PIL image or a list of up
+  to `MAX_REFERENCE_IMAGES` (3). FLUX.2 pipelines take the list natively;
+  Kontext stitches multiple refs side-by-side (`_stitch_references`) since its
+  diffusers pipeline conditions on a single image; FLUX.1 img2img rejects >1.
+  The API field is `input_images` (list); legacy single `input_image` is
+  normalized into it at validation.
 - **Web queue**: one worker thread, `QUEUE_MAX_SIZE=10`, jobs carry progress
   state polled by the UI via `/status`. `/generate` validates all params at the
   API boundary and returns 400s.
+- **Performance**: batch jobs pre-encode the prompt once
+  (`encode_prompt_once` → `prompt_embeds_kwargs`) instead of re-running the
+  LLM-sized FLUX.2 encoders per image; LoRAs are fused after loading
+  (`_fuse_loaded_lora`); live previews decode spatially-downsampled latents
+  (`_shrink_latents_for_preview`), not full resolution; `web_server.py
+  --compile` torch.compiles the transformer (lazy — first generation per
+  resolution is slow).
 - **Output convention**: `flux{1|2}_{YYYYMMDD_HHMMSS}_{8hex}.png` plus a
   `.prompt` sidecar with the generation metadata, in `web-generated/` (server)
   or the CWD (CLI). `image_manager.py` parses the `# Prompt:` sidecar line —

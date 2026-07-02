@@ -60,3 +60,4 @@ server.pid
 web-generated/
 server_smoke_test/
 debug-gallery/
+edit-loop-sessions/

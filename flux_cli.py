@@ -5,6 +5,7 @@ Model loading and generation live in flux_core; this module is just the
 command-line front end.
 """
 import argparse
+import os
 import socket
 import time
 import uuid
@@ -19,6 +20,7 @@ from flux_core import (
     compile_pipeline,
     save_prompt_file,
     play_completion_sound,
+    MAX_REFERENCE_IMAGES,
 )
 
 
@@ -34,7 +36,9 @@ def main():
     parser.add_argument("--flux2", action="store_true", help="Use FLUX.2 model instead of FLUX.1 (requires more VRAM)")
     parser.add_argument("--schnell", action="store_true", help="Use FLUX.1-schnell (fast 4-step model, Apache 2.0 license)")
     parser.add_argument("--kontext", action="store_true", help="Use FLUX.1 Kontext, an instruction-based image editor (4-bit; add --full-model for full bf16). Pass --image and a prompt describing the edit.")
-    parser.add_argument("--image", type=str, default=None, help="Reference image path for img2img generation")
+    parser.add_argument("--image", type=str, nargs='+', default=None, metavar="PATH",
+                        help=f"Reference image path(s) for img2img/editing, up to {MAX_REFERENCE_IMAGES}. "
+                             "Multiple references need --kontext (stitched side-by-side) or --flux2 (native)")
     parser.add_argument("--strength", type=float, default=0.75, help="Denoising strength for img2img (0.0-1.0, default: 0.75). Higher = more change from original")
     args = parser.parse_args()
 
@@ -54,17 +58,29 @@ def main():
     steps = args.steps
     guidance_scale = args.guidance  # None means use default (4 for normal, 2.5 for turbo)
     strength = args.strength  # Denoising strength for img2img
-    input_image = None
-    if args.image:
-        try:
-            input_image = Image.open(args.image).convert("RGB")
-            print(f"Loaded reference image: {args.image} ({input_image.size[0]}x{input_image.size[1]})")
-        except Exception as e:
-            print(f"Warning: Could not load reference image '{args.image}': {e}")
-            print("Continuing in text-to-image mode (no img2img).")
-            input_image = None
+    def load_reference_images(paths):
+        """Load up to MAX_REFERENCE_IMAGES paths; returns [] if any fails."""
+        if len(paths) > MAX_REFERENCE_IMAGES:
+            print(f"At most {MAX_REFERENCE_IMAGES} reference images are supported.")
+            return []
+        loaded = []
+        for path in paths:
+            try:
+                img = Image.open(path).convert("RGB")
+            except Exception as e:
+                print(f"Could not load image '{path}': {e}")
+                return []
+            loaded.append(img)
+            print(f"Loaded reference image {len(loaded)}: {path} ({img.size[0]}x{img.size[1]})")
+        return loaded
 
-    if args.kontext and input_image is None:
+    input_images = []
+    if args.image:
+        input_images = load_reference_images(args.image)
+        if not input_images:
+            print("Continuing in text-to-image mode (no img2img).")
+
+    if args.kontext and not input_images:
         print("Note: --kontext is an image editor; load a source image with --image "
               "or '/image <path>' before prompting, or output will be plain txt2img.")
 
@@ -111,7 +127,7 @@ def main():
         print("  '/help' - Show this command list")
         print("  '/steps <number>' - Change inference steps (current: {})".format(steps))
         print("  '/guidance <number>' - Change guidance scale (current: {}, lower=more variety)".format(guidance_scale if guidance_scale is not None else "auto"))
-        print("  '/image <path>' - Load reference image for img2img (use '/image clear' to remove)")
+        print("  '/image <path> [path2] [path3]' - Load reference image(s); multiple need Kontext or FLUX.2 ('/image clear' to remove)")
         print("  '/strength <number>' - Set img2img denoising strength 0.0-1.0 (current: {})".format(strength))
         print("  '/square' - Set square aspect ratio")
         print("  '/portrait' - Set portrait aspect ratio")
@@ -196,16 +212,17 @@ def main():
         if cmd == '/image':
             image_arg = user_input.split(maxsplit=1)[1] if len(tokens) > 1 else ""
             if not image_arg:
-                print("Usage: /image <path> (or '/image clear' to remove)")
+                print(f"Usage: /image <path> [path2] [path3] (up to {MAX_REFERENCE_IMAGES}; '/image clear' to remove)")
             elif image_arg.lower() == 'clear':
-                input_image = None
-                print("Reference image cleared. Using text-to-image mode.")
+                input_images = []
+                print("Reference images cleared. Using text-to-image mode.")
             else:
-                try:
-                    input_image = Image.open(image_arg).convert("RGB")
-                    print(f"Loaded reference image: {image_arg} ({input_image.size[0]}x{input_image.size[1]})")
-                except Exception as e:
-                    print(f"Could not load image '{image_arg}': {e}")
+                # A single path may contain spaces, so try the whole argument as
+                # one path first; only then treat it as space-separated paths.
+                paths = [image_arg] if os.path.exists(image_arg) else image_arg.split()
+                loaded = load_reference_images(paths)
+                if loaded:
+                    input_images = loaded
             continue
 
         if lower_input in orientation_modifiers:
@@ -281,13 +298,16 @@ def main():
         gen_info_parts = [f"{steps} steps", f"{width}x{height}"]
         if guidance_scale is not None:
             gen_info_parts.append(f"guidance={guidance_scale}")
-        if input_image:
+        if len(input_images) > 1:
+            gen_info_parts.append(f"{len(input_images)} reference images")
+        elif input_images:
             gen_info_parts.append(f"img2img strength={strength}")
         gen_info = ", ".join(gen_info_parts)
 
+        gen_input = input_images if len(input_images) > 1 else (input_images[0] if input_images else None)
         print(f"\n[{hostname}] Generating: {gen_info}")
         try:
-            image, last_seed, timings = generate_image(prompt, last_seed if lower_input.startswith('reseed ') else None, steps, width, height, use_local_encoder, input_image=input_image, strength=strength, guidance_scale=guidance_scale)
+            image, last_seed, timings = generate_image(prompt, last_seed if lower_input.startswith('reseed ') else None, steps, width, height, use_local_encoder, input_image=gen_input, strength=strength, guidance_scale=guidance_scale)
         except KeyboardInterrupt:
             print("\nGeneration cancelled.")
             continue
@@ -305,7 +325,7 @@ def main():
         timings['save'] = time.perf_counter() - t0
 
         # Save prompt file alongside image
-        save_prompt_file(filename, raw_input_text, prompt, width, height, last_seed, steps, timings, guidance_scale, strength if input_image else None)
+        save_prompt_file(filename, raw_input_text, prompt, width, height, last_seed, steps, timings, guidance_scale, strength if len(input_images) == 1 else None)
 
         # Clean summary output
         total_time = timings['total'] + timings['save']
