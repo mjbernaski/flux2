@@ -68,7 +68,8 @@ if (apiKeyInput) {
         .then(function(r) { if (!r.ok) throw new Error(r.status); return r.json(); })
         .then(function(data) {
             clearTimeout(timeout);
-            el.textContent = data.description || 'FLUX Image Generator';
+            // Model name is intentionally not shown on the page; the fetched
+            // info still drives the capability toggles below.
             var h = document.getElementById('hostname'); if (h) h.textContent = data.hostname || '';
             var v = document.getElementById('version'); if (v) v.textContent = 'v' + (data.version || '');
             window.__fluxVersion = data.flux_version || null;

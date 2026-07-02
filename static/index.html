@@ -20,7 +20,9 @@
         <span class="version" id="version"></span>
     </div>
     <h1>FLUX Image Generator</h1>
-    <p class="subtitle" id="modelInfo">Loading model info...</p>
+    <!-- Model name intentionally not displayed; /model-info still drives
+         capability toggles (inpaint, negative prompt, schnell) in app.js. -->
+    <p class="subtitle" id="modelInfo" style="display: none;"></p>
 
     <!-- Security UI -->
     <div class="security-section">
