@@ -919,16 +919,53 @@ def model_info():
     })
 
 
+# Async critique bookkeeping. The qwen3.6 vision critique can run for
+# several minutes — far past the ~60s connection cap browsers (Safari
+# especially) put on a single fetch — so POST /critique only validates and
+# starts the work, and the client polls GET /critique/<id> for the result.
+_critique_lock = threading.Lock()
+_critique_results: dict = {}  # id -> {'done': bool, 'created': float, 'result': dict|None}
+CRITIQUE_RESULT_TTL_S = 3600
+
+
+def _run_critique(cid, model, direction, prompt, reference, output, history, style):
+    from edit_loop import (vlm_critique, edit_metrics, heuristic_revision,
+                           describe_metrics)
+    try:
+        metrics = edit_metrics(reference, output)
+        result = vlm_critique(model, direction, prompt, reference, output, metrics,
+                              ollama_url=OLLAMA_URL, style=style, history=history)
+        if result:
+            payload = {'success': True, 'vlm': True, 'metrics': metrics,
+                       'metrics_text': describe_metrics(metrics),
+                       'applied': bool(result.get('applied')),
+                       'score': result.get('score'),
+                       'critique': result.get('critique', ''),
+                       'revised_prompt': result.get('revised_prompt')}
+        else:
+            payload = {'success': True, 'vlm': False, 'metrics': metrics,
+                       'metrics_text': describe_metrics(metrics),
+                       'applied': None,
+                       'score': None,
+                       'critique': 'Vision model unavailable — revision based on pixel metrics only.',
+                       'revised_prompt': heuristic_revision(direction, prompt, metrics)}
+    except Exception as e:
+        payload = {'success': False, 'error': f'critique failed: {e}'}
+    with _critique_lock:
+        entry = _critique_results.get(cid)
+        if entry is not None:
+            entry['result'] = payload
+            entry['done'] = True
+
+
 @app.route('/critique', methods=['POST'])
 def critique():
     """Compare an edit output against its reference and propose a revised
     instruction — the "look at the output" step of the edit loop (UI panel
     and edit_loop.py). Vision critique runs on the local ollama daemon
     (OLLAMA_URL / CRITIQUE_MODEL env vars); when it's unavailable the
-    response falls back to pixel-metric heuristics."""
-    from edit_loop import (vlm_critique, edit_metrics, heuristic_revision,
-                           describe_metrics)
-
+    result falls back to pixel-metric heuristics. Returns a critique_id
+    immediately; poll GET /critique/<id> for the result."""
     data = request.json or {}
     direction = (data.get('direction') or '').strip()
     prompt = (data.get('prompt') or direction).strip()
@@ -949,28 +986,57 @@ def critique():
         return jsonify({'success': False, 'error': 'ref_image is not a decodable base64 image'}), 400
 
     output = Image.open(out_path).convert('RGB')
-    metrics = edit_metrics(reference, output)
     model = data.get('model') or CRITIQUE_MODEL
     style = ("description" if getattr(flux_core, 'OUTPUT_PREFIX', '') == 'sdxl'
              else "instruction")
     # Prompt trajectory from earlier iterations ({prompt, applied, score,
     # critique} dicts) so the critic doesn't re-propose failed phrasings.
     history = data.get('history') if isinstance(data.get('history'), list) else []
-    result = vlm_critique(model, direction, prompt, reference, output, metrics,
-                          ollama_url=OLLAMA_URL, style=style, history=history)
-    if result:
-        return jsonify({'success': True, 'vlm': True, 'metrics': metrics,
-                        'metrics_text': describe_metrics(metrics),
-                        'applied': bool(result.get('applied')),
-                        'score': result.get('score'),
-                        'critique': result.get('critique', ''),
-                        'revised_prompt': result.get('revised_prompt')})
-    return jsonify({'success': True, 'vlm': False, 'metrics': metrics,
-                    'metrics_text': describe_metrics(metrics),
-                    'applied': None,
-                    'score': None,
-                    'critique': 'Vision model unavailable — revision based on pixel metrics only.',
-                    'revised_prompt': heuristic_revision(direction, prompt, metrics)})
+
+    cid = uuid.uuid4().hex[:12]
+    now = time.time()
+    with _critique_lock:
+        for old_id in [k for k, v in _critique_results.items()
+                       if v['done'] and now - v['created'] > CRITIQUE_RESULT_TTL_S]:
+            del _critique_results[old_id]
+        _critique_results[cid] = {'done': False, 'created': now, 'result': None}
+    threading.Thread(target=_run_critique, daemon=True, name=f'critique-{cid}',
+                     args=(cid, model, direction, prompt, reference, output,
+                           history, style)).start()
+    return jsonify({'success': True, 'critique_id': cid})
+
+
+@app.route('/critique/<cid>')
+def critique_result(cid):
+    """Poll for an async critique started by POST /critique."""
+    with _critique_lock:
+        entry = _critique_results.get(cid)
+        if entry is None:
+            return jsonify({'success': False, 'error': f'unknown critique id {cid}'}), 404
+        if not entry['done']:
+            return jsonify({'success': True, 'done': False})
+        result = dict(entry['result'])
+    result['done'] = True
+    status = 200 if result.get('success') else 500
+    return jsonify(result), status
+
+
+def _warm_critique_model():
+    """Pull the critique VLM into ollama's memory at server startup so the
+    edit loop's first critique doesn't pay the multi-minute cold load. An
+    empty /api/generate request loads the model and returns; keep_alive
+    matches the 15m refresh on every real critique call (edit_loop.py)."""
+    import urllib.request
+    payload = json.dumps({"model": CRITIQUE_MODEL, "stream": False,
+                          "keep_alive": "15m"}).encode()
+    req = urllib.request.Request(f"{OLLAMA_URL}/api/generate", data=payload,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=600) as r:
+            r.read()
+        print(f"Critique model {CRITIQUE_MODEL} loaded in ollama.")
+    except Exception as e:
+        print(f"Critique model warm-up skipped: {e}")
 
 
 @app.route('/loop-strip', methods=['POST'])
@@ -1216,6 +1282,8 @@ if __name__ == '__main__':
 
     _model_load_start_ts = time.perf_counter()
     threading.Thread(target=_load_in_background, daemon=True).start()
+    threading.Thread(target=_warm_critique_model, daemon=True,
+                     name='critique-warmup').start()
     _start_queue_worker()
     print(f"\nStarting web server on http://0.0.0.0:{args.port} (model loading in background)")
     app.run(host='0.0.0.0', port=args.port, threaded=True)

@@ -1351,6 +1351,20 @@ async function loopAwaitJob(jobId) {
     }
 }
 
+// The vision critic can run for several minutes — far past the ~60s cap
+// Safari puts on a single fetch — so POST /critique returns an id right away
+// and the verdict is collected by polling.
+async function loopAwaitCritique(critiqueId) {
+    for (;;) {
+        await new Promise(r => setTimeout(r, 2000));
+        const res = await fetch('/critique/' + critiqueId, { headers: getAuthHeaders() });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.success) throw new Error(data.error || `HTTP ${res.status}`);
+        if (data.done) return data;
+        if (loopRun && loopRun.stop) throw new Error('stopped');
+    }
+}
+
 async function loopFetchAsDataUrl(filename) {
     const res = await fetch('/images/' + filename, { headers: getAuthHeaders() });
     if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -1466,8 +1480,9 @@ async function runEditLoop() {
                         history: critHistory
                     })
                 });
-                critique = await res.json();
-                if (!res.ok || !critique.success) throw new Error(critique.error || `HTTP ${res.status}`);
+                const submitted = await res.json().catch(() => ({}));
+                if (!res.ok || !submitted.success) throw new Error(submitted.error || `HTTP ${res.status}`);
+                critique = await loopAwaitCritique(submitted.critique_id);
             } catch (err) {
                 critique = null;
                 verdictEl.textContent = 'Critique unavailable: ' + err.message;
