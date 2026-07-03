@@ -2,8 +2,9 @@
 
 Run with `./run_server.sh` for an interactive menu, or `./run_server.sh <number>` to launch directly.
 
-> Numbers below match `run_server.sh`. Keep this table in sync with the `case`
-> statement in that script if the menu is ever renumbered.
+> Numbers below match `run_server.sh`. Keep this table in sync with the
+> `set_config_args` case statement in that script — and the `SERVER_CONFIGS`
+> table in `web_server.py` — if the menu is ever renumbered.
 
 ## FLUX.1 Models (12B)
 
@@ -50,6 +51,11 @@ Run with `./run_server.sh` for an interactive menu, or `./run_server.sh <number>
   Kontext (10-12) stitches them side-by-side (address them as left/middle/right
   in the instruction); FLUX.1 img2img (1-5) takes a single reference
 - Auto-restart is enabled (up to 5 retries on crash, including OOM kills)
+- **Switching models on the fly**: when launched via `run_server.sh`, the web
+  UI shows a Model dropdown. Picking another config restarts the server under
+  the supervisor with that config's flags (queue must be idle — interrupt or
+  cancel jobs first). A running generation can be stopped mid-step with the
+  UI's Interrupt button.
 - FLUX.2 models require substantially more VRAM than FLUX.1
 - GGUF and schnell modes are FLUX.1 only; the uncensored LoRA is also FLUX.1 only
 - The full FLUX.2 models (7 and 8) are 32B and can take ~10+ minutes to cold-load from disk

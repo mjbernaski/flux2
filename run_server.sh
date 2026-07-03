@@ -63,16 +63,11 @@ show_menu() {
     echo ""
 }
 
-# Start server with selected configuration (with auto-restart on failure)
-start_server() {
+# Map a config number to server flags. Assigns the caller's `args` and `desc`
+# (bash dynamic scoping). Keep in sync with SERVER_OPTIONS.md and the
+# SERVER_CONFIGS table in web_server.py.
+set_config_args() {
     local config=$1
-    shift  # Remove config number from args
-    local args=""
-    local desc=""
-    local max_retries=5
-    local retry_delay=3
-    local log_file="server.log"
-
     case $config in
         1)
             args=""
@@ -136,6 +131,25 @@ start_server() {
             return 1
             ;;
     esac
+}
+
+# web_server.py exits with this code (after writing .next_config) when the
+# user picks a different model in the UI; the restart loop below relaunches
+# with the new config instead of treating it as a crash.
+SWITCH_EXIT_CODE=86
+SWITCH_CONFIG_FILE=".next_config"
+
+# Start server with selected configuration (with auto-restart on failure)
+start_server() {
+    local config=$1
+    shift  # Remove config number from args
+    local args=""
+    local desc=""
+    local max_retries=5
+    local retry_delay=3
+    local log_file="server.log"
+
+    set_config_args "$config" || return 1
 
     echo ""
     echo -e "${GREEN}Starting ${desc}...${NC}"
@@ -180,11 +194,34 @@ start_server() {
         # to go to the log file. We also want to see it in the terminal.
         # -u: unbuffered stdout so print() diagnostics land in the log/terminal
         # immediately (block-buffering through the tee pipe delays them by KBs).
-        python -u web_server.py $args "$@" 2>&1 | tee -a "$log_file"
+        # FLUX_CONFIG tells the server which menu entry it is, enabling the
+        # UI's on-the-fly model switcher (/configs + /switch-model).
+        FLUX_CONFIG=$config python -u web_server.py $args "$@" 2>&1 | tee -a "$log_file"
         exit_code=${PIPESTATUS[0]}
 
         local end_time=$(date +%s)
         local duration=$((end_time - start_time))
+
+        # Model switch requested from the web UI: relaunch with the new
+        # config's flags. Not a crash — reset the retry counter.
+        if [ $exit_code -eq $SWITCH_EXIT_CODE ] && [ -f "$SWITCH_CONFIG_FILE" ]; then
+            local new_config
+            new_config=$(cat "$SWITCH_CONFIG_FILE")
+            rm -f "$SWITCH_CONFIG_FILE"
+            if [[ "$new_config" =~ ^([1-9]|1[0-3])$ ]] && set_config_args "$new_config"; then
+                config=$new_config
+            else
+                echo -e "${RED}Invalid switch request '$new_config' — restarting current model${NC}" | tee -a "$log_file"
+                set_config_args "$config"
+            fi
+            echo "" | tee -a "$log_file"
+            echo -e "${CYAN}═══════════════════════════════════════════════════════════${NC}" | tee -a "$log_file"
+            echo -e "${CYAN}[$(date '+%Y-%m-%d %H:%M:%S')] Model switch — relaunching as: ${desc}${NC}" | tee -a "$log_file"
+            echo -e "${CYAN}═══════════════════════════════════════════════════════════${NC}" | tee -a "$log_file"
+            attempt=0
+            first_start=1
+            continue
+        fi
 
         # Check exit code
         if [ $exit_code -eq 0 ]; then

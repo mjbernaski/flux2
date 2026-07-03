@@ -55,6 +55,7 @@ Thumbs.db
 nohup.out
 server.log
 server.pid
+.next_config
 
 # Generated image artifacts
 web-generated/

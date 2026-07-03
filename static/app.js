@@ -90,6 +90,102 @@ if (apiKeyInput) {
         .catch(function() { clearTimeout(timeout); el.textContent = 'Model info unavailable (use server URL, e.g. http://localhost:2222)'; });
 })();
 
+// After a model switch: show the loading overlay and reload the page once the
+// server has gone down and come back up ready with the new model. (A reload
+// re-fetches /model-info so all capability toggles match the new backend.)
+function watchServerRestart(label) {
+    const overlay = document.getElementById('loadingOverlay');
+    const statusEl = document.getElementById('loadingStatus');
+    const elapsedEl = document.getElementById('loadingElapsed');
+    const titleEl = document.getElementById('loadingTitle');
+    if (!overlay) { setTimeout(() => location.reload(), 5000); return; }
+    overlay.classList.remove('error');
+    if (titleEl) titleEl.textContent = 'Switching to ' + label + '…';
+    if (statusEl) statusEl.textContent = 'restarting server';
+    if (elapsedEl) elapsedEl.textContent = '0s';
+    overlay.style.display = 'flex';
+
+    const t0 = Date.now();
+    let wentDown = false;  // don't reload until the old server has actually exited
+    setInterval(async function() {
+        if (elapsedEl) {
+            const s = Math.round((Date.now() - t0) / 1000);
+            elapsedEl.textContent = s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
+        }
+        try {
+            const res = await fetch('/ready', { cache: 'no-store' });
+            const data = await res.json();
+            if (!data.ready) {
+                wentDown = true;
+                if (data.error) {
+                    overlay.classList.add('error');
+                    if (titleEl) titleEl.textContent = 'Model load failed';
+                    if (statusEl) statusEl.textContent = data.error;
+                } else if (statusEl) {
+                    statusEl.textContent = data.status || 'loading model';
+                }
+            } else if (wentDown) {
+                location.reload();
+            }
+        } catch (err) {
+            wentDown = true;
+            if (statusEl) statusEl.textContent = 'waiting for server…';
+        }
+    }, 1500);
+}
+
+// ---- Model switcher ----
+// Populated from /configs (the run_server.sh menu). Picking a different
+// config POSTs /switch-model: the server restarts under the supervisor with
+// the new model's flags and the page reloads when it's back up.
+(function() {
+    const wrap = document.getElementById('modelSwitch');
+    const select = document.getElementById('modelSelect');
+    if (!wrap || !select) return;
+    let currentConfig = null;
+
+    fetch('/configs', { headers: getAuthHeaders() })
+        .then(function(r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+        .then(function(data) {
+            if (!data.switchable || !data.configs) return;
+            currentConfig = data.current;
+            data.configs.forEach(function(c) {
+                const opt = document.createElement('option');
+                opt.value = c.id;
+                opt.textContent = c.id + ' — ' + c.label;
+                if (c.id === data.current) opt.selected = true;
+                select.appendChild(opt);
+            });
+            wrap.style.display = 'flex';
+        })
+        .catch(function() {});  // no API key yet or older server — keep hidden
+
+    select.addEventListener('change', async function() {
+        const target = parseInt(select.value, 10);
+        if (!target || target === currentConfig) return;
+        const label = select.options[select.selectedIndex].textContent;
+        if (!confirm('Switch model to:\n\n' + label + '\n\nThe server restarts and loads the new model (this can take a while).')) {
+            select.value = String(currentConfig);
+            return;
+        }
+        select.disabled = true;
+        try {
+            const res = await fetch('/switch-model', {
+                method: 'POST',
+                headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+                body: JSON.stringify({ config: target })
+            });
+            const data = await res.json().catch(function() { return {}; });
+            if (!res.ok || !data.success) throw new Error(data.error || `HTTP ${res.status}`);
+            watchServerRestart(data.switching_to || label);
+        } catch (err) {
+            alert('Model switch failed: ' + err.message);
+            select.value = String(currentConfig);
+            select.disabled = false;
+        }
+    });
+})();
+
 const form = document.getElementById('generateForm');
 const submitBtn = document.getElementById('submitBtn');
 const status = document.getElementById('status');
@@ -576,6 +672,33 @@ if (clearRecentBtn) clearRecentBtn.addEventListener('click', async function() {
 let lastCompletedJobId = null;
 let seenDoneJobIds = new Set();
 
+// ---- Interrupt (stop the running job) ----
+const interruptBtn = document.getElementById('interruptBtn');
+let runningJobId = null;
+let interruptRequested = false;  // optimistic UI until /status echoes cancel_requested
+
+if (interruptBtn) interruptBtn.addEventListener('click', async function() {
+    if (!runningJobId) return;
+    interruptRequested = true;
+    interruptBtn.disabled = true;
+    interruptBtn.textContent = 'Stopping…';
+    try {
+        const res = await fetch(`/jobs/${runningJobId}/cancel`, {
+            method: 'POST',
+            headers: getAuthHeaders(),
+        });
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            alert('Interrupt failed: ' + (err.error || res.status));
+            interruptRequested = false;
+        }
+    } catch (e) {
+        alert('Interrupt failed: ' + e.message);
+        interruptRequested = false;
+    }
+    pollStatus();
+});
+
 function renderQueueItem(job, position) {
     const safePrompt = (job.prompt || '(empty prompt)').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     const metaParts = [];
@@ -642,12 +765,29 @@ function renderRunning(running) {
         if (progressTracker) progressTracker.style.display = 'none';
         if (pwrap) pwrap.style.display = 'none';
         if (watchBtn) watchBtn.style.display = 'none';
+        if (interruptBtn) {
+            interruptBtn.style.display = 'none';
+            interruptBtn.disabled = false;
+            interruptBtn.textContent = '■ Interrupt';
+        }
+        runningJobId = null;
+        interruptRequested = false;
         updateWatchOverlay(null);
         return;
     }
 
     status.className = 'status generating';
     if (watchBtn) watchBtn.style.display = 'inline-block';
+    if (running.id !== runningJobId) {
+        runningJobId = running.id;
+        interruptRequested = false;
+    }
+    if (interruptBtn) {
+        const stopping = interruptRequested || running.cancel_requested;
+        interruptBtn.style.display = 'inline-block';
+        interruptBtn.disabled = !!stopping;
+        interruptBtn.textContent = stopping ? 'Stopping…' : '■ Interrupt';
+    }
 
     let stepInfo = '';
     if (running.total_steps > 0 && running.step > 0) {
@@ -660,6 +800,9 @@ function renderRunning(running) {
         statusText.textContent = running.step > 0
             ? `Generating: step ${running.step} of ${running.total_steps}...`
             : 'Generating...';
+    }
+    if (interruptRequested || running.cancel_requested) {
+        statusText.textContent = 'Stopping…';
     }
 
     // Overall progress across the whole batch (0-100).

@@ -29,6 +29,14 @@
          capability toggles (inpaint, negative prompt, schnell) in app.js. -->
     <p class="subtitle" id="modelInfo" style="display: none;"></p>
 
+    <!-- Model switcher: populated from /configs. Hidden unless the server was
+         launched via run_server.sh (its supervisor performs the restart). -->
+    <div class="model-switch" id="modelSwitch" style="display: none;">
+        <label for="modelSelect">Model</label>
+        <select id="modelSelect"></select>
+        <span class="model-switch-hint">Switching restarts the server and loads the selected model.</span>
+    </div>
+
     <!-- Security UI -->
     <div class="security-section">
         <div class="security-header" onclick="document.getElementById('securityContent').style.display = document.getElementById('securityContent').style.display === 'none' ? 'block' : 'none'">
@@ -299,6 +307,7 @@
             </div>
             <span class="progress-text" id="progressText">0 / 0</span>
         </div>
+        <button type="button" class="interrupt-btn" id="interruptBtn" style="display: none;">■ Interrupt</button>
         <div class="preview-wrap" id="previewWrap" style="display: none; margin-top: 12px;">
             <img id="previewImgLive" alt="Live preview" style="max-width: 512px; width: 100%; border-radius: 6px; display: block;">
         </div>

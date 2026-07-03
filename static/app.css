@@ -82,6 +82,27 @@ button:disabled {
     color: #fff;
 }
 .reset-btn:hover:not(:disabled) { background: #5a6268; }
+.interrupt-btn {
+    flex: 0 0 auto;
+    width: auto;
+    margin-top: 12px;
+    padding: 10px 22px;
+    background: #c0392b;
+    color: #fff;
+    font-size: 15px;
+}
+.interrupt-btn:hover:not(:disabled) { background: #e74c3c; }
+.interrupt-btn:disabled { background: #5a2a24; color: #caa; }
+.model-switch {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 15px;
+}
+.model-switch label { margin-bottom: 0; flex: 0 0 auto; }
+.model-switch select { width: auto; flex: 0 1 auto; min-width: 240px; padding: 8px 12px; font-size: 14px; }
+.model-switch-hint { color: #666; font-size: 11px; }
 .status {
     text-align: center;
     padding: 15px;

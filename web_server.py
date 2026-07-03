@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Version number - update this when releasing new versions
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 
 # Import model components from flux_core (model loading + generation).
 # `--sdxl` swaps in sd_core, the uncensored Stable Diffusion XL backend —
@@ -117,6 +117,35 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 QUEUE_MAX_SIZE = 10
 RECENT_DONE_MAX = 10
 
+# Server configuration menu, mirroring run_server.sh's case statement (and
+# SERVER_OPTIONS.md — keep all three in sync). The launcher exports the active
+# number as FLUX_CONFIG; /switch-model writes the requested number to
+# SWITCH_CONFIG_FILE and exits with SWITCH_EXIT_CODE, and the run_server.sh
+# supervisor relaunches with the new config's flags.
+SERVER_CONFIGS = {
+    1: "FLUX.1 4-bit BNB",
+    2: "FLUX.1 Full",
+    3: "FLUX.1 GGUF Q8",
+    4: "FLUX.1-schnell",
+    5: "FLUX.1 + Uncensored LoRA",
+    6: "FLUX.2 4-bit BNB",
+    7: "FLUX.2 Full + Turbo",
+    8: "FLUX.2 Full (no Turbo)",
+    9: "FLUX.2-klein-9B",
+    10: "FLUX.1 Kontext (editor)",
+    11: "FLUX.1 Kontext Full (editor, bf16)",
+    12: "FLUX.1 Kontext Full + Uncensored LoRA",
+    13: "SDXL Uncensored (LUSTIFY!)",
+}
+SWITCH_EXIT_CODE = 86
+SWITCH_CONFIG_FILE = ".next_config"
+try:
+    _current_config = int(os.environ.get("FLUX_CONFIG", ""))
+except ValueError:
+    _current_config = None
+if _current_config not in SERVER_CONFIGS:
+    _current_config = None
+
 # Edit-loop critique (local ollama vision model; see /critique)
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 CRITIQUE_MODEL = os.environ.get("CRITIQUE_MODEL", "gemma4:e2b")
@@ -125,11 +154,17 @@ PREVIEW_FILENAME = "_preview_current.png"
 PREVIEW_MIN_INTERVAL_S = 0.75  # throttle: skip decode if last preview was this recent
 
 
+class JobCanceled(Exception):
+    """Raised inside the generation loop when the user interrupts the running
+    job; unwinds out of the diffusers pipeline back to the queue worker."""
+
+
 @dataclass
 class Job:
     id: str
     params: dict
     state: str = 'queued'  # queued | running | done | failed | canceled
+    cancel_requested: bool = False
     submitted_at: float = 0.0
     started_at: float = 0.0
     finished_at: float = 0.0
@@ -188,6 +223,7 @@ class Job:
             'step_times': list(self.step_times),
             'generation_time': self.generation_time,
             'error': self.error,
+            'cancel_requested': self.cancel_requested,
         })
         # summary's "batch" is the *requested* batch param; callers watching
         # progress want the actual total (may differ for spectrum grid).
@@ -328,7 +364,14 @@ def _run_job(job: Job):
     show_preview = bool(data.get('show_preview', False))
     preview_state = {"last_decode": 0.0}
 
+    def _check_cancel():
+        if job.cancel_requested:
+            raise JobCanceled()
+
     def _step_callback(pipe_obj, step_index, timestep, callback_kwargs):
+        # Interrupt point: raising here unwinds out of the denoising loop
+        # mid-generation (the worker catches JobCanceled).
+        _check_cancel()
         # The scheduler holds the *actual* timesteps for this run. For img2img the
         # pipeline only denoises ~steps*strength of them (and turbo/schnell clamp
         # the count too), so the requested `steps` overstates the work. Read the
@@ -395,6 +438,7 @@ def _run_job(job: Job):
                 generated_count += 1
                 job.current = generated_count
                 job.step = 0
+                _check_cancel()
                 current_seed = grid_seed if spectrum_same_seed else random.randint(0, 2**32 - 1)
 
                 image, used_seed, timings = generate_image(
@@ -491,6 +535,7 @@ def _run_job(job: Job):
         for i in range(batch):
             job.current = i + 1
             job.step = 0
+            _check_cancel()
             current_seed = (seed + i) if seed is not None else None
             image, used_seed, timings = generate_image(
                 prompt, seed=current_seed, steps=steps, width=width, height=height,
@@ -540,6 +585,9 @@ def _queue_worker():
         try:
             _run_job(job)
             job.state = 'done'
+        except JobCanceled:
+            print(f"[queue] job {job.id} interrupted by user", flush=True)
+            job.state = 'canceled'
         except Exception as e:
             print(f"[queue] job {job.id} failed: {e}", flush=True)
             job.state = 'failed'
@@ -741,8 +789,69 @@ def cancel_job(job_id):
                 del _recent_done[RECENT_DONE_MAX:]
                 return jsonify({'success': True, 'message': f'Job {job_id} canceled'})
         if _running_job and _running_job.id == job_id:
-            return jsonify({'success': False, 'error': 'Cannot cancel a running job'}), 400
+            # Interrupt: the generation loop checks this flag at every step and
+            # raises JobCanceled; the worker then marks the job canceled. Any
+            # batch images already finished are kept.
+            _running_job.cancel_requested = True
+            return jsonify({'success': True, 'message': f'Job {job_id} is stopping'})
     return jsonify({'success': False, 'error': 'Job not found'}), 404
+
+
+@app.route('/configs')
+def configs():
+    """The launcher's model-config menu, for the UI's model switcher.
+
+    `switchable` is false when the server was started directly (no
+    run_server.sh supervisor), in which case /switch-model is unavailable
+    and the UI hides the control.
+    """
+    return jsonify({
+        'configs': [{'id': k, 'label': v} for k, v in SERVER_CONFIGS.items()],
+        'current': _current_config,
+        'switchable': _current_config is not None,
+    })
+
+
+@app.route('/switch-model', methods=['POST'])
+def switch_model():
+    """Switch to another run_server.sh configuration on the fly.
+
+    The models are far too large to hot-swap in-process (and the SDXL backend
+    is chosen at import time), so switching is a supervised restart: write the
+    requested config number to SWITCH_CONFIG_FILE and exit with
+    SWITCH_EXIT_CODE. The run_server.sh restart loop picks the file up and
+    relaunches with the new config's flags; clients poll /ready until the new
+    model is up.
+    """
+    if _current_config is None:
+        return jsonify({
+            'success': False,
+            'error': 'Model switching requires launching via run_server.sh (no supervisor detected).',
+        }), 400
+
+    data = request.json or {}
+    try:
+        target = int(data.get('config'))
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'config must be an integer'}), 400
+    if target not in SERVER_CONFIGS:
+        return jsonify({'success': False, 'error': f'config must be one of {sorted(SERVER_CONFIGS)}'}), 400
+    if target == _current_config:
+        return jsonify({'success': False, 'error': 'Already running this configuration'}), 400
+
+    with _queue_cv:
+        if _running_job is not None or _pending:
+            return jsonify({
+                'success': False,
+                'error': 'Jobs are running or queued. Interrupt/cancel them before switching models.',
+            }), 409
+
+    with open(SWITCH_CONFIG_FILE, 'w') as f:
+        f.write(str(target))
+    print(f"[switch] restarting into config {target} ({SERVER_CONFIGS[target]})", flush=True)
+    # Give Flask a moment to flush this response before the process exits.
+    threading.Timer(0.5, lambda: os._exit(SWITCH_EXIT_CODE)).start()
+    return jsonify({'success': True, 'switching_to': SERVER_CONFIGS[target]})
 
 
 @app.route('/model-info')
