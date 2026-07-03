@@ -919,13 +919,51 @@ def model_info():
     })
 
 
-# Async critique bookkeeping. The qwen3.6 vision critique can run for
-# several minutes — far past the ~60s connection cap browsers (Safari
-# especially) put on a single fetch — so POST /critique only validates and
-# starts the work, and the client polls GET /critique/<id> for the result.
-_critique_lock = threading.Lock()
-_critique_results: dict = {}  # id -> {'done': bool, 'created': float, 'result': dict|None}
-CRITIQUE_RESULT_TTL_S = 3600
+# Async VLM job bookkeeping (critique and describe). A qwen3.6 vision call
+# can run for several minutes — far past the ~60s connection cap browsers
+# (Safari especially) put on a single fetch — so the POST endpoints only
+# validate and start the work, and the client polls GET /<route>/<id> for
+# the result.
+_vlm_jobs_lock = threading.Lock()
+_vlm_jobs: dict = {}  # id -> {'done': bool, 'created': float, 'result': dict|None}
+VLM_JOB_TTL_S = 3600
+
+
+def _vlm_job_start(runner, *args):
+    """Register a job, run `runner(cid, *args)` on a daemon thread, and
+    return the id the client polls with."""
+    cid = uuid.uuid4().hex[:12]
+    now = time.time()
+    with _vlm_jobs_lock:
+        for old_id in [k for k, v in _vlm_jobs.items()
+                       if v['done'] and now - v['created'] > VLM_JOB_TTL_S]:
+            del _vlm_jobs[old_id]
+        _vlm_jobs[cid] = {'done': False, 'created': now, 'result': None}
+    threading.Thread(target=runner, daemon=True, name=f'vlm-job-{cid}',
+                     args=(cid,) + args).start()
+    return cid
+
+
+def _vlm_job_finish(cid, payload):
+    with _vlm_jobs_lock:
+        entry = _vlm_jobs.get(cid)
+        if entry is not None:
+            entry['result'] = payload
+            entry['done'] = True
+
+
+def _vlm_job_status(cid):
+    """Shared poll response for GET /critique/<id> and GET /describe/<id>."""
+    with _vlm_jobs_lock:
+        entry = _vlm_jobs.get(cid)
+        if entry is None:
+            return jsonify({'success': False, 'error': f'unknown job id {cid}'}), 404
+        if not entry['done']:
+            return jsonify({'success': True, 'done': False})
+        result = dict(entry['result'])
+    result['done'] = True
+    status = 200 if result.get('success') else 500
+    return jsonify(result), status
 
 
 def _run_critique(cid, model, direction, prompt, reference, output, history, style):
@@ -951,11 +989,7 @@ def _run_critique(cid, model, direction, prompt, reference, output, history, sty
                        'revised_prompt': heuristic_revision(direction, prompt, metrics)}
     except Exception as e:
         payload = {'success': False, 'error': f'critique failed: {e}'}
-    with _critique_lock:
-        entry = _critique_results.get(cid)
-        if entry is not None:
-            entry['result'] = payload
-            entry['done'] = True
+    _vlm_job_finish(cid, payload)
 
 
 @app.route('/critique', methods=['POST'])
@@ -993,32 +1027,56 @@ def critique():
     # critique} dicts) so the critic doesn't re-propose failed phrasings.
     history = data.get('history') if isinstance(data.get('history'), list) else []
 
-    cid = uuid.uuid4().hex[:12]
-    now = time.time()
-    with _critique_lock:
-        for old_id in [k for k, v in _critique_results.items()
-                       if v['done'] and now - v['created'] > CRITIQUE_RESULT_TTL_S]:
-            del _critique_results[old_id]
-        _critique_results[cid] = {'done': False, 'created': now, 'result': None}
-    threading.Thread(target=_run_critique, daemon=True, name=f'critique-{cid}',
-                     args=(cid, model, direction, prompt, reference, output,
-                           history, style)).start()
+    cid = _vlm_job_start(_run_critique, model, direction, prompt, reference,
+                         output, history, style)
     return jsonify({'success': True, 'critique_id': cid})
 
 
 @app.route('/critique/<cid>')
 def critique_result(cid):
     """Poll for an async critique started by POST /critique."""
-    with _critique_lock:
-        entry = _critique_results.get(cid)
-        if entry is None:
-            return jsonify({'success': False, 'error': f'unknown critique id {cid}'}), 404
-        if not entry['done']:
-            return jsonify({'success': True, 'done': False})
-        result = dict(entry['result'])
-    result['done'] = True
-    status = 200 if result.get('success') else 500
-    return jsonify(result), status
+    return _vlm_job_status(cid)
+
+
+def _run_describe(cid, model, image):
+    from edit_loop import vlm_describe
+    try:
+        prompt = vlm_describe(model, image, ollama_url=OLLAMA_URL)
+        if prompt:
+            payload = {'success': True, 'prompt': prompt}
+        else:
+            payload = {'success': False,
+                       'error': 'vision model unavailable or returned no description'}
+    except Exception as e:
+        payload = {'success': False, 'error': f'describe failed: {e}'}
+    _vlm_job_finish(cid, payload)
+
+
+@app.route('/describe', methods=['POST'])
+def describe():
+    """The reverse path: have the local vision model write a detailed
+    text-to-image prompt that would recreate the posted photo, for
+    generating a fresh image from that prompt alone. Returns a describe_id
+    immediately; poll GET /describe/<id> for the prompt."""
+    data = request.json or {}
+    img_b64 = data.get('image') or ''
+    if not img_b64:
+        return jsonify({'success': False, 'error': 'image is required'}), 400
+    try:
+        if img_b64.startswith('data:'):
+            img_b64 = img_b64.split(',', 1)[1]
+        image = Image.open(io.BytesIO(base64.b64decode(img_b64))).convert('RGB')
+    except Exception:
+        return jsonify({'success': False, 'error': 'image is not a decodable base64 image'}), 400
+    model = data.get('model') or CRITIQUE_MODEL
+    cid = _vlm_job_start(_run_describe, model, image)
+    return jsonify({'success': True, 'describe_id': cid})
+
+
+@app.route('/describe/<cid>')
+def describe_result(cid):
+    """Poll for an async describe started by POST /describe."""
+    return _vlm_job_status(cid)
 
 
 def _warm_critique_model():

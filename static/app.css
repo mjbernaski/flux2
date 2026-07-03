@@ -413,6 +413,17 @@ button:disabled {
     color: #666;
     font-size: 12px;
 }
+.describe-btn {
+    flex: none;
+    width: auto;
+    padding: 8px 14px;
+    font-size: 14px;
+    background: #7b5cd6;
+    color: #fff;
+    margin-bottom: 4px;
+}
+.describe-btn:hover:not(:disabled) { background: #6a4cc4; }
+.describe-btn:disabled { background: #3d2e6b; color: #aaa; }
 .inpaint-control { margin-top: 10px; }
 .inpaint-toggle { display: flex; align-items: center; gap: 8px; color: #ccc; font-size: 14px; cursor: pointer; }
 .inpaint-toggle input[type="checkbox"] { width: auto; }

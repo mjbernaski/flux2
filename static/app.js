@@ -419,6 +419,8 @@ function syncRefUI() {
     // Strength only applies to single-image FLUX.1 img2img; multi-reference
     // runs through Kontext/FLUX.2 conditioning, which ignores it.
     if (strengthControl) strengthControl.style.display = n === 1 ? 'flex' : 'none';
+    const describeControl = document.getElementById('describeControl');
+    if (describeControl) describeControl.style.display = n > 0 ? 'block' : 'none';
     if (aspectModeControl) aspectModeControl.style.display = n > 0 ? 'block' : 'none';
     if (multiRefHint) multiRefHint.style.display = n > 1 ? 'block' : 'none';
     if (inputImage) inputImage.value = '';
@@ -448,6 +450,47 @@ function clearRefs() {
     syncRefUI();
     if (typeof resetInpaint === 'function') resetInpaint();
 }
+
+// The reverse path: have the local vision model write a detailed prompt from
+// the first reference photo, drop it into the prompt box, and generate a
+// fresh image from that prompt alone (the references are set aside for the
+// submission so the result comes from the description, not img2img).
+async function runReversePath() {
+    const btn = document.getElementById('describeBtn');
+    if (!currentInputImages.length) { alert('Upload a reference image first.'); return; }
+    const promptEl = document.getElementById('prompt');
+    const oldLabel = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Describing photo with vision model…';
+    try {
+        const res = await fetch('/describe', {
+            method: 'POST',
+            headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+            body: JSON.stringify({ image: currentInputImages[0] })
+        });
+        const submitted = await res.json().catch(() => ({}));
+        if (!res.ok || !submitted.success) throw new Error(submitted.error || `HTTP ${res.status}`);
+        const data = await pollVlmJob('/describe/' + submitted.describe_id);
+        if (promptEl) promptEl.value = data.prompt;
+        const refs = currentInputImages;
+        currentInputImages = [];
+        syncRefUI();
+        try {
+            await doGenerate();
+        } finally {
+            currentInputImages = refs;
+            syncRefUI();
+        }
+    } catch (err) {
+        alert('Reverse path failed: ' + err.message);
+    } finally {
+        btn.disabled = false;
+        btn.textContent = oldLabel;
+    }
+}
+
+const describeBtn = document.getElementById('describeBtn');
+if (describeBtn) describeBtn.addEventListener('click', runReversePath);
 
 if (uploadArea) {
     uploadArea.addEventListener('click', function() { if (inputImage) inputImage.click(); });
@@ -1351,18 +1394,23 @@ async function loopAwaitJob(jobId) {
     }
 }
 
-// The vision critic can run for several minutes — far past the ~60s cap
-// Safari puts on a single fetch — so POST /critique returns an id right away
-// and the verdict is collected by polling.
-async function loopAwaitCritique(critiqueId) {
+// Slow VLM calls (/critique, /describe) can run for minutes — far past the
+// ~60s cap Safari puts on a single fetch — so their POST endpoints return an
+// id right away and the result is collected by polling. The optional
+// `cancelled` callback aborts the wait.
+async function pollVlmJob(url, cancelled) {
     for (;;) {
         await new Promise(r => setTimeout(r, 2000));
-        const res = await fetch('/critique/' + critiqueId, { headers: getAuthHeaders() });
+        const res = await fetch(url, { headers: getAuthHeaders() });
         const data = await res.json().catch(() => ({}));
         if (!res.ok || !data.success) throw new Error(data.error || `HTTP ${res.status}`);
         if (data.done) return data;
-        if (loopRun && loopRun.stop) throw new Error('stopped');
+        if (cancelled && cancelled()) throw new Error('stopped');
     }
+}
+
+function loopAwaitCritique(critiqueId) {
+    return pollVlmJob('/critique/' + critiqueId, () => loopRun && loopRun.stop);
 }
 
 async function loopFetchAsDataUrl(filename) {

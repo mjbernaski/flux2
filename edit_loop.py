@@ -199,6 +199,27 @@ def _ollama_chat(ollama_url, payload):
         return json.loads(r.read().decode())
 
 
+def _chat_text(ollama_url, payload):
+    """Chat with retries for two ollama quirks: models that reject the
+    "think" flag (HTTP error → retry without it), and 200 replies with empty
+    content — a request racing the model's keep_alive unload returns
+    done_reason "load", and a thinking model occasionally ends its turn after
+    the thinking phase without emitting the schema-constrained reply (retry
+    once, dropping "think" in that case to force the JSON out directly)."""
+    try:
+        resp = _ollama_chat(ollama_url, payload)
+    except urllib.error.HTTPError:
+        payload.pop("think", None)
+        resp = _ollama_chat(ollama_url, payload)
+    text = resp["message"]["content"]
+    if not text.strip():
+        if resp.get("done_reason") != "load":
+            payload.pop("think", None)
+        resp = _ollama_chat(ollama_url, payload)
+        text = resp["message"]["content"]
+    return text
+
+
 def vlm_critique(model, direction, prompt, reference, output, metrics,
                  ollama_url="http://127.0.0.1:11434", style="instruction",
                  history=None):
@@ -266,30 +287,56 @@ def vlm_critique(model, direction, prompt, reference, output, metrics,
         "options": {"temperature": 0.3, "num_ctx": 8192},
     }
     try:
-        try:
-            resp = _ollama_chat(ollama_url, payload)
-        except urllib.error.HTTPError:
-            # Not every vision model supports thinking; retry once without.
-            payload.pop("think", None)
-            resp = _ollama_chat(ollama_url, payload)
-        text = resp["message"]["content"]
-        if not text.strip():
-            # ollama can answer 200 with empty content: a request racing the
-            # model's keep_alive unload returns done_reason "load", and a
-            # thinking model occasionally ends its turn after the thinking
-            # phase without emitting the schema-constrained reply. Retry once
-            # — dropping "think" in the second case forces the JSON out
-            # directly.
-            if resp.get("done_reason") != "load":
-                payload.pop("think", None)
-            resp = _ollama_chat(ollama_url, payload)
-            text = resp["message"]["content"]
+        text = _chat_text(ollama_url, payload)
         result = json.loads(text)
         if result.get("revised_prompt"):
             return result
         print(f"  (VLM reply missing revised_prompt: {text[:200]})")
     except Exception as e:
         print(f"  (VLM critique unavailable: {e})")
+    return None
+
+
+# Structured-output schema for the reverse path (photo → prompt).
+DESCRIBE_SCHEMA = {
+    "type": "object",
+    "properties": {"prompt": {"type": "string"}},
+    "required": ["prompt"],
+}
+
+
+def vlm_describe(model, image, ollama_url="http://127.0.0.1:11434"):
+    """The reverse path: ask the local vision model to write a detailed
+    text-to-image prompt that would recreate `image` from scratch. Returns
+    the prompt string, or None on any failure."""
+    ask = (
+        "Write a detailed text-to-image generation prompt that would recreate "
+        "this photograph from scratch. Describe the subject and their exact "
+        "appearance, pose and expression; the setting and background; the "
+        "composition and camera framing (angle, distance, lens feel); the "
+        "lighting and time of day; the color palette and mood; and the overall "
+        "style (photorealistic photo, film stock, illustration, etc.). Be "
+        "specific and concrete — name colors, materials, textures and spatial "
+        "relationships. Do not mention that you are describing an image; just "
+        "write the prompt as one dense paragraph."
+    )
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": ask, "images": [img_b64(image)]}],
+        "stream": False,
+        "think": True,
+        "format": DESCRIBE_SCHEMA,
+        "keep_alive": "15m",
+        "options": {"temperature": 0.4, "num_ctx": 8192},
+    }
+    try:
+        text = _chat_text(ollama_url, payload)
+        prompt = (json.loads(text).get("prompt") or "").strip()
+        if prompt:
+            return prompt
+        print(f"  (VLM describe reply missing prompt: {text[:200]})")
+    except Exception as e:
+        print(f"  (VLM describe unavailable: {e})")
     return None
 
 
