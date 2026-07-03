@@ -9,6 +9,21 @@ body {
 }
 h1 { color: #00d4ff; margin-bottom: 5px; }
 .header-info { display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px; }
+.model-hover { position: fixed; top: 0; left: 0; width: 60px; height: 60px; z-index: 1000; }
+.model-hover-name {
+    display: none;
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    padding: 6px 10px;
+    border: 1px solid #333;
+    border-radius: 6px;
+    background: #16213e;
+    color: #00d4ff;
+    font-size: 12px;
+    white-space: nowrap;
+}
+.model-hover:hover .model-hover-name:not(:empty) { display: block; }
 .hostname { color: #666; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; }
 .version { color: #666; font-size: 12px; }
 .subtitle { color: #888; margin-bottom: 20px; }

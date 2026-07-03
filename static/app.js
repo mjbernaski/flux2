@@ -68,8 +68,11 @@ if (apiKeyInput) {
         .then(function(r) { if (!r.ok) throw new Error(r.status); return r.json(); })
         .then(function(data) {
             clearTimeout(timeout);
-            // Model name is intentionally not shown on the page; the fetched
-            // info still drives the capability toggles below.
+            // Model name is not shown on the page, but hovering the top-left
+            // corner reveals it; the fetched info also drives the capability
+            // toggles below.
+            var mh = document.getElementById('modelHoverName');
+            if (mh) mh.textContent = data.description || data.model || '';
             var h = document.getElementById('hostname'); if (h) h.textContent = data.hostname || '';
             var v = document.getElementById('version'); if (v) v.textContent = 'v' + (data.version || '');
             window.__fluxVersion = data.flux_version || null;
