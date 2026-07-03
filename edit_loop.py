@@ -196,7 +196,7 @@ def _ollama_chat(ollama_url, payload):
         headers={"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=300) as r:
-        return json.loads(r.read().decode())["message"]["content"]
+        return json.loads(r.read().decode())
 
 
 def vlm_critique(model, direction, prompt, reference, output, metrics,
@@ -267,11 +267,23 @@ def vlm_critique(model, direction, prompt, reference, output, metrics,
     }
     try:
         try:
-            text = _ollama_chat(ollama_url, payload)
+            resp = _ollama_chat(ollama_url, payload)
         except urllib.error.HTTPError:
             # Not every vision model supports thinking; retry once without.
             payload.pop("think", None)
-            text = _ollama_chat(ollama_url, payload)
+            resp = _ollama_chat(ollama_url, payload)
+        text = resp["message"]["content"]
+        if not text.strip():
+            # ollama can answer 200 with empty content: a request racing the
+            # model's keep_alive unload returns done_reason "load", and a
+            # thinking model occasionally ends its turn after the thinking
+            # phase without emitting the schema-constrained reply. Retry once
+            # — dropping "think" in the second case forces the JSON out
+            # directly.
+            if resp.get("done_reason") != "load":
+                payload.pop("think", None)
+            resp = _ollama_chat(ollama_url, payload)
+            text = resp["message"]["content"]
         result = json.loads(text)
         if result.get("revised_prompt"):
             return result
