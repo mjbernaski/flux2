@@ -6,9 +6,12 @@ Takes an input image and an edit direction, runs the edit through the server
 again — up to N iterations, stoppable between any two.
 
 The "look at the output" step is pluggable:
-  - a local ollama vision model (--vlm, default gemma4:e2b) compares the
-    reference and the output and proposes a revised instruction, entirely
-    on-box (no cloud), so any content stays local;
+  - a local ollama vision model (--vlm; default from the CRITIQUE_MODEL env
+    var, falling back to qwen3.6:latest) compares the reference and the
+    output, grades the result 0-10, and proposes a revised instruction,
+    entirely on-box (no cloud), so any content stays local. It sees the
+    session's prompt trajectory (what was tried and why it failed) and runs
+    with thinking enabled + structured JSON output;
   - with --vlm none (or if ollama is unreachable) the loop falls back to
     pixel metrics plus your own typed feedback.
 
@@ -27,7 +30,6 @@ import base64
 import io
 import json
 import os
-import re
 import shutil
 import sys
 import time
@@ -173,34 +175,80 @@ def img_b64(image, max_side=896):
     return base64.b64encode(buf.getvalue()).decode()
 
 
+# Structured-output schema for the critique: ollama constrains generation to
+# this shape, so the reply is guaranteed-parseable JSON (no regex scraping).
+CRITIQUE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "applied": {"type": "boolean"},
+        "score": {"type": "integer", "minimum": 0, "maximum": 10},
+        "critique": {"type": "string"},
+        "revised_prompt": {"type": "string"},
+    },
+    "required": ["applied", "score", "critique", "revised_prompt"],
+}
+
+
+def _ollama_chat(ollama_url, payload):
+    req = urllib.request.Request(
+        ollama_url.rstrip("/") + "/api/chat",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=300) as r:
+        return json.loads(r.read().decode())["message"]["content"]
+
+
 def vlm_critique(model, direction, prompt, reference, output, metrics,
-                 ollama_url="http://127.0.0.1:11434", style="instruction"):
-    """Ask a local ollama vision model whether the edit landed and how to
-    rephrase the prompt. `style` picks the prompting idiom of the backend:
-    'instruction' (Kontext edit commands) or 'description' (SDXL scene
-    descriptions). Returns dict or None on any failure."""
+                 ollama_url="http://127.0.0.1:11434", style="instruction",
+                 history=None):
+    """Ask a local ollama vision model whether the edit landed, grade it
+    0-10, and propose the next prompt. `style` picks the prompting idiom of
+    the backend: 'instruction' (Kontext edit commands) or 'description' (SDXL
+    scene descriptions). `history` is the session's prompt trajectory — a
+    list of {prompt, applied, score, critique} from earlier iterations — so
+    the critic revises against what already failed instead of oscillating.
+    Runs with thinking enabled (deliberation before the verdict) and a JSON
+    schema constraining the reply. Returns dict or None on any failure."""
     if style == "description":
         backend_line = ("You are refining a prompt for SDXL img2img: the FIRST "
                         "image is the starting image; the SECOND is the result "
                         "of re-rendering it with the prompt.")
-        revised_hint = ("<improved DESCRIPTIVE prompt of the desired final "
-                        "image to try next; one sentence, no commands>")
+        revised_hint = ("an improved DESCRIPTIVE prompt of the desired final "
+                        "image to try next; one sentence, no commands")
     else:
         backend_line = ("You are refining an edit instruction for an "
                         "instruction-based image editor (FLUX.1-Kontext). The "
                         "FIRST image is the reference; the SECOND is the "
                         "editor's output.")
-        revised_hint = ("<improved instruction to try next; keep it one "
-                        "imperative sentence>")
+        revised_hint = ("an improved instruction to try next; keep it one "
+                        "imperative sentence")
+    history_block = ""
+    if history:
+        lines = [
+            f"  {n}. \"{h.get('prompt', '')}\" -> applied={h.get('applied')}, "
+            f"score={h.get('score', '?')}/10 — {h.get('critique', '')}"
+            for n, h in enumerate(history, start=1)
+        ]
+        history_block = (
+            "Previous attempts this session (oldest first):\n"
+            + "\n".join(lines) + "\n"
+            "Do not re-propose a phrasing that already failed. If the goal "
+            "keeps not landing, change the approach: a different verb, a more "
+            "concrete name for the subject, or an explicit description of the "
+            "desired result.\n"
+        )
     ask = (
         f"{backend_line}\n"
         f"The user's goal: {direction}\n"
-        f"The prompt used: {prompt}\n"
+        f"The prompt used for this attempt: {prompt}\n"
+        f"{history_block}"
         f"Pixel metrics: {describe_metrics(metrics)}\n"
         f"{PROMPT_TIPS.get(style, KONTEXT_PROMPT_TIPS)}\n"
-        "Compare the images. Reply with STRICT JSON only, no prose:\n"
-        '{"applied": true|false, "critique": "<one sentence: what did or '
-        f'did not change vs the goal>", "revised_prompt": "{revised_hint}"}}'
+        "Compare the images. Decide whether the requested edit was applied, "
+        "grade the output 0-10 against the goal (10 = goal fully achieved "
+        "with everything else preserved, 0 = no progress), write a one-"
+        f"sentence critique, and give revised_prompt: {revised_hint}."
     )
     payload = {
         "model": model,
@@ -210,21 +258,24 @@ def vlm_critique(model, direction, prompt, reference, output, metrics,
             "images": [img_b64(reference), img_b64(output)],
         }],
         "stream": False,
-        "options": {"temperature": 0.3},
+        "think": True,
+        "format": CRITIQUE_SCHEMA,
+        # Keep the critic resident between iterations so each critique doesn't
+        # pay the model-load cost again.
+        "keep_alive": "15m",
+        "options": {"temperature": 0.3, "num_ctx": 8192},
     }
     try:
-        req = urllib.request.Request(
-            ollama_url.rstrip("/") + "/api/chat",
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=300) as r:
-            text = json.loads(r.read().decode())["message"]["content"]
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        result = json.loads(match.group(0)) if match else None
-        if result and result.get("revised_prompt"):
+        try:
+            text = _ollama_chat(ollama_url, payload)
+        except urllib.error.HTTPError:
+            # Not every vision model supports thinking; retry once without.
+            payload.pop("think", None)
+            text = _ollama_chat(ollama_url, payload)
+        result = json.loads(text)
+        if result.get("revised_prompt"):
             return result
-        print(f"  (VLM reply had no usable JSON: {text[:200]})")
+        print(f"  (VLM reply missing revised_prompt: {text[:200]})")
     except Exception as e:
         print(f"  (VLM critique unavailable: {e})")
     return None
@@ -292,12 +343,16 @@ def main():
     ap.add_argument("-n", "--iterations", type=int, default=5,
                     help="max iterations (default 5)")
     ap.add_argument("--server", default="http://127.0.0.1:2222")
-    ap.add_argument("--vlm", default="gemma4:e2b",
-                    help="ollama vision model for critique, or 'none' (default gemma4:e2b)")
+    ap.add_argument("--vlm", default=os.environ.get("CRITIQUE_MODEL", "qwen3.6:latest"),
+                    help="ollama vision model for critique, or 'none' "
+                         "(default: CRITIQUE_MODEL env or qwen3.6:latest)")
     ap.add_argument("--ollama", default="http://127.0.0.1:11434",
                     help="ollama endpoint")
     ap.add_argument("--auto", action="store_true",
                     help="don't pause for confirmation between iterations")
+    ap.add_argument("--stop-score", type=int, default=8,
+                    help="in --auto mode, stop early once the critic grades an "
+                         "iteration at or above this score (default 8)")
     ap.add_argument("--chain", action="store_true",
                     help="feed each output in as the next iteration's input "
                          "(default: always re-edit the original)")
@@ -338,6 +393,7 @@ def main():
     versions = [original]  # versions[0] = input, versions[i] = iteration i output
     prompt = args.direction
     use_vlm = args.vlm.lower() != "none"
+    history = []  # prompt trajectory handed to the critic each iteration
 
     for i in range(1, args.iterations + 1):
         print(f"\n=== Iteration {i}/{args.iterations} ===")
@@ -359,15 +415,24 @@ def main():
             print(f"  asking {args.vlm} to compare input and output...")
             critique = vlm_critique(args.vlm, args.direction, prompt,
                                     reference, output, metrics, args.ollama,
-                                    style=prompt_style)
+                                    style=prompt_style, history=history)
         if critique:
-            print(f"  VLM: edit applied={critique.get('applied')} — "
+            score = critique.get("score")
+            score_txt = f" score={score}/10" if isinstance(score, int) else ""
+            print(f"  VLM: edit applied={critique.get('applied')}{score_txt} — "
                   f"{critique.get('critique', '')}")
             next_prompt = critique["revised_prompt"]
         else:
             next_prompt = heuristic_revision(args.direction, prompt, metrics)
         if next_prompt != prompt:
             print(f"  proposed next instruction: {next_prompt}")
+        history.append({
+            "prompt": prompt,
+            "applied": critique.get("applied") if critique else None,
+            "score": critique.get("score") if critique else None,
+            "critique": (critique.get("critique") if critique
+                         else describe_metrics(metrics)),
+        })
 
         log["iterations"].append({
             "prompt": prompt, "filename": filename, "output": out_path,
@@ -375,6 +440,16 @@ def main():
         })
         with open(os.path.join(session, "session.json"), "w") as f:
             json.dump(log, f, indent=2)
+
+        # Early stop: the critic says the goal landed and grades it highly.
+        goal_met = (critique and critique.get("applied")
+                    and isinstance(critique.get("score"), int)
+                    and critique["score"] >= args.stop_score)
+        if goal_met:
+            print(f"  goal achieved (score {critique['score']}/10)"
+                  + ("" if args.auto else " — accept with [a] or keep refining"))
+            if args.auto:
+                break
 
         if i == args.iterations:
             break
@@ -431,6 +506,13 @@ def main():
         strip_path = os.path.join(session, "filmstrip.png")
         build_film_strip(frames).save(strip_path)
         print(f"\n  film strip: {strip_path}")
+
+    scored = [((it.get("critique") or {}).get("score"), n + 1, it["output"])
+              for n, it in enumerate(log["iterations"])]
+    scored = [(s, n, p) for s, n, p in scored if isinstance(s, int)]
+    if scored:
+        s, n, p = max(scored)
+        print(f"  best iteration: {n} (score {s}/10) — {p}")
 
     print(f"\nSession saved: {session}")
     print(f"  {len(log['iterations'])} iteration(s); session.json has prompts, "

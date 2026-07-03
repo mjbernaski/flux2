@@ -323,6 +323,7 @@
                 <div class="watch-progress" id="watchProgress"></div>
             </div>
             <div class="watch-text" id="watchText">Starting…</div>
+            <button type="button" class="interrupt-btn watch-interrupt" id="watchInterruptBtn" style="display: none;">■ Interrupt</button>
         </div>
     </div>
 
@@ -341,6 +342,9 @@
             <button type="button" class="clear-recent-btn" id="clearRecentBtn">Clear recent</button>
         </div>
     </div>
+
+    <!-- GPU power draw, refreshed with the /status poll. -->
+    <div class="power-badge" id="powerBadge" style="display: none;">⚡ <span id="powerWatts"></span></div>
 
     <div class="history-section" id="historySection">
         <div class="history-header">

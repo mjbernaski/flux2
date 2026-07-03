@@ -713,15 +713,25 @@ let lastCompletedJobId = null;
 let seenDoneJobIds = new Set();
 
 // ---- Interrupt (stop the running job) ----
+// Two buttons share the handler: one in the main status panel, one in the
+// fullscreen watch overlay.
 const interruptBtn = document.getElementById('interruptBtn');
+const watchInterruptBtn = document.getElementById('watchInterruptBtn');
 let runningJobId = null;
 let interruptRequested = false;  // optimistic UI until /status echoes cancel_requested
 
-if (interruptBtn) interruptBtn.addEventListener('click', async function() {
+function setInterruptButton(btn, visible, stopping) {
+    if (!btn) return;
+    btn.style.display = visible ? 'inline-block' : 'none';
+    btn.disabled = !!stopping;
+    btn.textContent = stopping ? 'Stopping…' : '■ Interrupt';
+}
+
+async function requestInterrupt() {
     if (!runningJobId) return;
     interruptRequested = true;
-    interruptBtn.disabled = true;
-    interruptBtn.textContent = 'Stopping…';
+    setInterruptButton(interruptBtn, true, true);
+    setInterruptButton(watchInterruptBtn, true, true);
     try {
         const res = await fetch(`/jobs/${runningJobId}/cancel`, {
             method: 'POST',
@@ -737,7 +747,10 @@ if (interruptBtn) interruptBtn.addEventListener('click', async function() {
         interruptRequested = false;
     }
     pollStatus();
-});
+}
+
+if (interruptBtn) interruptBtn.addEventListener('click', requestInterrupt);
+if (watchInterruptBtn) watchInterruptBtn.addEventListener('click', requestInterrupt);
 
 function renderQueueItem(job, position) {
     const safePrompt = (job.prompt || '(empty prompt)').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -805,11 +818,8 @@ function renderRunning(running) {
         if (progressTracker) progressTracker.style.display = 'none';
         if (pwrap) pwrap.style.display = 'none';
         if (watchBtn) watchBtn.style.display = 'none';
-        if (interruptBtn) {
-            interruptBtn.style.display = 'none';
-            interruptBtn.disabled = false;
-            interruptBtn.textContent = '■ Interrupt';
-        }
+        setInterruptButton(interruptBtn, false, false);
+        setInterruptButton(watchInterruptBtn, false, false);
         runningJobId = null;
         interruptRequested = false;
         updateWatchOverlay(null);
@@ -822,12 +832,9 @@ function renderRunning(running) {
         runningJobId = running.id;
         interruptRequested = false;
     }
-    if (interruptBtn) {
-        const stopping = interruptRequested || running.cancel_requested;
-        interruptBtn.style.display = 'inline-block';
-        interruptBtn.disabled = !!stopping;
-        interruptBtn.textContent = stopping ? 'Stopping…' : '■ Interrupt';
-    }
+    const stopping = interruptRequested || running.cancel_requested;
+    setInterruptButton(interruptBtn, true, stopping);
+    setInterruptButton(watchInterruptBtn, true, stopping);
 
     let stepInfo = '';
     if (running.total_steps > 0 && running.step > 0) {
@@ -926,6 +933,19 @@ function renderRecentDone(recent) {
     }
 }
 
+// GPU wattage badge in the lower-right corner (value rides on /status).
+function renderPower(watts) {
+    const badge = document.getElementById('powerBadge');
+    const val = document.getElementById('powerWatts');
+    if (!badge || !val) return;
+    if (typeof watts === 'number') {
+        val.textContent = Math.round(watts) + ' W';
+        badge.style.display = 'block';
+    } else {
+        badge.style.display = 'none';
+    }
+}
+
 async function pollStatus() {
     try {
         const response = await fetch('/status', { headers: getAuthHeaders() });
@@ -945,6 +965,7 @@ async function pollStatus() {
         renderRunning(data.running);
         renderQueue(data.queued || []);
         renderRecentDone(data.recent_done || []);
+        renderPower(data.power_w);
     } catch (err) {
         console.error('Polling error:', err);
     }
@@ -1417,8 +1438,10 @@ async function runEditLoop() {
     const originalRef = currentInputImages[0];
     let refDataUrl = originalRef;
     let prompt = direction;
-    const completed = [];   // {filename, prompt} per finished iteration
-    let makeStrip = false;  // set on Accept & finish or natural completion
+    const completed = [];    // {filename, prompt} per finished iteration
+    const critHistory = [];  // prompt trajectory sent to the critic each round
+    let best = { score: -1, iter: 0 };  // best-graded iteration so far
+    let makeStrip = false;   // set on Accept & finish or natural completion
     try {
         for (let i = 1; i <= maxIter && !loopRun.stop; i++) {
             loopSetStatus(`Iteration ${i}/${maxIter}: generating…`);
@@ -1437,7 +1460,10 @@ async function runEditLoop() {
                         direction: direction,
                         prompt: prompt,
                         ref_image: refDataUrl,
-                        output_filename: filename
+                        output_filename: filename,
+                        // Trajectory of earlier rounds so the critic doesn't
+                        // re-propose phrasings that already failed.
+                        history: critHistory
                     })
                 });
                 critique = await res.json();
@@ -1451,14 +1477,32 @@ async function runEditLoop() {
             if (critique) {
                 const appliedTxt = critique.applied === null ? ''
                     : (critique.applied ? '✔ edit applied — ' : '✘ edit NOT applied — ');
-                verdictEl.textContent = appliedTxt + (critique.critique || '') +
+                const scoreTxt = (typeof critique.score === 'number') ? ` (score ${critique.score}/10)` : '';
+                verdictEl.textContent = appliedTxt + (critique.critique || '') + scoreTxt +
                     ' [' + (critique.metrics_text || '') + ']';
                 verdictEl.classList.add(critique.applied === false ? 'not-applied' : 'applied');
                 nextPrompt = critique.revised_prompt || prompt;
             }
             loopNextPrompt.value = nextPrompt;
 
+            critHistory.push({
+                prompt: prompt,
+                applied: critique ? critique.applied : null,
+                score: critique ? critique.score : null,
+                critique: critique ? (critique.critique || '') : ''
+            });
+            if (critique && typeof critique.score === 'number' && critique.score > best.score) {
+                best = { score: critique.score, iter: i };
+            }
+
             if (loopRun.stop) break;
+            // Early stop in auto mode: the critic says the goal landed.
+            if (auto && critique && critique.applied &&
+                typeof critique.score === 'number' && critique.score >= 8) {
+                loopSetStatus(`Goal achieved at iteration ${i} (score ${critique.score}/10).`);
+                makeStrip = true;
+                break;
+            }
             if (i === maxIter) { makeStrip = true; break; }
 
             if (auto) {
@@ -1514,7 +1558,8 @@ async function runEditLoop() {
                 loopSetStatus('Film strip failed: ' + err.message, 'error');
             }
         }
-        loopSetStatus(loopRun.stop ? 'Loop stopped.' : 'Loop finished — outputs are in the history below.', 'done');
+        const bestTxt = best.score >= 0 ? ` Best result: iteration ${best.iter} (score ${best.score}/10).` : '';
+        loopSetStatus((loopRun.stop ? 'Loop stopped.' : 'Loop finished — outputs are in the history below.') + bestTxt, 'done');
     } catch (err) {
         loopSetStatus(err.message === 'stopped' ? 'Loop stopped.' : 'Loop error: ' + err.message,
                       err.message === 'stopped' ? 'done' : 'error');

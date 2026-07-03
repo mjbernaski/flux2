@@ -2,6 +2,7 @@ import os
 import argparse
 import hmac
 import json
+import subprocess
 import threading
 import time
 import base64
@@ -146,12 +147,37 @@ except ValueError:
 if _current_config not in SERVER_CONFIGS:
     _current_config = None
 
-# Edit-loop critique (local ollama vision model; see /critique)
+# Edit-loop critique (local ollama vision model; see /critique). qwen3.6 is
+# the strongest local VLM on this box — slower than gemma4:e2b but its
+# judgments and revised prompts are markedly better.
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
-CRITIQUE_MODEL = os.environ.get("CRITIQUE_MODEL", "gemma4:e2b")
+CRITIQUE_MODEL = os.environ.get("CRITIQUE_MODEL", "qwen3.6:latest")
 
 PREVIEW_FILENAME = "_preview_current.png"
 PREVIEW_MIN_INTERVAL_S = 0.75  # throttle: skip decode if last preview was this recent
+
+# GPU power draw for the UI's corner wattage badge. nvidia-smi takes ~100ms
+# per call, so the reading is cached and refreshed at most every 2s even
+# though /status is polled more often.
+_POWER_CACHE_S = 2.0
+_power_state = {"watts": None, "ts": 0.0}
+
+
+def _gpu_power_watts():
+    now = time.monotonic()
+    if now - _power_state["ts"] < _POWER_CACHE_S:
+        return _power_state["watts"]
+    _power_state["ts"] = now
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=power.draw", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=2)
+        watts = sum(float(line) for line in out.stdout.split("\n")
+                    if line.strip() and "N/A" not in line)
+        _power_state["watts"] = round(watts, 1) if watts > 0 else None
+    except (subprocess.SubprocessError, FileNotFoundError, ValueError):
+        _power_state["watts"] = None
+    return _power_state["watts"]
 
 
 class JobCanceled(Exception):
@@ -765,6 +791,7 @@ def status():
         'queued': queued,
         'recent_done': recent,
         'queue_max_size': QUEUE_MAX_SIZE,
+        'power_w': _gpu_power_watts(),
     })
 
 
@@ -926,17 +953,22 @@ def critique():
     model = data.get('model') or CRITIQUE_MODEL
     style = ("description" if getattr(flux_core, 'OUTPUT_PREFIX', '') == 'sdxl'
              else "instruction")
+    # Prompt trajectory from earlier iterations ({prompt, applied, score,
+    # critique} dicts) so the critic doesn't re-propose failed phrasings.
+    history = data.get('history') if isinstance(data.get('history'), list) else []
     result = vlm_critique(model, direction, prompt, reference, output, metrics,
-                          ollama_url=OLLAMA_URL, style=style)
+                          ollama_url=OLLAMA_URL, style=style, history=history)
     if result:
         return jsonify({'success': True, 'vlm': True, 'metrics': metrics,
                         'metrics_text': describe_metrics(metrics),
                         'applied': bool(result.get('applied')),
+                        'score': result.get('score'),
                         'critique': result.get('critique', ''),
                         'revised_prompt': result.get('revised_prompt')})
     return jsonify({'success': True, 'vlm': False, 'metrics': metrics,
                     'metrics_text': describe_metrics(metrics),
                     'applied': None,
+                    'score': None,
                     'critique': 'Vision model unavailable — revision based on pixel metrics only.',
                     'revised_prompt': heuristic_revision(direction, prompt, metrics)})
 
