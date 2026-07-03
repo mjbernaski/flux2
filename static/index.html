@@ -2,7 +2,8 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="theme-color" content="#1a1a2e">
     <title>flux</title>
     <script>document.title = window.location.hostname + ' flux';</script>
     <link rel="stylesheet" href="/static/app.css">
@@ -72,7 +73,7 @@
                     <div class="image-upload-area" id="uploadArea">
                         <input type="file" id="inputImage" accept="image/*" multiple style="display: none;">
                         <div class="upload-placeholder" id="uploadPlaceholder">
-                            <span>Click or drag up to 3 images here</span>
+                            <span>Tap or click to add up to 3 images</span>
                         </div>
                     </div>
                 </div>
@@ -271,13 +272,13 @@
                     </select>
                 </div>
                 <div class="form-group">
-                    <label class="checkbox-label" style="margin-top: 24px;">
+                    <label class="checkbox-label row-checkbox-offset">
                         <input type="checkbox" id="loopAuto">
                         Auto-continue (no pause)
                     </label>
                 </div>
                 <div class="form-group">
-                    <label class="checkbox-label" style="margin-top: 24px;">
+                    <label class="checkbox-label row-checkbox-offset">
                         <input type="checkbox" id="loopChain">
                         Chain outputs (edit previous result, not the original)
                     </label>
@@ -319,7 +320,7 @@
         <div class="preview-wrap" id="previewWrap" style="display: none; margin-top: 12px;">
             <img id="previewImgLive" alt="Live preview" style="max-width: 512px; width: 100%; border-radius: 6px; display: block;">
         </div>
-        <button type="button" class="watch-btn" id="watchBtn" style="display: none;">⛶ Watch fullscreen</button>
+        <button type="button" class="watch-btn" id="watchBtn" style="display: none;">⛶ Watch live</button>
     </div>
 
     <div class="watch-overlay" id="watchOverlay">
@@ -333,6 +334,17 @@
             <div class="watch-text" id="watchText">Starting…</div>
             <button type="button" class="interrupt-btn watch-interrupt" id="watchInterruptBtn" style="display: none;">■ Interrupt</button>
         </div>
+    </div>
+
+    <!-- In-page image viewer: history/result/loop images open here instead of
+         a new tab. Pinch-zoom, pan, and swipe are pointer-gesture driven in
+         app.js (native pinch on fixed overlays zooms the page on iOS). -->
+    <div class="lightbox" id="lightbox">
+        <div class="lightbox-stage" id="lightboxStage"><img id="lightboxImg" alt=""></div>
+        <button type="button" class="lightbox-close" id="lightboxClose">✕</button>
+        <button type="button" class="lightbox-nav lightbox-prev" id="lightboxPrev">‹</button>
+        <button type="button" class="lightbox-nav lightbox-next" id="lightboxNext">›</button>
+        <div class="lightbox-caption" id="lightboxCaption"></div>
     </div>
 
     <div class="queue-panel" id="queuePanel" style="display: none;">

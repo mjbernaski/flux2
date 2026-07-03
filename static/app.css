@@ -3,13 +3,14 @@ body {
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
     max-width: 900px;
     margin: 0 auto;
-    padding: 20px;
+    /* Side padding respects the iPhone notch in landscape (viewport-fit=cover). */
+    padding: 20px max(20px, env(safe-area-inset-right)) 20px max(20px, env(safe-area-inset-left));
     background: #1a1a2e;
     color: #eee;
 }
 h1 { color: #00d4ff; margin-bottom: 5px; }
 .header-info { display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px; }
-.model-hover { position: fixed; top: 0; left: 0; width: 60px; height: 60px; z-index: 1000; }
+.model-hover { position: fixed; top: env(safe-area-inset-top, 0); left: 0; width: 60px; height: 60px; z-index: 1000; }
 .model-hover-name {
     display: none;
     position: absolute;
@@ -23,7 +24,8 @@ h1 { color: #00d4ff; margin-bottom: 5px; }
     font-size: 12px;
     white-space: nowrap;
 }
-.model-hover:hover .model-hover-name:not(:empty) { display: block; }
+.model-hover:hover .model-hover-name:not(:empty),
+.model-hover.show .model-hover-name:not(:empty) { display: block; }
 .hostname { color: #666; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; }
 .version { color: #666; font-size: 12px; }
 .subtitle { color: #888; margin-bottom: 20px; }
@@ -96,8 +98,8 @@ button:disabled {
 .watch-interrupt { margin-top: 10px; font-size: 14px; padding: 8px 18px; }
 .power-badge {
     position: fixed;
-    bottom: 12px;
-    right: 12px;
+    bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+    right: calc(12px + env(safe-area-inset-right, 0px));
     padding: 6px 12px;
     border: 1px solid #333;
     border-radius: 6px;
@@ -116,7 +118,8 @@ button:disabled {
     margin-bottom: 15px;
 }
 .model-switch label { margin-bottom: 0; flex: 0 0 auto; }
-.model-switch select { width: auto; flex: 0 1 auto; min-width: 240px; padding: 8px 12px; font-size: 14px; }
+/* 16px: anything smaller makes iOS Safari zoom the page on focus. */
+.model-switch select { width: auto; flex: 0 1 auto; min-width: 240px; padding: 8px 12px; font-size: 16px; }
 .model-switch-hint { color: #666; font-size: 11px; }
 .status {
     text-align: center;
@@ -211,7 +214,8 @@ button:disabled {
 .result.visible { display: block; }
 .image-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    /* min() keeps the 300px track from overflowing 320-390px viewports. */
+    grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr));
     gap: 20px;
 }
 .image-card {
@@ -224,10 +228,12 @@ button:disabled {
     max-width: 100%;
     border-radius: 6px;
     box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+    cursor: pointer;
 }
 .image-card .actions {
     margin-top: 12px;
     display: flex;
+    flex-wrap: wrap;
     gap: 10px;
     justify-content: center;
 }
@@ -509,8 +515,8 @@ button:disabled {
 .watch-overlay img.hidden { display: none; }
 .watch-close {
     position: absolute;
-    top: 16px;
-    right: 16px;
+    top: calc(16px + env(safe-area-inset-top, 0px));
+    right: calc(16px + env(safe-area-inset-right, 0px));
     z-index: 1;
     flex: 0 0 auto;
     width: auto;
@@ -523,7 +529,7 @@ button:disabled {
 .watch-info {
     position: absolute;
     left: 50%;
-    bottom: 16px;
+    bottom: calc(16px + env(safe-area-inset-bottom, 0px));
     transform: translateX(-50%);
     width: min(820px, calc(100% - 32px));
     background: rgba(0, 0, 0, 0.55);
@@ -876,11 +882,148 @@ button:disabled {
 #apiKeyInput {
     margin-top: 10px;
     padding: 8px;
-    font-size: 14px;
+    font-size: 16px; /* <16px triggers iOS zoom-on-focus */
     background: #16213e;
     border: 1px solid #444;
     border-radius: 4px;
     color: #fff;
     width: 100%;
+}
+
+/* Aligns a bare checkbox with the labeled select beside it in a .row;
+   zeroed in the stacked phone layout below. */
+.row-checkbox-offset { margin-top: 24px; }
+
+/* Lightbox: in-page viewer for history/result/loop images. Same fixed
+   inset:0 pattern as .watch-overlay (avoids the iOS 100vh problem).
+   touch-action:none on the stage: pinch/pan/swipe are handled with pointer
+   events in app.js, because native pinch on a fixed overlay zooms the whole
+   page in iOS Safari and leaks zoom state back to the page. */
+.lightbox {
+    position: fixed;
+    inset: 0;
+    background: #000;
+    z-index: 10000;
+    display: none;
+}
+.lightbox.visible { display: block; }
+.lightbox-stage {
+    position: absolute;
+    inset: 0;
+    overflow: hidden;
+    touch-action: none;
+}
+#lightboxImg {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    transform-origin: 0 0;
+    will-change: transform;
+    user-select: none;
+    -webkit-user-drag: none;
+}
+.lightbox-close {
+    position: absolute;
+    top: calc(12px + env(safe-area-inset-top, 0px));
+    right: calc(12px + env(safe-area-inset-right, 0px));
+    z-index: 1;
+    flex: 0 0 auto;
+    width: 44px;
+    height: 44px;
+    padding: 0;
+    font-size: 18px;
+    border-radius: 22px;
+    background: rgba(255,255,255,0.12);
+    color: #fff;
+}
+.lightbox-close:hover:not(:disabled) { background: rgba(255,255,255,0.25); }
+.lightbox-nav {
+    position: absolute;
+    top: 50%;
+    transform: translateY(-50%);
+    z-index: 1;
+    flex: 0 0 auto;
+    width: 44px;
+    height: 60px;
+    padding: 0;
+    font-size: 28px;
+    line-height: 1;
+    border-radius: 8px;
+    background: rgba(255,255,255,0.10);
+    color: #fff;
+}
+.lightbox-nav:hover:not(:disabled) { background: rgba(255,255,255,0.22); }
+.lightbox-prev { left: calc(8px + env(safe-area-inset-left, 0px)); }
+.lightbox-next { right: calc(8px + env(safe-area-inset-right, 0px)); }
+.lightbox-caption {
+    position: absolute;
+    left: 50%;
+    bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+    transform: translateX(-50%);
+    max-width: min(820px, calc(100% - 32px));
+    padding: 8px 14px;
+    border-radius: 8px;
+    background: rgba(0, 0, 0, 0.55);
+    color: #ccc;
+    font-size: 13px;
+    text-align: center;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    pointer-events: none;
+}
+.lightbox-caption:empty { display: none; }
+
+/* ==== Touch affordances ====
+   On devices without hover (iPad/iPhone) the hover-revealed history controls
+   must be visible and comfortably tappable. Desktop hover behavior above is
+   untouched. */
+@media (hover: none), (pointer: coarse) {
+    .history-item .item-delete,
+    .history-item .item-save,
+    .history-item .item-ref {
+        opacity: 1;
+        width: 32px;
+        height: 32px;
+        font-size: 15px;
+    }
+    .history-item .item-delete { right: 4px; }
+    .history-item .item-save { right: 42px; }
+    .history-item .item-ref { right: 80px; }
+    .history-item .overlay { opacity: 1; }
+    /* :hover sticks after a tap on iOS; keep thumbnails in place. */
+    .history-item:hover { transform: none; }
+
+    .clear-btn { width: 32px; height: 32px; font-size: 16px; }
+    .queue-item .cancel { padding: 8px 14px; font-size: 13px; }
+    .inpaint-buttons button { padding: 10px 16px; }
+    .loop-base-btn { padding: 8px 14px; }
+    button, a { -webkit-tap-highlight-color: rgba(0, 212, 255, 0.15); }
+}
+
+/* ==== Responsive layout ==== */
+@media (max-width: 700px) {
+    body {
+        padding-left: max(12px, env(safe-area-inset-left));
+        padding-right: max(12px, env(safe-area-inset-right));
+    }
+    .row { flex-wrap: wrap; }
+    .row .form-group { flex: 1 1 calc(50% - 8px); }
+    .loop-card { flex-direction: column; }
+    .loop-card img {
+        max-width: 100%;
+        max-height: 320px;
+        align-self: center;
+    }
+}
+
+@media (max-width: 480px) {
+    .row .form-group { flex-basis: 100%; }
+    .row-checkbox-offset { margin-top: 0; }
+    h1 { font-size: 24px; }
+    .history-header { flex-wrap: wrap; gap: 8px; }
+    .image-grid { gap: 14px; }
+    .image-card { padding: 10px; }
 }
 

@@ -134,6 +134,10 @@ function saveSwitchState() {
 // re-fetches /model-info so all capability toggles match the new backend.)
 function watchServerRestart(label) {
     saveSwitchState();
+    // The restarting server can't answer /status; this watcher's own /ready
+    // poll takes over until the page reloads.
+    pollStopped = true;
+    if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
     const overlay = document.getElementById('loadingOverlay');
     const statusEl = document.getElementById('loadingStatus');
     const elapsedEl = document.getElementById('loadingElapsed');
@@ -252,7 +256,6 @@ const aspectModeEl = document.getElementById('aspectMode');
 const strengthSlider = document.getElementById('strength');
 const strengthValue = document.getElementById('strengthValue');
 
-let pollInterval = null;
 let knownImageFilenames = new Set();
 let lastPreviewStep = -1;
 
@@ -320,12 +323,201 @@ function updateWatchOverlay(running, pct, runBatch, stepInfo) {
 if (watchBtnEl) watchBtnEl.addEventListener('click', openWatch);
 if (watchCloseEl) watchCloseEl.addEventListener('click', closeWatch);
 document.addEventListener('keydown', function(e) {
-    if (e.key === 'Escape' && watchOpen) closeWatch();
+    // !lbOpen: when the lightbox is up, Escape must close only it.
+    if (e.key === 'Escape' && watchOpen && !lbOpen) closeWatch();
 });
 // If the user leaves browser fullscreen (Esc/F11), drop our overlay too.
 document.addEventListener('fullscreenchange', function() {
     if (!document.fullscreenElement && watchOpen) closeWatch();
 });
+
+// ---- In-page lightbox ----
+// Replaces window.open for history/result/loop images. Pinch, pan, swipe and
+// double-tap zoom are implemented with pointer events: native pinch on a
+// fixed overlay zooms the page's visual viewport in iOS Safari and leaks
+// that zoom back to the page after closing, so it can't be relied on.
+const lightboxEl = document.getElementById('lightbox');
+const lightboxStage = document.getElementById('lightboxStage');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCaption = document.getElementById('lightboxCaption');
+const lightboxPrevBtn = document.getElementById('lightboxPrev');
+const lightboxNextBtn = document.getElementById('lightboxNext');
+const lightboxCloseBtn = document.getElementById('lightboxClose');
+let lbItems = [];
+let lbIndex = 0;
+let lbOpen = false;
+let lbScale = 1, lbTx = 0, lbTy = 0;
+
+function lbApplyTransform() {
+    lightboxImg.style.transform = `translate(${lbTx}px, ${lbTy}px) scale(${lbScale})`;
+}
+function lbClampPan() {
+    // The image fills the stage (object-fit contain), so keep the scaled
+    // box covering the viewport instead of letting it fly off-screen.
+    const w = lightboxStage.clientWidth, h = lightboxStage.clientHeight;
+    lbTx = Math.min(0, Math.max(w - w * lbScale, lbTx));
+    lbTy = Math.min(0, Math.max(h - h * lbScale, lbTy));
+}
+function lbResetTransform() {
+    lbScale = 1; lbTx = 0; lbTy = 0;
+    lbApplyTransform();
+}
+function lbShow(i) {
+    const n = lbItems.length;
+    lbIndex = ((i % n) + n) % n;
+    lbResetTransform();
+    lightboxImg.src = lbItems[lbIndex].src;
+    lightboxCaption.textContent = lbItems[lbIndex].caption || '';
+    if (n > 1) {  // preload neighbors so swipes feel instant
+        new Image().src = lbItems[(lbIndex + 1) % n].src;
+        new Image().src = lbItems[(lbIndex - 1 + n) % n].src;
+    }
+}
+function openLightbox(items, index) {
+    if (!lightboxEl || !items || !items.length) return;
+    lbItems = items;
+    lbOpen = true;
+    const multi = items.length > 1;
+    if (lightboxPrevBtn) lightboxPrevBtn.style.display = multi ? 'block' : 'none';
+    if (lightboxNextBtn) lightboxNextBtn.style.display = multi ? 'block' : 'none';
+    lbShow(index || 0);
+    lightboxEl.classList.add('visible');
+    document.body.style.overflow = 'hidden';
+}
+function closeLightbox() {
+    if (!lightboxEl) return;
+    lbOpen = false;
+    lightboxEl.classList.remove('visible');
+    lightboxImg.removeAttribute('src');  // frees the decoded bitmap on iOS
+    document.body.style.overflow = '';
+}
+
+// Zoom toward a screen point (transform-origin is 0 0, so the anchor math
+// keeps whatever is under the tap in place).
+function lbToggleZoom(clientX, clientY) {
+    if (lbScale > 1) { lbResetTransform(); return; }
+    const rect = lightboxStage.getBoundingClientRect();
+    const s = 2.5;
+    const x = clientX - rect.left, y = clientY - rect.top;
+    lbTx = x - (x - lbTx) * (s / lbScale);
+    lbTy = y - (y - lbTy) * (s / lbScale);
+    lbScale = s;
+    lbClampPan();
+    lbApplyTransform();
+}
+
+if (lightboxEl) {
+    // Gesture rules: two pointers pinch; one pointer pans when zoomed and
+    // swipes between images when not. Swipe and pan never overlap.
+    const lbPointers = new Map();
+    let lbPinchStart = null;
+    let lbPanStart = null;
+    let lbSwipeStart = null;
+    let lbLastTap = { t: 0, x: 0, y: 0 };
+
+    lightboxStage.addEventListener('pointerdown', function(e) {
+        e.preventDefault();
+        try { lightboxStage.setPointerCapture(e.pointerId); } catch (err) {}
+        lbPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        if (lbPointers.size === 2) {
+            const pts = Array.from(lbPointers.values());
+            lbPinchStart = {
+                dist: Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y),
+                scale: lbScale, tx: lbTx, ty: lbTy
+            };
+            lbPanStart = null;
+            lbSwipeStart = null;
+        } else if (lbPointers.size === 1) {
+            if (lbScale > 1) lbPanStart = { x: e.clientX, y: e.clientY, tx: lbTx, ty: lbTy };
+            else lbSwipeStart = { x: e.clientX, y: e.clientY };
+        }
+    });
+    lightboxStage.addEventListener('pointermove', function(e) {
+        const p = lbPointers.get(e.pointerId);
+        if (!p) return;
+        p.x = e.clientX; p.y = e.clientY;
+        if (lbPointers.size === 2 && lbPinchStart) {
+            const pts = Array.from(lbPointers.values());
+            const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+            const rect = lightboxStage.getBoundingClientRect();
+            const midX = (pts[0].x + pts[1].x) / 2 - rect.left;
+            const midY = (pts[0].y + pts[1].y) / 2 - rect.top;
+            const next = Math.min(5, Math.max(1, lbPinchStart.scale * (dist / lbPinchStart.dist)));
+            lbTx = midX - (midX - lbPinchStart.tx) * (next / lbPinchStart.scale);
+            lbTy = midY - (midY - lbPinchStart.ty) * (next / lbPinchStart.scale);
+            lbScale = next;
+            lbClampPan();
+            lbApplyTransform();
+        } else if (lbPanStart && lbScale > 1) {
+            lbTx = lbPanStart.tx + (e.clientX - lbPanStart.x);
+            lbTy = lbPanStart.ty + (e.clientY - lbPanStart.y);
+            lbClampPan();
+            lbApplyTransform();
+        }
+    });
+    const lbPointerEnd = function(e) {
+        lbPointers.delete(e.pointerId);
+        if (lbPointers.size < 2) lbPinchStart = null;
+        if (lbPointers.size > 0) return;
+        if (lbSwipeStart && lbScale === 1) {
+            const dx = e.clientX - lbSwipeStart.x;
+            const dy = e.clientY - lbSwipeStart.y;
+            if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) && lbItems.length > 1) {
+                lbShow(lbIndex + (dx < 0 ? 1 : -1));
+            } else if (Math.abs(dx) < 8 && Math.abs(dy) < 8) {
+                const now = Date.now();
+                if (now - lbLastTap.t < 300 &&
+                    Math.abs(e.clientX - lbLastTap.x) < 25 && Math.abs(e.clientY - lbLastTap.y) < 25) {
+                    lbToggleZoom(e.clientX, e.clientY);
+                    lbLastTap = { t: 0, x: 0, y: 0 };
+                } else {
+                    lbLastTap = { t: now, x: e.clientX, y: e.clientY };
+                }
+            }
+        }
+        // Double-tap back to 1x also works while zoomed: a zoomed single
+        // pointer starts a pan, so detect the no-movement case here.
+        if (lbPanStart && Math.abs(e.clientX - lbPanStart.x) < 8 && Math.abs(e.clientY - lbPanStart.y) < 8) {
+            const now = Date.now();
+            if (now - lbLastTap.t < 300 &&
+                Math.abs(e.clientX - lbLastTap.x) < 25 && Math.abs(e.clientY - lbLastTap.y) < 25) {
+                lbToggleZoom(e.clientX, e.clientY);
+                lbLastTap = { t: 0, x: 0, y: 0 };
+            } else {
+                lbLastTap = { t: now, x: e.clientX, y: e.clientY };
+            }
+        }
+        lbPanStart = null;
+        lbSwipeStart = null;
+    };
+    lightboxStage.addEventListener('pointerup', lbPointerEnd);
+    lightboxStage.addEventListener('pointercancel', lbPointerEnd);
+
+    if (lightboxCloseBtn) lightboxCloseBtn.addEventListener('click', closeLightbox);
+    if (lightboxPrevBtn) lightboxPrevBtn.addEventListener('click', function() { lbShow(lbIndex - 1); });
+    if (lightboxNextBtn) lightboxNextBtn.addEventListener('click', function() { lbShow(lbIndex + 1); });
+    document.addEventListener('keydown', function(e) {
+        if (!lbOpen) return;
+        if (e.key === 'Escape') closeLightbox();
+        else if (e.key === 'ArrowLeft' && lbItems.length > 1) lbShow(lbIndex - 1);
+        else if (e.key === 'ArrowRight' && lbItems.length > 1) lbShow(lbIndex + 1);
+    });
+    // Older-Safari belt and braces: suppress its proprietary gesture events.
+    document.addEventListener('gesturestart', function(e) { if (lbOpen) e.preventDefault(); });
+}
+
+// Touch path for the top-left model-name reveal (:hover never fires on
+// iPad/iPhone): a tap toggles the badge, which auto-hides after a moment.
+(function() {
+    const zone = document.getElementById('modelHover');
+    if (!zone) return;
+    let hideTimer = null;
+    zone.addEventListener('click', function() {
+        const on = zone.classList.toggle('show');
+        if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+        if (on) hideTimer = setTimeout(function() { zone.classList.remove('show'); }, 4000);
+    });
+})();
 
 if (strengthSlider) strengthSlider.addEventListener('input', function() { if (strengthValue) strengthValue.textContent = strengthSlider.value; });
 
@@ -413,7 +605,7 @@ function syncRefUI() {
     if (uploadPlaceholder) {
         const span = uploadPlaceholder.querySelector('span');
         if (span) span.textContent = n === 0
-            ? 'Click or drag up to 3 images here'
+            ? 'Tap or click to add up to 3 images'
             : `+ Add image (${n}/${MAX_REFERENCE_IMAGES})`;
     }
     // Strength only applies to single-image FLUX.1 img2img; multi-reference
@@ -726,6 +918,7 @@ if (resetBtn) resetBtn.addEventListener('click', async function() {
     }
     // Clear results and status
     if (imageGrid) imageGrid.innerHTML = '';
+    resultLbItems.length = 0;
     if (generationInfo) generationInfo.textContent = '';
     if (result) result.className = 'result';
     if (status) {
@@ -745,6 +938,7 @@ if (clearRecentBtn) clearRecentBtn.addEventListener('click', async function() {
         await fetch('/reset', { method: 'POST', headers: getAuthHeaders() });
     } catch (e) { console.warn('Clear recent request failed:', e); }
     if (imageGrid) imageGrid.innerHTML = '';
+    resultLbItems.length = 0;
     if (generationInfo) generationInfo.textContent = '';
     if (result) result.className = 'result';
     if (knownImageFilenames) knownImageFilenames.clear();
@@ -754,6 +948,9 @@ if (clearRecentBtn) clearRecentBtn.addEventListener('click', async function() {
 
 let lastCompletedJobId = null;
 let seenDoneJobIds = new Set();
+// Lightbox item list for the result grid; cleared wherever the grid clears
+// so indices captured by the card click handlers stay valid.
+const resultLbItems = [];
 
 // ---- Interrupt (stop the running job) ----
 // Two buttons share the handler: one in the main status panel, one in the
@@ -789,7 +986,8 @@ async function requestInterrupt() {
         alert('Interrupt failed: ' + e.message);
         interruptRequested = false;
     }
-    pollStatus();
+    noteActivity();
+    schedulePoll(0);
 }
 
 if (interruptBtn) interruptBtn.addEventListener('click', requestInterrupt);
@@ -843,7 +1041,8 @@ async function cancelQueuedJob(jobId) {
             const err = await res.json().catch(() => ({}));
             console.warn('Cancel failed:', err.error || res.status);
         }
-        pollStatus();
+        noteActivity();
+        schedulePoll(0);
     } catch (e) {
         console.error('Cancel error:', e);
     }
@@ -994,7 +1193,7 @@ async function pollStatus() {
         const response = await fetch('/status', { headers: getAuthHeaders() });
 
         if (response.status === 401) {
-            if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
+            pollStopped = true;  // un-latched when the API key input changes
             status.className = 'status error';
             statusText.textContent = 'Error: Unauthorized. Please check your API Key.';
             return;
@@ -1005,6 +1204,7 @@ async function pollStatus() {
         }
 
         const data = await response.json();
+        statusBusy = !!(data.running || (data.queued && data.queued.length));
         renderRunning(data.running);
         renderQueue(data.queued || []);
         renderRecentDone(data.recent_done || []);
@@ -1037,7 +1237,11 @@ function addImageToGrid(img, index) {
             <span class="timing-item timing-total"><span class="timing-label">Total:</span> ${img.timings.total}s</span>
         </div>
     `;
-    card.querySelector('img').src = `/images/${encodeURIComponent(img.filename)}?t=${t}`;
+    const cardImg = card.querySelector('img');
+    cardImg.src = `/images/${encodeURIComponent(img.filename)}?t=${t}`;
+    const lbIdx = resultLbItems.length;
+    resultLbItems.push({ src: `/images/${encodeURIComponent(img.filename)}`, caption: `Seed ${img.seed}` });
+    cardImg.addEventListener('click', () => openLightbox(resultLbItems, lbIdx));
     const dl = card.querySelector('.download-btn');
     dl.href = `/images/${encodeURIComponent(img.filename)}`;
     dl.setAttribute('download', img.filename);
@@ -1058,6 +1262,8 @@ function addCompositeToGrid(filename) {
             <a href="/images/${filename}" download="${filename}">Download composite</a>
         </div>
     `;
+    compositeCard.querySelector('img').addEventListener('click', () =>
+        openLightbox([{ src: `/images/${filename}`, caption: 'Spectrum composite' }], 0));
     imageGrid.insertBefore(compositeCard, imageGrid.firstChild);
 }
 
@@ -1162,11 +1368,13 @@ async function doGenerate() {
                 : (firstPosition > 1 ? `Queued at position ${firstPosition}` : 'Starting generation...');
             status.className = 'status generating';
             statusText.textContent = posMsg;
-            pollStatus();
+            noteActivity();
+            schedulePoll(0);
         } else if (submitted > 0 && errorMsg) {
             status.className = 'status error';
             statusText.textContent = `Queued ${submitted}/${orientationsToQueue.length}; stopped: ${errorMsg}`;
-            pollStatus();
+            noteActivity();
+            schedulePoll(0);
         } else {
             status.className = 'status error';
             statusText.textContent = 'Error: ' + (errorMsg || 'submission failed');
@@ -1179,14 +1387,53 @@ async function doGenerate() {
     }
 }
 
-// Handle visibility change for mobile robustness
+// ---- Adaptive /status polling ----
+// 1.5s while anything is active (running/queued job, edit loop, recent user
+// activity); ~10s when idle; fully stopped while the tab is hidden. The old
+// unconditional 1.5s interval was a real battery/heat cost on iPad/iPhone.
+let pollTimer = null;
+let pollStopped = false;   // latched on 401 until the API key changes
+let statusBusy = false;    // last /status showed a running or queued job
+let lastActivityTs = Date.now();
+
+function pollDelay() {
+    const active = statusBusy || loopRun || (Date.now() - lastActivityTs < 30000);
+    return active ? 1500 : 10000;
+}
+
+function schedulePoll(delayMs) {
+    if (pollTimer) clearTimeout(pollTimer);
+    pollTimer = null;
+    if (pollStopped || document.hidden) return;
+    pollTimer = setTimeout(async function() {
+        await pollStatus();
+        schedulePoll();
+    }, delayMs !== undefined ? delayMs : pollDelay());
+}
+
+function noteActivity() { lastActivityTs = Date.now(); }
+
+// Polling a hidden tab is wasted work; catch up immediately on return.
 document.addEventListener('visibilitychange', function() {
-    if (document.visibilityState === 'visible') pollStatus();
+    if (document.hidden) {
+        if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+    } else {
+        noteActivity();
+        schedulePoll(0);
+    }
+});
+// Any interaction keeps the fast cadence for 30s (adds no extra requests).
+document.addEventListener('pointerdown', noteActivity, { passive: true });
+document.addEventListener('keydown', noteActivity, { passive: true });
+// Typing a new API key un-latches a 401 stop and retries promptly.
+if (apiKeyInput) apiKeyInput.addEventListener('input', function() {
+    if (pollStopped) { pollStopped = false; schedulePoll(800); }
 });
 
-// Always poll so the queue panel and completed jobs update in real time.
 pollStatus();
-pollInterval = setInterval(pollStatus, 1500);
+// Explicit first delay: pollDelay() reads loopRun, which is declared later
+// in the file (TDZ at this point); reschedules run after full script load.
+schedulePoll(1500);
 
 if (submitBtn) submitBtn.addEventListener('click', function(e) { e.preventDefault(); doGenerate(); });
 if (form) form.addEventListener('submit', function(e) { e.preventDefault(); doGenerate(); });
@@ -1211,7 +1458,11 @@ async function loadHistory() {
             historyGrid.innerHTML = '<p class="history-empty">No images generated today</p>';
             return;
         }
-        data.images.forEach(img => {
+        const lbList = data.images.map(im => ({
+            src: `/images/${encodeURIComponent(im.filename)}`,
+            caption: (im.time ? im.time + ' — ' : '') + (im.prompt || im.filename)
+        }));
+        data.images.forEach((img, idx) => {
             const item = document.createElement('div');
             item.className = 'history-item';
             item.innerHTML = `
@@ -1234,7 +1485,7 @@ async function loadHistory() {
                 if (e.target.classList.contains('item-delete')) return;
                 if (e.target.classList.contains('item-save')) return;
                 if (e.target.classList.contains('item-ref')) return;
-                window.open(`/images/${img.filename}`, '_blank');
+                openLightbox(lbList, idx);
             });
             const refBtn = item.querySelector('.item-ref');
             if (refBtn) {
@@ -1341,6 +1592,8 @@ const loopControls = document.getElementById('loopControls');
 const loopNextPrompt = document.getElementById('loopNextPrompt');
 
 let loopRun = null;  // { stop, decision } — state of the active loop
+// Lightbox item list for the loop cards; cleared when a new loop starts.
+const loopLbItems = [];
 
 function loopSetStatus(msg, cls) {
     if (!loopStatusEl) return;
@@ -1431,7 +1684,9 @@ function loopAddCard(iter, prompt, filename) {
     const img = document.createElement('img');
     img.src = '/images/' + filename;
     img.alt = 'Iteration ' + iter;
-    img.addEventListener('click', () => window.open('/images/' + filename, '_blank'));
+    const lbIdx = loopLbItems.length;
+    loopLbItems.push({ src: '/images/' + filename, caption: `Iteration ${iter} — ${prompt}` });
+    img.addEventListener('click', () => openLightbox(loopLbItems, lbIdx));
     const body = document.createElement('div');
     body.className = 'loop-card-body';
     const title = document.createElement('div');
@@ -1496,6 +1751,7 @@ async function runEditLoop() {
     loopStartBtn.style.display = 'none';
     loopStopBtn.style.display = 'inline-block';
     loopCards.innerHTML = '';
+    loopLbItems.length = 0;
 
     const originalRef = currentInputImages[0];
     let refDataUrl = originalRef;
@@ -1612,7 +1868,8 @@ async function runEditLoop() {
                 const img = document.createElement('img');
                 img.src = '/images/' + body.filename;
                 img.alt = 'Edit loop film strip';
-                img.addEventListener('click', () => window.open('/images/' + body.filename, '_blank'));
+                img.addEventListener('click', () => openLightbox(
+                    [{ src: '/images/' + body.filename, caption: 'Film strip — ' + direction }], 0));
                 stripCard.appendChild(title);
                 stripCard.appendChild(img);
                 loopCards.appendChild(stripCard);
