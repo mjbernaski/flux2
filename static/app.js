@@ -90,10 +90,50 @@ if (apiKeyInput) {
         .catch(function() { clearTimeout(timeout); el.textContent = 'Model info unavailable (use server URL, e.g. http://localhost:2222)'; });
 })();
 
+// ---- Form-state carryover across a model switch ----
+// The switch ends in a full page reload (so /model-info re-fetches and the
+// capability toggles match the new backend), which would otherwise wipe the
+// prompt, reference images and every setting. Snapshot the form to
+// sessionStorage before reloading; the restore block at the bottom of this
+// file puts it back on the next load.
+const SWITCH_STATE_KEY = 'flux_switch_state';
+
+function saveSwitchState() {
+    const val = function(id) { const el = document.getElementById(id); return el ? el.value : null; };
+    const chk = function(id) { const el = document.getElementById(id); return el ? el.checked : null; };
+    const state = {
+        prompt: val('prompt'),
+        negativePrompt: val('negativePrompt'),
+        orientation: val('orientation'),
+        size: val('size'),
+        steps: val('steps'),
+        seed: val('seed'),
+        guidance: val('guidance'),
+        batch: val('batch'),
+        allOrientations: chk('allOrientations'),
+        spectrumGrid: chk('spectrumGrid'),
+        spectrumSameSeed: chk('spectrumSameSeed'),
+        showPreview: chk('showPreview'),
+        strength: strengthSlider ? strengthSlider.value : null,
+        aspectMode: aspectModeEl ? aspectModeEl.value : null,
+        cells: Array.from(selectedCells),
+        refImages: currentInputImages.slice(0, MAX_REFERENCE_IMAGES)
+    };
+    try {
+        sessionStorage.setItem(SWITCH_STATE_KEY, JSON.stringify(state));
+    } catch (err) {
+        // Reference data URLs can blow the sessionStorage quota; keep at
+        // least the text parameters.
+        state.refImages = [];
+        try { sessionStorage.setItem(SWITCH_STATE_KEY, JSON.stringify(state)); } catch (err2) {}
+    }
+}
+
 // After a model switch: show the loading overlay and reload the page once the
 // server has gone down and come back up ready with the new model. (A reload
 // re-fetches /model-info so all capability toggles match the new backend.)
 function watchServerRestart(label) {
+    saveSwitchState();
     const overlay = document.getElementById('loadingOverlay');
     const statusEl = document.getElementById('loadingStatus');
     const elapsedEl = document.getElementById('loadingElapsed');
@@ -1508,4 +1548,66 @@ if (loopBaseOriginalBtn) loopBaseOriginalBtn.addEventListener('click', function(
 if (loopAcceptBtn) loopAcceptBtn.addEventListener('click', function() {
     if (loopRun && loopRun.decision) loopRun.decision('accept');
 });
+
+// ---- Restore form state after a model switch ----
+// Counterpart of saveSwitchState(): the model-switch reload lands here, and
+// the snapshot (prompt, reference images, parameters) is put back so the
+// working context survives the switch. One-shot: the key is cleared on read.
+(function() {
+    let saved = null;
+    try {
+        const raw = sessionStorage.getItem(SWITCH_STATE_KEY);
+        if (!raw) return;
+        sessionStorage.removeItem(SWITCH_STATE_KEY);
+        saved = JSON.parse(raw);
+    } catch (err) { return; }
+    if (!saved) return;
+
+    const setVal = function(id, v) {
+        const el = document.getElementById(id);
+        if (el && v !== null && v !== undefined) el.value = v;
+    };
+    const setChk = function(id, v) {
+        const el = document.getElementById(id);
+        if (el && typeof v === 'boolean') el.checked = v;
+    };
+    setVal('prompt', saved.prompt);
+    setVal('negativePrompt', saved.negativePrompt);
+    setVal('orientation', saved.orientation);
+    setVal('size', saved.size);
+    setVal('steps', saved.steps);
+    setVal('seed', saved.seed);
+    setVal('guidance', saved.guidance);
+    setVal('batch', saved.batch);
+    setChk('allOrientations', saved.allOrientations);
+    setChk('spectrumGrid', saved.spectrumGrid);
+    setChk('spectrumSameSeed', saved.spectrumSameSeed);
+    setChk('showPreview', saved.showPreview);
+    if (strengthSlider && saved.strength !== null && saved.strength !== undefined) {
+        strengthSlider.value = saved.strength;
+        if (strengthValue) strengthValue.textContent = saved.strength;
+    }
+    if (aspectModeEl && saved.aspectMode) aspectModeEl.value = saved.aspectMode;
+
+    // Re-apply the UI side effects the change handlers would have produced.
+    if (allOrientationsEl && orientationSelectEl) {
+        orientationSelectEl.disabled = allOrientationsEl.checked;
+        orientationSelectEl.style.opacity = allOrientationsEl.checked ? '0.5' : '';
+    }
+    if (gridContainer && spectrumGridEl) {
+        gridContainer.style.display = spectrumGridEl.checked ? 'block' : 'none';
+    }
+    if (Array.isArray(saved.cells) && gridSelector) {
+        selectedCells.clear();
+        Array.from(gridSelector.children).forEach(function(cell, i) {
+            const on = saved.cells.indexOf(i) !== -1;
+            cell.classList.toggle('selected', on);
+            if (on) selectedCells.add(i);
+        });
+    }
+    if (Array.isArray(saved.refImages) && saved.refImages.length > 0) {
+        currentInputImages = saved.refImages.slice(0, MAX_REFERENCE_IMAGES);
+        syncRefUI();
+    }
+})();
 
