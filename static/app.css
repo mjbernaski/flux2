@@ -28,6 +28,11 @@ h1 { color: #00d4ff; margin-bottom: 5px; }
 .model-hover.show .model-hover-name:not(:empty) { display: block; }
 .hostname { color: #666; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; }
 .version { color: #666; font-size: 12px; }
+/* Edit-loop vision model state, refreshed with the /status poll. */
+.vlm-badge { font-size: 12px; color: #666; }
+.vlm-badge.loaded { color: #7fdc9a; }
+.vlm-badge.loading { color: #e6b450; }
+.vlm-badge.unavailable { color: #ff8a8a; }
 .subtitle { color: #888; margin-bottom: 20px; }
 .form-group { margin-bottom: 15px; }
 label { display: block; margin-bottom: 5px; color: #aaa; }

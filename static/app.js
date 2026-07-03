@@ -1175,6 +1175,27 @@ function renderRecentDone(recent) {
     }
 }
 
+// Critique-VLM badge in the header: is the edit loop's vision model
+// resident in ollama right now? (Value rides on /status; older servers
+// don't send it, so the badge stays hidden there.)
+function renderVlm(vlm) {
+    const badge = document.getElementById('vlmBadge');
+    if (!badge) return;
+    if (!vlm || !vlm.status) { badge.style.display = 'none'; return; }
+    const model = (vlm.model || 'VLM').replace(/:latest$/, '');
+    const labels = {
+        loaded: `🧠 ${model} ready`,
+        loading: `🧠 ${model} loading…`,
+        unloaded: `🧠 ${model} idle`,
+        unavailable: '🧠 VLM unavailable'
+    };
+    badge.textContent = labels[vlm.status] || `🧠 ${model} ${vlm.status}`;
+    badge.className = 'vlm-badge ' + vlm.status;
+    badge.title = 'Edit-loop vision model (' + (vlm.model || '') + '): ' + vlm.status
+        + (vlm.status === 'unloaded' ? ' — loads on the first critique' : '');
+    badge.style.display = 'inline';
+}
+
 // GPU wattage badge in the lower-right corner (value rides on /status).
 function renderPower(watts) {
     const badge = document.getElementById('powerBadge');
@@ -1209,6 +1230,7 @@ async function pollStatus() {
         renderQueue(data.queued || []);
         renderRecentDone(data.recent_done || []);
         renderPower(data.power_w);
+        renderVlm(data.vlm);
     } catch (err) {
         console.error('Polling error:', err);
     }
@@ -1437,10 +1459,15 @@ schedulePoll(1500);
 
 if (submitBtn) submitBtn.addEventListener('click', function(e) { e.preventDefault(); doGenerate(); });
 if (form) form.addEventListener('submit', function(e) { e.preventDefault(); doGenerate(); });
+// Cmd/Ctrl+Return: start the generation that's available in context — when
+// the edit loop is paused between iterations, that's "Continue" (with the
+// possibly-edited next instruction); otherwise queue a normal generation
+// (works during a running job too — it just queues behind it).
 document.addEventListener('keydown', function(e) {
     if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
         e.preventDefault();
-        doGenerate();
+        if (loopRun && loopRun.decision) loopRun.decision('continue');
+        else doGenerate();
     }
 });
 

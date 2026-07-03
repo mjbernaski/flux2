@@ -162,6 +162,36 @@ PREVIEW_MIN_INTERVAL_S = 0.75  # throttle: skip decode if last preview was this 
 _POWER_CACHE_S = 2.0
 _power_state = {"watts": None, "ts": 0.0}
 
+# Whether the critique VLM is resident in ollama, for the UI's header badge.
+# ollama's /api/ps is a cheap local call, but /status polls at up to 1.5s,
+# so the answer is cached. _vlm_warming is set while the startup preload
+# runs, so the badge can distinguish "loading" from "not loaded yet".
+_VLM_CACHE_S = 10.0
+_vlm_state = {"status": None, "ts": 0.0}
+_vlm_warming = False
+
+
+def _vlm_status():
+    now = time.monotonic()
+    if now - _vlm_state["ts"] < _VLM_CACHE_S:
+        status = _vlm_state["status"]
+    else:
+        _vlm_state["ts"] = now
+        status = "unloaded"
+        try:
+            import urllib.request
+            with urllib.request.urlopen(OLLAMA_URL + "/api/ps", timeout=2) as r:
+                models = json.loads(r.read().decode()).get("models") or []
+            norm = lambda n: n if ":" in n else n + ":latest"
+            if any(norm(m.get("name") or "") == norm(CRITIQUE_MODEL) for m in models):
+                status = "loaded"
+        except Exception:
+            status = "unavailable"
+        _vlm_state["status"] = status
+    if status != "loaded" and _vlm_warming:
+        status = "loading"
+    return {"model": CRITIQUE_MODEL, "status": status}
+
 
 def _gpu_power_watts():
     now = time.monotonic()
@@ -792,6 +822,7 @@ def status():
         'recent_done': recent,
         'queue_max_size': QUEUE_MAX_SIZE,
         'power_w': _gpu_power_watts(),
+        'vlm': _vlm_status(),
     })
 
 
@@ -1084,17 +1115,22 @@ def _warm_critique_model():
     edit loop's first critique doesn't pay the multi-minute cold load. An
     empty /api/generate request loads the model and returns; keep_alive
     matches the 15m refresh on every real critique call (edit_loop.py)."""
+    global _vlm_warming
     import urllib.request
     payload = json.dumps({"model": CRITIQUE_MODEL, "stream": False,
                           "keep_alive": "15m"}).encode()
     req = urllib.request.Request(f"{OLLAMA_URL}/api/generate", data=payload,
                                  headers={"Content-Type": "application/json"})
+    _vlm_warming = True
     try:
         with urllib.request.urlopen(req, timeout=600) as r:
             r.read()
         print(f"Critique model {CRITIQUE_MODEL} loaded in ollama.")
     except Exception as e:
         print(f"Critique model warm-up skipped: {e}")
+    finally:
+        _vlm_warming = False
+        _vlm_state["ts"] = 0.0  # re-check residency on the next /status
 
 
 @app.route('/loop-strip', methods=['POST'])
