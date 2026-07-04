@@ -1130,11 +1130,11 @@ def _boost_family(has_image=False):
     return 'flux1-img2img' if has_image else 'flux1'
 
 
-def _run_boost(cid, model, prompt, family, model_desc, level):
+def _run_boost(cid, model, prompt, family, model_desc, level, think):
     from edit_loop import vlm_boost
     try:
         boosted = vlm_boost(model, prompt, family=family, model_desc=model_desc,
-                            level=level, ollama_url=OLLAMA_URL)
+                            level=level, think=think, ollama_url=OLLAMA_URL)
         if boosted:
             payload = {'success': True, 'prompt': boosted}
         else:
@@ -1153,8 +1153,9 @@ def boost():
     shifted to edit-instruction / final-image idiom when `has_image` says
     references are attached), via the local ollama model. `level` 1-5 sets
     how far the rewrite may depart from the draft (1 = polish wording only,
-    5 = reimagine boldly). Returns a boost_id immediately; poll
-    GET /boost/<id> for the improved prompt."""
+    5 = reimagine boldly); `think` (default true) toggles the VLM's
+    thinking phase — off is faster but shallower. Returns a boost_id
+    immediately; poll GET /boost/<id> for the improved prompt."""
     data = request.json or {}
     prompt = (data.get('prompt') or '').strip()
     if not prompt:
@@ -1166,9 +1167,10 @@ def boost():
     if not 1 <= level <= 5:
         return jsonify({'success': False, 'error': 'level must be an integer 1-5'}), 400
     has_image = bool(data.get('has_image'))
+    think = bool(data.get('think', True))
     model = data.get('model') or CRITIQUE_MODEL
     cid = _vlm_job_start(_run_boost, model, prompt, _boost_family(has_image),
-                         _model_type_string(), level)
+                         _model_type_string(), level, think)
     return jsonify({'success': True, 'boost_id': cid})
 
 

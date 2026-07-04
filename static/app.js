@@ -719,6 +719,7 @@ async function runBoost() {
     const btn = document.getElementById('boostBtn');
     const promptEl = document.getElementById('prompt');
     const levelEl = document.getElementById('boostLevel');
+    const thinkEl = document.getElementById('boostThink');
     const draft = (promptEl.value || '').trim();
     if (!draft) { alert('Type a prompt to boost first.'); return; }
     const oldLabel = btn.textContent;
@@ -731,6 +732,7 @@ async function runBoost() {
             body: JSON.stringify({
                 prompt: draft,
                 level: levelEl ? parseInt(levelEl.value, 10) : 3,
+                think: thinkEl ? thinkEl.checked : true,
                 has_image: currentInputImages.length > 0
             })
         });

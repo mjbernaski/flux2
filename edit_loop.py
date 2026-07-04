@@ -427,13 +427,14 @@ BOOST_LEVELS = {
 
 
 def vlm_boost(model, prompt, family="flux2", model_desc="", level=3,
-              ollama_url="http://127.0.0.1:11434"):
+              think=True, ollama_url="http://127.0.0.1:11434"):
     """Rewrite the user's draft prompt into a stronger one tuned to the
     prompting idiom of the loaded image model (`family` picks the guidance;
     `model_desc` is the human-readable model name for context; `level` 1-5
-    sets how far the rewrite may depart from the draft). Text-only chat —
-    no images. Returns the improved prompt string, or None on any
-    failure."""
+    sets how far the rewrite may depart from the draft; `think=False`
+    disables the model's thinking phase for a faster, shallower rewrite).
+    Text-only chat — no images. Returns the improved prompt string, or
+    None on any failure."""
     guidance = BOOST_GUIDANCE.get(family, BOOST_GUIDANCE["flux2"])
     degree, temperature = BOOST_LEVELS.get(level, BOOST_LEVELS[3])
     ask = (
@@ -453,7 +454,7 @@ def vlm_boost(model, prompt, family="flux2", model_desc="", level=3,
         "model": model,
         "messages": [{"role": "user", "content": ask}],
         "stream": False,
-        "think": True,
+        "think": bool(think),
         "format": DESCRIBE_SCHEMA,
         "keep_alive": "15m",
         "options": {"temperature": temperature, "num_ctx": 8192},
