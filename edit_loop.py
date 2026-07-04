@@ -372,15 +372,70 @@ BOOST_GUIDANCE = {
     ),
 }
 
+# When the user has attached reference image(s), the nature of the prompt
+# changes: FLUX.2 and Kontext condition on the reference and want the prompt
+# as active CHANGES (edit instructions); SDXL and FLUX.1 img2img re-render
+# from a description of the desired FINAL image, never the delta.
+BOOST_GUIDANCE["flux2-edit"] = (
+    "The target model is FLUX.2 conditioning on the user's attached "
+    "reference image(s): the prompt must state the CHANGES to make as "
+    "active edit instructions — imperative sentences naming concretely "
+    "what to change, add or remove and the desired result, ending with "
+    "what must stay the same. Do NOT describe the whole scene from "
+    "scratch; the reference supplies it."
+)
+BOOST_GUIDANCE["sdxl-img2img"] = (
+    BOOST_GUIDANCE["sdxl"] + " The user has attached a starting image "
+    "(img2img): the prompt must still describe the desired FINAL image as "
+    "a whole — subject, setting, lighting, style — never the delta from "
+    "the starting image; anything left undescribed may drift when the "
+    "image is re-rendered."
+)
+BOOST_GUIDANCE["flux1-img2img"] = (
+    BOOST_GUIDANCE["flux1"] + " The user has attached a starting image "
+    "(img2img): describe the desired FINAL image as a whole, never the "
+    "changes relative to the starting image — the model re-renders from "
+    "the description."
+)
 
-def vlm_boost(model, prompt, family="flux2", model_desc="",
+
+# How far /boost is allowed to depart from the user's draft, by level 1-5.
+# Each level pairs a rewrite instruction with a sampling temperature —
+# conservative levels run cold so the draft survives nearly verbatim,
+# adventurous levels run hot for more inventive detail.
+BOOST_LEVELS = {
+    1: ("Make the lightest possible touch: fix grammar, word order and "
+        "ambiguity only. Add NO new details — the result should read as the "
+        "user's own prompt, just cleaner, and stay close to its original "
+        "length.", 0.1),
+    2: ("Tighten and clarify the wording, and add at most one or two small "
+        "concrete details where the draft is vague. Keep it brief and "
+        "recognizably the user's prompt.", 0.2),
+    3: ("Flesh out what the draft leaves open — composition, lighting, "
+        "style — into a well-formed prompt, keeping the user's framing and "
+        "adding nothing that changes the scene.", 0.4),
+    4: ("Expand generously: develop the scene with concrete specifics of "
+        "subject appearance, setting, composition and camera, lighting, "
+        "palette and mood. The result should be much richer than the draft, "
+        "but every addition must fit naturally with what the user "
+        "described.", 0.6),
+    5: ("Reimagine boldly: treat the draft as a seed and write the most "
+        "vivid, evocative prompt you can — take real creative liberties "
+        "with style, atmosphere, lighting and composition, as long as the "
+        "core subject and the user's explicit details remain intact.", 0.85),
+}
+
+
+def vlm_boost(model, prompt, family="flux2", model_desc="", level=3,
               ollama_url="http://127.0.0.1:11434"):
     """Rewrite the user's draft prompt into a stronger one tuned to the
     prompting idiom of the loaded image model (`family` picks the guidance;
-    `model_desc` is the human-readable model name for context). Text-only
-    chat — no images. Returns the improved prompt string, or None on any
+    `model_desc` is the human-readable model name for context; `level` 1-5
+    sets how far the rewrite may depart from the draft). Text-only chat —
+    no images. Returns the improved prompt string, or None on any
     failure."""
     guidance = BOOST_GUIDANCE.get(family, BOOST_GUIDANCE["flux2"])
+    degree, temperature = BOOST_LEVELS.get(level, BOOST_LEVELS[3])
     ask = (
         "You improve prompts for a local text-to-image system"
         + (f" currently running {model_desc}" if model_desc else "") + ".\n"
@@ -388,10 +443,11 @@ def vlm_boost(model, prompt, family="flux2", model_desc="",
         f"The user's draft prompt: {prompt}\n"
         "Rewrite it into a stronger prompt for this model. Preserve the "
         "user's intent and every explicit detail they gave (subjects, "
-        "counts, colors, names, any text to render verbatim); flesh out "
-        "only what the draft leaves open. Do not invent new subjects or "
-        "change what the image is fundamentally of. Reply with the "
-        "improved prompt only."
+        "counts, colors, names, any text to render verbatim). "
+        f"Degree of rewrite: {degree} "
+        "Where the degree conflicts with the style guidance above (e.g. on "
+        "length or how much to add), the degree wins. "
+        "Reply with the improved prompt only."
     )
     payload = {
         "model": model,
@@ -400,7 +456,7 @@ def vlm_boost(model, prompt, family="flux2", model_desc="",
         "think": True,
         "format": DESCRIBE_SCHEMA,
         "keep_alive": "15m",
-        "options": {"temperature": 0.4, "num_ctx": 8192},
+        "options": {"temperature": temperature, "num_ctx": 8192},
     }
     try:
         text = _chat_text(ollama_url, payload)

@@ -58,8 +58,17 @@
         <div class="form-group">
             <label for="prompt">Prompt</label>
             <textarea id="prompt" name="prompt" rows="5" placeholder="A majestic mountain landscape at sunset..." required></textarea>
-            <button type="button" id="boostBtn" class="describe-btn boost-btn"
-                    title="The local vision model rewrites your prompt to suit the loaded model's prompting style">&#10024; Boost prompt</button>
+            <div class="boost-control">
+                <button type="button" id="boostBtn" class="describe-btn boost-btn"
+                        title="The local vision model rewrites your prompt to suit the loaded model's prompting style (and, with references attached, its editing idiom)">&#10024; Boost prompt</button>
+                <select id="boostLevel" title="How far the rewrite may depart from your draft">
+                    <option value="1">1 &middot; polish wording only</option>
+                    <option value="2">2 &middot; tidy + a detail or two</option>
+                    <option value="3" selected>3 &middot; enhance</option>
+                    <option value="4">4 &middot; enrich generously</option>
+                    <option value="5">5 &middot; reimagine boldly</option>
+                </select>
+            </div>
         </div>
 
         <!-- SDXL only (shown when the server reports negative-prompt support) -->

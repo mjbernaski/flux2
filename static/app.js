@@ -711,10 +711,14 @@ if (describeBtn) describeBtn.addEventListener('click', runReversePath);
 
 // Prompt boost: the local VLM rewrites whatever is in the prompt box into a
 // stronger prompt for the loaded model (the server knows which backend is
-// active and picks the matching prompting idiom).
+// active and picks the matching prompting idiom; has_image tells it whether
+// references are attached, which shifts the idiom to edit instructions on
+// FLUX.2/Kontext and desired-final-image description on SDXL/FLUX.1).
+// The level select (1-5) sets how far the rewrite may depart from the draft.
 async function runBoost() {
     const btn = document.getElementById('boostBtn');
     const promptEl = document.getElementById('prompt');
+    const levelEl = document.getElementById('boostLevel');
     const draft = (promptEl.value || '').trim();
     if (!draft) { alert('Type a prompt to boost first.'); return; }
     const oldLabel = btn.textContent;
@@ -724,7 +728,11 @@ async function runBoost() {
         const res = await fetch('/boost', {
             method: 'POST',
             headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
-            body: JSON.stringify({ prompt: draft })
+            body: JSON.stringify({
+                prompt: draft,
+                level: levelEl ? parseInt(levelEl.value, 10) : 3,
+                has_image: currentInputImages.length > 0
+            })
         });
         const submitted = await res.json().catch(() => ({}));
         if (!res.ok || !submitted.success) throw new Error(submitted.error || `HTTP ${res.status}`);
