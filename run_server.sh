@@ -133,6 +133,31 @@ set_config_args() {
     esac
 }
 
+# The critique/describe VLM needs a local ollama on 11434. The systemd unit
+# is no use here: it runs as the `ollama` user, whose model store doesn't
+# have qwen3.6 — the models live under ~/.ollama. So start `ollama serve` as
+# this user, detached (setsid nohup) so it survives the SSH session ending.
+ensure_ollama() {
+    if ! command -v ollama >/dev/null 2>&1; then
+        echo -e "${YELLOW}ollama not installed — VLM critique/describe will be unavailable${NC}"
+        return 0
+    fi
+    if curl -sf --max-time 2 "http://127.0.0.1:11434/api/version" >/dev/null 2>&1; then
+        return 0
+    fi
+    echo -e "${CYAN}Starting ollama (VLM backend, logging to ollama.log)...${NC}"
+    setsid nohup ollama serve >> ollama.log 2>&1 < /dev/null &
+    local i
+    for i in $(seq 1 20); do
+        if curl -sf --max-time 1 "http://127.0.0.1:11434/api/version" >/dev/null 2>&1; then
+            echo -e "${GREEN}ollama is up.${NC}"
+            return 0
+        fi
+        sleep 0.5
+    done
+    echo -e "${YELLOW}ollama did not come up within 10s — VLM features may be unavailable (see ollama.log)${NC}"
+}
+
 # web_server.py exits with this code (after writing .next_config) when the
 # user picks a different model in the UI; the restart loop below relaunches
 # with the new config instead of treating it as a crash.
@@ -159,6 +184,7 @@ start_server() {
     echo ""
 
     kill_existing_server
+    ensure_ollama
 
     if [ ! -f .venv/bin/activate ]; then
         echo -e "${RED}No .venv found — create it first: python -m venv .venv && uv pip install -r requirements.txt${NC}"
