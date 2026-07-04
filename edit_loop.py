@@ -340,6 +340,79 @@ def vlm_describe(model, image, ollama_url="http://127.0.0.1:11434"):
     return None
 
 
+# Per-backend prompting idioms for /boost — what a strong prompt looks like
+# for the loaded model, so the rewrite targets the right style.
+BOOST_GUIDANCE = {
+    "flux2": (
+        "The target model is FLUX.2, whose text encoder is a full LLM: it "
+        "rewards detailed natural-language description. Write one rich "
+        "paragraph of flowing prose covering the subject and its exact "
+        "appearance, the setting, composition and camera framing, lighting, "
+        "color palette, mood, and overall style. No keyword lists, no "
+        "negative-prompt phrasing ('no X', 'without Y') — describe what "
+        "SHOULD be in the image."
+    ),
+    "flux1": (
+        "The target model is FLUX.1 (T5 text encoder): it rewards one dense "
+        "descriptive paragraph of natural language — subject, setting, "
+        "composition, lighting, palette, mood, style — with concrete nouns "
+        "and specifics. Keep it under roughly 120 words; no keyword soup, "
+        "no negative-prompt phrasing ('no X', 'without Y')."
+    ),
+    "kontext": (
+        "The target model is FLUX.1-Kontext, an instruction-based image "
+        "EDITOR: the prompt must stay a command, not a scene description. "
+        + KONTEXT_PROMPT_TIPS
+    ),
+    "sdxl": (
+        SDXL_PROMPT_TIPS + " Its CLIP encoder only reads roughly the first "
+        "75 tokens, so keep it to short comma-separated descriptive phrases "
+        "with the subject first and style/quality terms (e.g. "
+        "'photorealistic, sharp focus, detailed') at the end."
+    ),
+}
+
+
+def vlm_boost(model, prompt, family="flux2", model_desc="",
+              ollama_url="http://127.0.0.1:11434"):
+    """Rewrite the user's draft prompt into a stronger one tuned to the
+    prompting idiom of the loaded image model (`family` picks the guidance;
+    `model_desc` is the human-readable model name for context). Text-only
+    chat — no images. Returns the improved prompt string, or None on any
+    failure."""
+    guidance = BOOST_GUIDANCE.get(family, BOOST_GUIDANCE["flux2"])
+    ask = (
+        "You improve prompts for a local text-to-image system"
+        + (f" currently running {model_desc}" if model_desc else "") + ".\n"
+        f"{guidance}\n"
+        f"The user's draft prompt: {prompt}\n"
+        "Rewrite it into a stronger prompt for this model. Preserve the "
+        "user's intent and every explicit detail they gave (subjects, "
+        "counts, colors, names, any text to render verbatim); flesh out "
+        "only what the draft leaves open. Do not invent new subjects or "
+        "change what the image is fundamentally of. Reply with the "
+        "improved prompt only."
+    )
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": ask}],
+        "stream": False,
+        "think": True,
+        "format": DESCRIBE_SCHEMA,
+        "keep_alive": "15m",
+        "options": {"temperature": 0.4, "num_ctx": 8192},
+    }
+    try:
+        text = _chat_text(ollama_url, payload)
+        boosted = (json.loads(text).get("prompt") or "").strip()
+        if boosted:
+            return boosted
+        print(f"  (VLM boost reply missing prompt: {text[:200]})")
+    except Exception as e:
+        print(f"  (VLM boost unavailable: {e})")
+    return None
+
+
 def _label_font(size):
     from PIL import ImageFont
     for path in (

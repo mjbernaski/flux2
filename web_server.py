@@ -912,25 +912,28 @@ def switch_model():
     return jsonify({'success': True, 'switching_to': SERVER_CONFIGS[target]})
 
 
-@app.route('/model-info')
-def model_info():
+def _model_type_string():
     flux_name = f"FLUX.{flux_core._flux_version}"
     variant = "-klein" if _klein else "-dev"
     if _SDXL_ACTIVE:
         # Deliberately not the checkpoint basename — this string shows in the
         # UI's model-name hover, and checkpoint repo ids can be lurid.
-        model_type = "SDXL (photoreal)"
-    elif _kontext:
+        return "SDXL (photoreal)"
+    if _kontext:
         kontext_prec = "full bf16" if _full_model else "4-bit"
-        model_type = f"FLUX.1-Kontext (editor, {kontext_prec})"
-    elif _schnell:
-        model_type = f"{flux_name}-schnell (4-step)"
-    elif _gguf_quant:
-        model_type = f"{flux_name}-dev GGUF {_gguf_quant.upper()}"
-    elif _full_model:
-        model_type = f"{flux_name}{variant} (full)"
-    else:
-        model_type = f"{flux_name}-dev-bnb-4bit"
+        return f"FLUX.1-Kontext (editor, {kontext_prec})"
+    if _schnell:
+        return f"{flux_name}-schnell (4-step)"
+    if _gguf_quant:
+        return f"{flux_name}-dev GGUF {_gguf_quant.upper()}"
+    if _full_model:
+        return f"{flux_name}{variant} (full)"
+    return f"{flux_name}-dev-bnb-4bit"
+
+
+@app.route('/model-info')
+def model_info():
+    model_type = _model_type_string()
     encoder_type = ("local CLIP encoders" if _SDXL_ACTIVE
                     else "local encoder" if _local_encoder else "remote encoder")
     turbo_str = " + Turbo" if flux_core._turbo_enabled else ""
@@ -952,7 +955,7 @@ def model_info():
     })
 
 
-# Async VLM job bookkeeping (critique and describe). A qwen3.6 vision call
+# Async VLM job bookkeeping (critique, describe, boost). A qwen3.6 vision call
 # can run for several minutes — far past the ~60s connection cap browsers
 # (Safari especially) put on a single fetch — so the POST endpoints only
 # validate and start the work, and the client polls GET /<route>/<id> for
@@ -986,7 +989,7 @@ def _vlm_job_finish(cid, payload):
 
 
 def _vlm_job_status(cid):
-    """Shared poll response for GET /critique/<id> and GET /describe/<id>."""
+    """Shared poll response for GET /critique|describe|boost/<id>."""
     with _vlm_jobs_lock:
         entry = _vlm_jobs.get(cid)
         if entry is None:
@@ -1109,6 +1112,53 @@ def describe():
 @app.route('/describe/<cid>')
 def describe_result(cid):
     """Poll for an async describe started by POST /describe."""
+    return _vlm_job_status(cid)
+
+
+def _boost_family():
+    """Prompting idiom of the loaded backend, keying edit_loop.BOOST_GUIDANCE."""
+    if _SDXL_ACTIVE:
+        return 'sdxl'
+    if _kontext:
+        return 'kontext'
+    return 'flux2' if flux_core._flux_version == 2 else 'flux1'
+
+
+def _run_boost(cid, model, prompt, family, model_desc):
+    from edit_loop import vlm_boost
+    try:
+        boosted = vlm_boost(model, prompt, family=family, model_desc=model_desc,
+                            ollama_url=OLLAMA_URL)
+        if boosted:
+            payload = {'success': True, 'prompt': boosted}
+        else:
+            payload = {'success': False,
+                       'error': 'vision model unavailable or returned no rewrite'}
+    except Exception as e:
+        payload = {'success': False, 'error': f'boost failed: {e}'}
+    _vlm_job_finish(cid, payload)
+
+
+@app.route('/boost', methods=['POST'])
+def boost():
+    """Rewrite the user's draft prompt into a stronger one tuned to the
+    prompting idiom of the currently loaded model (descriptive prose for
+    FLUX, an imperative instruction for Kontext, tag phrases for SDXL),
+    via the local ollama model. Returns a boost_id immediately; poll
+    GET /boost/<id> for the improved prompt."""
+    data = request.json or {}
+    prompt = (data.get('prompt') or '').strip()
+    if not prompt:
+        return jsonify({'success': False, 'error': 'prompt is required'}), 400
+    model = data.get('model') or CRITIQUE_MODEL
+    cid = _vlm_job_start(_run_boost, model, prompt, _boost_family(),
+                         _model_type_string())
+    return jsonify({'success': True, 'boost_id': cid})
+
+
+@app.route('/boost/<cid>')
+def boost_result(cid):
+    """Poll for an async boost started by POST /boost."""
     return _vlm_job_status(cid)
 
 

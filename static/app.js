@@ -709,6 +709,38 @@ async function runReversePath() {
 const describeBtn = document.getElementById('describeBtn');
 if (describeBtn) describeBtn.addEventListener('click', runReversePath);
 
+// Prompt boost: the local VLM rewrites whatever is in the prompt box into a
+// stronger prompt for the loaded model (the server knows which backend is
+// active and picks the matching prompting idiom).
+async function runBoost() {
+    const btn = document.getElementById('boostBtn');
+    const promptEl = document.getElementById('prompt');
+    const draft = (promptEl.value || '').trim();
+    if (!draft) { alert('Type a prompt to boost first.'); return; }
+    const oldLabel = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Boosting prompt…';
+    try {
+        const res = await fetch('/boost', {
+            method: 'POST',
+            headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+            body: JSON.stringify({ prompt: draft })
+        });
+        const submitted = await res.json().catch(() => ({}));
+        if (!res.ok || !submitted.success) throw new Error(submitted.error || `HTTP ${res.status}`);
+        const data = await pollVlmJob('/boost/' + submitted.boost_id);
+        if (data.prompt) promptEl.value = data.prompt;
+    } catch (err) {
+        alert('Prompt boost failed: ' + err.message);
+    } finally {
+        btn.disabled = false;
+        btn.textContent = oldLabel;
+    }
+}
+
+const boostBtn = document.getElementById('boostBtn');
+if (boostBtn) boostBtn.addEventListener('click', runBoost);
+
 if (uploadArea) {
     uploadArea.addEventListener('click', function() { if (inputImage) inputImage.click(); });
     uploadArea.addEventListener('dragover', function(e) { e.preventDefault(); uploadArea.classList.add('dragover'); });
@@ -1699,7 +1731,7 @@ async function loopAwaitJob(jobId) {
     }
 }
 
-// Slow VLM calls (/critique, /describe) can run for minutes — far past the
+// Slow VLM calls (/critique, /describe, /boost) can run for minutes — far past the
 // ~60s cap Safari puts on a single fetch — so their POST endpoints return an
 // id right away and the result is collected by polling. The optional
 // `cancelled` callback aborts the wait.
