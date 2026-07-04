@@ -202,18 +202,24 @@ def _ollama_chat(ollama_url, payload):
 def _chat_text(ollama_url, payload):
     """Chat with retries for two ollama quirks: models that reject the
     "think" flag (HTTP error → retry without it), and 200 replies with empty
-    content — a request racing the model's keep_alive unload returns
-    done_reason "load", and a thinking model occasionally ends its turn after
-    the thinking phase without emitting the schema-constrained reply (retry
-    once, dropping "think" in that case to force the JSON out directly)."""
+    content — a request racing a model load/unload returns done_reason
+    "load" (retried with a short wait until the load settles, which can take
+    a while right after server startup while the warm-up pull runs), and a
+    thinking model occasionally ends its turn after the thinking phase
+    without emitting the schema-constrained reply (retry, dropping "think"
+    in that case to force the JSON out directly)."""
     try:
         resp = _ollama_chat(ollama_url, payload)
     except urllib.error.HTTPError:
         payload.pop("think", None)
         resp = _ollama_chat(ollama_url, payload)
     text = resp["message"]["content"]
-    if not text.strip():
-        if resp.get("done_reason") != "load":
+    for _ in range(5):
+        if text.strip():
+            break
+        if resp.get("done_reason") == "load":
+            time.sleep(3)
+        else:
             payload.pop("think", None)
         resp = _ollama_chat(ollama_url, payload)
         text = resp["message"]["content"]
