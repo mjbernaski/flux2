@@ -467,7 +467,14 @@ def vlm_boost(model, prompt, family="flux2", model_desc="", level=3,
     }
     try:
         text = _chat_text(ollama_url, payload)
-        boosted = (json.loads(text).get("prompt") or "").strip()
+        # With think disabled, qwen3.6 ignores the format schema and
+        # returns the rewrite as plain text — accept both shapes.
+        try:
+            parsed = json.loads(text)
+            boosted = (parsed.get("prompt") or "").strip() \
+                if isinstance(parsed, dict) else str(parsed).strip()
+        except json.JSONDecodeError:
+            boosted = text.strip()
         if boosted:
             return boosted
         print(f"  (VLM boost reply missing prompt: {text[:200]})")
