@@ -642,8 +642,36 @@ function shrinkImageDataUrl(dataUrl, cb) {
     img.src = dataUrl;
 }
 
+// Camera RAW files (NEF etc.) can't be decoded by the browser, so they're
+// posted as-is to /convert-raw, which returns a JPEG data URL that then
+// behaves like any other reference. Detection is by extension — browsers
+// report an empty MIME type for RAW files.
+var RAW_EXTENSIONS = ['nef', 'nrw', 'dng', 'cr2', 'cr3', 'arw', 'raf', 'orf', 'rw2'];
+
+function isRawFile(file) {
+    var ext = ((file && file.name) || '').split('.').pop().toLowerCase();
+    return RAW_EXTENSIONS.indexOf(ext) !== -1;
+}
+
+function handleRawFile(file) {
+    var span = uploadPlaceholder ? uploadPlaceholder.querySelector('span') : null;
+    if (span) span.textContent = 'Converting ' + file.name + '…';
+    var fd = new FormData();
+    fd.append('file', file, file.name);
+    fetch('/convert-raw', { method: 'POST', headers: getAuthHeaders(), body: fd })
+        .then(function(res) {
+            return res.json().catch(function() { return {}; }).then(function(data) {
+                if (!res.ok || !data.success) throw new Error(data.error || ('HTTP ' + res.status));
+                if (currentInputImages.length < MAX_REFERENCE_IMAGES) currentInputImages.push(data.image);
+            });
+        })
+        .catch(function(err) { alert('RAW conversion failed: ' + err.message); })
+        .then(function() { syncRefUI(); }); // also restores the placeholder label
+}
+
 function handleImageFile(file) {
     if (currentInputImages.length >= MAX_REFERENCE_IMAGES) return;
+    if (isRawFile(file)) { handleRawFile(file); return; }
     var reader = new FileReader();
     reader.onload = function(e) {
         shrinkImageDataUrl(e.target.result, function(shrunk) {
@@ -657,7 +685,7 @@ function handleImageFile(file) {
 
 function addImageFiles(fileList) {
     Array.from(fileList || [])
-        .filter(function(f) { return f && f.type.indexOf('image/') === 0; })
+        .filter(function(f) { return f && (f.type.indexOf('image/') === 0 || isRawFile(f)); })
         .slice(0, Math.max(0, MAX_REFERENCE_IMAGES - currentInputImages.length))
         .forEach(handleImageFile);
 }

@@ -1118,6 +1118,92 @@ def describe_result(cid):
     return _vlm_job_status(cid)
 
 
+# Camera RAW (NEF etc.) reference support: browsers can't decode RAW files, so
+# the UI posts them here as-is and gets back a browser-usable JPEG data URL
+# that then flows through the normal reference path. Decoded with LibRaw via
+# rawpy (ffmpeg has no NEF decoder). References are conditioned at ~2MP, so
+# half_size skips the full-resolution demosaic and MAX_RAW_EDGE bounds the
+# returned JPEG the same way the client bounds ordinary uploads.
+MAX_RAW_EDGE = 2048
+
+
+def _largest_embedded_jpeg(data):
+    """Largest JPEG embedded in a RAW container, or None. Cameras store
+    full-size JPEG previews inside RAW files; when LibRaw can't decode the
+    raw data itself (body newer than the LibRaw release, Nikon High
+    Efficiency NEFs), the preview is still a faithful full-res rendering.
+    Scans for JPEG SOI markers and lets PIL parse from each — PIL stops at
+    the matching EOI, so trailing container bytes are harmless."""
+    best = None
+    pos = 0
+    for _ in range(16):
+        pos = data.find(b'\xff\xd8\xff', pos)
+        if pos < 0:
+            break
+        try:
+            img = Image.open(io.BytesIO(data[pos:]))
+            img.load()
+            if best is None or img.width * img.height > best.width * best.height:
+                best = img.convert('RGB')
+        except Exception:
+            pass
+        pos += 3
+    return best
+
+
+def _raw_to_pil(data):
+    """Decode camera RAW bytes to a PIL image: full LibRaw demosaic first,
+    then LibRaw's thumbnail extractor, then the embedded-JPEG scan."""
+    import rawpy
+    try:
+        with rawpy.imread(io.BytesIO(data)) as raw:
+            return Image.fromarray(raw.postprocess(use_camera_wb=True, half_size=True))
+    except Exception as demosaic_err:
+        try:
+            with rawpy.imread(io.BytesIO(data)) as raw:
+                thumb = raw.extract_thumb()
+            if thumb.format == rawpy.ThumbFormat.JPEG:
+                return Image.open(io.BytesIO(thumb.data)).convert('RGB')
+            return Image.fromarray(thumb.data)
+        except Exception:
+            pass
+        image = _largest_embedded_jpeg(data)
+        if image is not None:
+            return image
+        raise demosaic_err
+
+
+@app.route('/convert-raw', methods=['POST'])
+def convert_raw():
+    """Convert an uploaded camera RAW file (NEF/DNG/CR3/...) to a JPEG data
+    URL for use as a reference image. Takes a multipart form `file` field
+    (raw bytes, not base64 — a 50MB NEF must fit the 64MB body cap)."""
+    f = request.files.get('file')
+    if f is None:
+        return jsonify({'success': False, 'error': 'multipart form field "file" is required'}), 400
+    try:
+        import rawpy  # noqa: F401 — fail fast with a clear error if absent
+    except ImportError:
+        return jsonify({'success': False, 'error': 'RAW conversion requires the rawpy package on the server (uv pip install rawpy)'}), 501
+    data = f.read()
+    if not data:
+        return jsonify({'success': False, 'error': 'uploaded file is empty'}), 400
+    try:
+        image = _raw_to_pil(data)
+    except Exception as e:
+        # Size + header bytes make "what was this file actually?" answerable
+        # from the client-side error alone.
+        print(f"convert-raw failed: {f.filename!r}, {len(data)} bytes, header {data[:12].hex()}: {e}")
+        return jsonify({'success': False, 'error': f'could not decode RAW file ({len(data)} bytes, header {data[:12].hex()}): {e}'}), 400
+    image.thumbnail((MAX_RAW_EDGE, MAX_RAW_EDGE), Image.LANCZOS)
+    buf = io.BytesIO()
+    image.save(buf, format='JPEG', quality=92)
+    b64 = base64.b64encode(buf.getvalue()).decode('ascii')
+    return jsonify({'success': True,
+                    'image': 'data:image/jpeg;base64,' + b64,
+                    'width': image.width, 'height': image.height})
+
+
 def _boost_family(has_image=False):
     """Prompting idiom of the loaded backend, keying edit_loop.BOOST_GUIDANCE.
     With reference image(s) attached the idiom shifts: FLUX.2 and Kontext

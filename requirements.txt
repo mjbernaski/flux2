@@ -12,5 +12,6 @@ sentencepiece
 protobuf
 flask
 pillow
+rawpy  # LibRaw bindings: camera RAW (NEF etc.) reference uploads via /convert-raw
 python-dotenv
 # nvidia-modelopt  # installed for future NVFP4 support (currently blocked by diffusers Flux2 converter)
