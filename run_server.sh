@@ -43,7 +43,7 @@ show_menu() {
     echo -e "    ${GREEN}2)${NC} Full             Best quality"
     echo -e "    ${GREEN}3)${NC} GGUF Q8          DGX Spark optimized"
     echo -e "    ${GREEN}4)${NC} schnell          4-step fast (Apache 2.0)"
-    echo -e "    ${GREEN}5)${NC} Uncensored       Full model + LoRA"
+    echo -e "    ${GREEN}5)${NC} U-LoRA           Full model + LoRA"
     echo ""
     echo -e "  ${YELLOW}FLUX.2 (32B · klein 9B)${NC}"
     echo -e "    ${GREEN}6)${NC} 4-bit            Low VRAM"
@@ -54,10 +54,10 @@ show_menu() {
     echo -e "  ${YELLOW}Editing${NC}"
     echo -e "   ${GREEN}10)${NC} Kontext          Instruction editing (FLUX.1, 4-bit)"
     echo -e "   ${GREEN}11)${NC} Kontext Full     Instruction editing (FLUX.1, full bf16)"
-    echo -e "   ${GREEN}12)${NC} Kontext Uncens.  Kontext Full + Uncensored LoRA (edit refs)"
+    echo -e "   ${GREEN}12)${NC} Kontext U-LoRA   Kontext Full + U-LoRA (edit refs)"
     echo ""
     echo -e "  ${YELLOW}Stable Diffusion (SDXL)${NC}"
-    echo -e "   ${GREEN}13)${NC} SDXL Uncensored  LUSTIFY! checkpoint, negative prompts"
+    echo -e "   ${GREEN}13)${NC} SDXL photoreal   Photoreal checkpoint, negative prompts"
     echo ""
     echo -e "    ${RED}q)${NC} Quit"
     echo ""
@@ -90,7 +90,7 @@ set_config_args() {
             ;;
         5)
             args="--uncensored"
-            desc="FLUX.1 + Uncensored LoRA"
+            desc="FLUX.1 + U-LoRA"
             ;;
         6)
             args="--flux2"
@@ -118,13 +118,13 @@ set_config_args() {
             ;;
         12)
             args="--kontext --full-model --uncensored"
-            desc="FLUX.1 Kontext Full + Uncensored LoRA"
+            desc="FLUX.1 Kontext Full + U-LoRA"
             ;;
         13)
-            # Uncensored SDXL checkpoint (sd_core.py backend). Override the
+            # SDXL checkpoint (sd_core.py backend). Override the
             # checkpoint with SD_MODEL=<repo-or-path> before launching.
             args="--sdxl"
-            desc="SDXL Uncensored (LUSTIFY!)"
+            desc="SDXL (photoreal)"
             ;;
         *)
             echo -e "${RED}Invalid selection${NC}"

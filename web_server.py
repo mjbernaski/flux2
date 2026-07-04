@@ -128,15 +128,15 @@ SERVER_CONFIGS = {
     2: "FLUX.1 Full",
     3: "FLUX.1 GGUF Q8",
     4: "FLUX.1-schnell",
-    5: "FLUX.1 + Uncensored LoRA",
+    5: "FLUX.1 + U-LoRA",
     6: "FLUX.2 4-bit BNB",
     7: "FLUX.2 Full + Turbo",
     8: "FLUX.2 Full (no Turbo)",
     9: "FLUX.2-klein-9B",
     10: "FLUX.1 Kontext (editor)",
     11: "FLUX.1 Kontext Full (editor, bf16)",
-    12: "FLUX.1 Kontext Full + Uncensored LoRA",
-    13: "SDXL Uncensored (LUSTIFY!)",
+    12: "FLUX.1 Kontext Full + U-LoRA",
+    13: "SDXL (photoreal)",
 }
 SWITCH_EXIT_CODE = 86
 SWITCH_CONFIG_FILE = ".next_config"
@@ -917,7 +917,9 @@ def model_info():
     flux_name = f"FLUX.{flux_core._flux_version}"
     variant = "-klein" if _klein else "-dev"
     if _SDXL_ACTIVE:
-        model_type = f"SDXL ({flux_core.model_name()})"
+        # Deliberately not the checkpoint basename — this string shows in the
+        # UI's model-name hover, and checkpoint repo ids can be lurid.
+        model_type = "SDXL (photoreal)"
     elif _kontext:
         kontext_prec = "full bf16" if _full_model else "4-bit"
         model_type = f"FLUX.1-Kontext (editor, {kontext_prec})"
@@ -932,7 +934,7 @@ def model_info():
     encoder_type = ("local CLIP encoders" if _SDXL_ACTIVE
                     else "local encoder" if _local_encoder else "remote encoder")
     turbo_str = " + Turbo" if flux_core._turbo_enabled else ""
-    uncensored_str = " + Uncensored" if flux_core._uncensored_enabled else ""
+    uncensored_str = " + U-LoRA" if flux_core._uncensored_enabled and not _SDXL_ACTIVE else ""
     return jsonify({
         'model': model_type,
         'encoder': encoder_type,
@@ -1320,13 +1322,13 @@ if __name__ == '__main__':
     parser.add_argument("--klein", action="store_true", help="Use FLUX.2-klein (9B) instead of FLUX.2-dev (32B). Implies --flux2 --full-model")
     parser.add_argument("--turbo", action="store_true", default=None, help="Enable turbo LoRA")
     parser.add_argument("--no-turbo", action="store_true", help="Disable turbo LoRA")
-    parser.add_argument("--uncensored", action="store_true", help="Load Lustly.ai uncensored NSFW LoRA")
+    parser.add_argument("--uncensored", action="store_true", help="Load the uncensored LoRA (FLUX.1 only)")
     parser.add_argument("--kontext", action="store_true", help="Use FLUX.1 Kontext, an instruction-based image editor (4-bit; add --full-model for full bf16)")
     parser.add_argument("--sdxl", nargs='?', const='', default=None, metavar='MODEL',
-                        help="Serve an uncensored Stable Diffusion XL checkpoint instead of FLUX. "
+                        help="Serve a Stable Diffusion XL checkpoint instead of FLUX. "
                              "Optional MODEL is an HF repo id, local diffusers dir, or single-file "
                              ".safetensors (e.g. a Civitai download); default is "
-                             "the LUSTIFY! NSFW/SFW merge (or the SD_MODEL env var). "
+                             "a photoreal merge (or the SD_MODEL env var). "
                              "Enables negative prompts; ignores the FLUX model flags.")
     parser.add_argument("--compile", action="store_true", help="torch.compile the transformer after load: the first generation per resolution is much slower (compilation), later ones ~10-25%% faster. Best when generating at consistent resolutions")
     parser.add_argument("--port", type=int, default=PORT, help=f"Port (default: {PORT})")
@@ -1359,7 +1361,7 @@ if __name__ == '__main__':
                 _model_load_status = "loading turbo LoRA"
                 load_turbo_lora()
             if _uncensored and not _SDXL_ACTIVE:
-                _model_load_status = "loading uncensored LoRA"
+                _model_load_status = "loading U-LoRA"
                 load_uncensored_lora()
             if args.compile:
                 # Wraps the transformer; actual compilation happens lazily on
