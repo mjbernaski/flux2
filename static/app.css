@@ -440,6 +440,7 @@ button:disabled {
 .boost-control select { width: auto; flex: 0 1 auto; padding: 6px 10px; font-size: 13px; }
 .boost-think { display: flex; align-items: center; gap: 5px; color: #ccc; font-size: 13px; cursor: pointer; }
 .boost-think input[type="checkbox"] { width: auto; }
+.describe-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .inpaint-control { margin-top: 10px; }
 .inpaint-toggle { display: flex; align-items: center; gap: 8px; color: #ccc; font-size: 14px; cursor: pointer; }
 .inpaint-toggle input[type="checkbox"] { width: auto; }

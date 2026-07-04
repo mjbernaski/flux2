@@ -680,10 +680,14 @@ async function runReversePath() {
     btn.disabled = true;
     btn.textContent = 'Describing photo with vision model…';
     try {
+        const thinkEl = document.getElementById('describeThink');
         const res = await fetch('/describe', {
             method: 'POST',
             headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
-            body: JSON.stringify({ image: currentInputImages[0] })
+            body: JSON.stringify({
+                image: currentInputImages[0],
+                think: thinkEl ? thinkEl.checked : true
+            })
         });
         const submitted = await res.json().catch(() => ({}));
         if (!res.ok || !submitted.success) throw new Error(submitted.error || `HTTP ${res.status}`);

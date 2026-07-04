@@ -1074,10 +1074,10 @@ def critique_result(cid):
     return _vlm_job_status(cid)
 
 
-def _run_describe(cid, model, image):
+def _run_describe(cid, model, image, think):
     from edit_loop import vlm_describe
     try:
-        prompt = vlm_describe(model, image, ollama_url=OLLAMA_URL)
+        prompt = vlm_describe(model, image, think=think, ollama_url=OLLAMA_URL)
         if prompt:
             payload = {'success': True, 'prompt': prompt}
         else:
@@ -1092,8 +1092,10 @@ def _run_describe(cid, model, image):
 def describe():
     """The reverse path: have the local vision model write a detailed
     text-to-image prompt that would recreate the posted photo, for
-    generating a fresh image from that prompt alone. Returns a describe_id
-    immediately; poll GET /describe/<id> for the prompt."""
+    generating a fresh image from that prompt alone. `think` (default true)
+    toggles the VLM's deliberation phase — off is faster but shallower.
+    Returns a describe_id immediately; poll GET /describe/<id> for the
+    prompt."""
     data = request.json or {}
     img_b64 = data.get('image') or ''
     if not img_b64:
@@ -1104,8 +1106,9 @@ def describe():
         image = Image.open(io.BytesIO(base64.b64decode(img_b64))).convert('RGB')
     except Exception:
         return jsonify({'success': False, 'error': 'image is not a decodable base64 image'}), 400
+    think = bool(data.get('think', True))
     model = data.get('model') or CRITIQUE_MODEL
-    cid = _vlm_job_start(_run_describe, model, image)
+    cid = _vlm_job_start(_run_describe, model, image, think)
     return jsonify({'success': True, 'describe_id': cid})
 
 

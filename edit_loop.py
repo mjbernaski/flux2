@@ -311,10 +311,24 @@ DESCRIBE_SCHEMA = {
 }
 
 
-def vlm_describe(model, image, ollama_url="http://127.0.0.1:11434"):
+def _prompt_from_reply(text):
+    """Extract the prompt from a DESCRIBE_SCHEMA-formatted reply. With think
+    disabled, qwen3.6 ignores the format schema and returns plain text —
+    accept both shapes."""
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return (parsed.get("prompt") or "").strip()
+        return str(parsed).strip()
+    except json.JSONDecodeError:
+        return text.strip()
+
+
+def vlm_describe(model, image, think=True, ollama_url="http://127.0.0.1:11434"):
     """The reverse path: ask the local vision model to write a detailed
-    text-to-image prompt that would recreate `image` from scratch. Returns
-    the prompt string, or None on any failure."""
+    text-to-image prompt that would recreate `image` from scratch.
+    `think=False` skips the deliberation phase for a faster, shallower
+    description. Returns the prompt string, or None on any failure."""
     ask = (
         "Write a detailed text-to-image generation prompt that would recreate "
         "this photograph from scratch. Describe the subject and their exact "
@@ -330,14 +344,14 @@ def vlm_describe(model, image, ollama_url="http://127.0.0.1:11434"):
         "model": model,
         "messages": [{"role": "user", "content": ask, "images": [img_b64(image)]}],
         "stream": False,
-        "think": True,
+        "think": bool(think),
         "format": DESCRIBE_SCHEMA,
         "keep_alive": "15m",
         "options": {"temperature": 0.4, "num_ctx": 8192},
     }
     try:
         text = _chat_text(ollama_url, payload)
-        prompt = (json.loads(text).get("prompt") or "").strip()
+        prompt = _prompt_from_reply(text)
         if prompt:
             return prompt
         print(f"  (VLM describe reply missing prompt: {text[:200]})")
@@ -467,14 +481,7 @@ def vlm_boost(model, prompt, family="flux2", model_desc="", level=3,
     }
     try:
         text = _chat_text(ollama_url, payload)
-        # With think disabled, qwen3.6 ignores the format schema and
-        # returns the rewrite as plain text — accept both shapes.
-        try:
-            parsed = json.loads(text)
-            boosted = (parsed.get("prompt") or "").strip() \
-                if isinstance(parsed, dict) else str(parsed).strip()
-        except json.JSONDecodeError:
-            boosted = text.strip()
+        boosted = _prompt_from_reply(text)
         if boosted:
             return boosted
         print(f"  (VLM boost reply missing prompt: {text[:200]})")

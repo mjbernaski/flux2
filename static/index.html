@@ -101,7 +101,13 @@
                     so the side-by-side layout doesn't appear in the result.
                 </div>
                 <div class="describe-control" id="describeControl" style="display: none; margin-top: 10px;">
-                    <button type="button" id="describeBtn" class="describe-btn">&#8646; Reverse: photo &rarr; prompt &rarr; new image</button>
+                    <div class="describe-row">
+                        <button type="button" id="describeBtn" class="describe-btn">&#8646; Reverse: photo &rarr; prompt &rarr; new image</button>
+                        <label class="boost-think" for="describeThink"
+                               title="On: the vision model deliberates before writing the prompt — better results, slower. Off: faster, shallower description.">
+                            <input type="checkbox" id="describeThink" checked> think
+                        </label>
+                    </div>
                     <div class="strength-hint">
                         The local vision model writes a detailed prompt from the first
                         reference; it lands in the prompt box and a fresh image is
