@@ -619,13 +619,38 @@ function syncRefUI() {
     if (typeof refreshInpaintAvailability === 'function') refreshInpaintAvailability();
 }
 
+// FLUX conditions on ≤~2MP inputs, so anything bigger is wasted upload; raw
+// phone photos (base64, ×3 refs) were blowing past the server's 64MB body cap.
+var MAX_UPLOAD_EDGE = 2048;
+var UPLOAD_JPEG_QUALITY = 0.92;
+
+function shrinkImageDataUrl(dataUrl, cb) {
+    var img = new Image();
+    img.onload = function() {
+        var w = img.naturalWidth, h = img.naturalHeight;
+        var scale = Math.min(1, MAX_UPLOAD_EDGE / Math.max(w, h));
+        if (scale === 1 && dataUrl.length < 4 * 1024 * 1024) { cb(dataUrl); return; }
+        var canvas = document.createElement('canvas');
+        canvas.width = Math.max(1, Math.round(w * scale));
+        canvas.height = Math.max(1, Math.round(h * scale));
+        canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+        cb(canvas.toDataURL('image/jpeg', UPLOAD_JPEG_QUALITY));
+    };
+    // Formats the browser can't decode (e.g. HEIC outside Safari) pass
+    // through unshrunk; the server's PIL decode is the real gate.
+    img.onerror = function() { cb(dataUrl); };
+    img.src = dataUrl;
+}
+
 function handleImageFile(file) {
     if (currentInputImages.length >= MAX_REFERENCE_IMAGES) return;
     var reader = new FileReader();
     reader.onload = function(e) {
-        if (currentInputImages.length >= MAX_REFERENCE_IMAGES) return;
-        currentInputImages.push(e.target.result);
-        syncRefUI();
+        shrinkImageDataUrl(e.target.result, function(shrunk) {
+            if (currentInputImages.length >= MAX_REFERENCE_IMAGES) return;
+            currentInputImages.push(shrunk);
+            syncRefUI();
+        });
     };
     reader.readAsDataURL(file);
 }
