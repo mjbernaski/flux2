@@ -164,6 +164,11 @@ ensure_ollama() {
 SWITCH_EXIT_CODE=86
 SWITCH_CONFIG_FILE=".next_config"
 
+# Every (re)launch records its config number here, so `./run_server.sh last`
+# — used by the flux-server systemd unit at boot — resumes whatever model
+# was running before the reboot, including UI model switches.
+LAST_CONFIG_FILE=".last_config"
+
 # Start server with selected configuration (with auto-restart on failure)
 start_server() {
     local config=$1
@@ -222,6 +227,7 @@ start_server() {
         # immediately (block-buffering through the tee pipe delays them by KBs).
         # FLUX_CONFIG tells the server which menu entry it is, enabling the
         # UI's on-the-fly model switcher (/configs + /switch-model).
+        echo "$config" > "$LAST_CONFIG_FILE"
         FLUX_CONFIG=$config python -u web_server.py $args "$@" 2>&1 | tee -a "$log_file"
         exit_code=${PIPESTATUS[0]}
 
@@ -297,6 +303,19 @@ start_server() {
 
 # Main loop
 main() {
+    # `last` → resume the most recently run config (falling back to 9/klein).
+    # This is what the flux-server systemd unit passes at boot.
+    if [ "$1" = "last" ]; then
+        local last_config
+        last_config=$(cat "$LAST_CONFIG_FILE" 2>/dev/null)
+        if ! [[ "$last_config" =~ ^([1-9]|1[0-3])$ ]]; then
+            last_config=9
+        fi
+        shift
+        start_server "$last_config" "$@"
+        exit $?
+    fi
+
     # Check if a number was passed as argument
     if [ -n "$1" ] && [[ "$1" =~ ^([1-9]|1[0-3])$ ]]; then
         start_server "$@"

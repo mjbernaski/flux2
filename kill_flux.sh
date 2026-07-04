@@ -16,6 +16,17 @@ log() {
 
 killed=0
 
+# If the server is managed by the flux-server systemd user unit (boot
+# resilience), stop it through systemd first — killing the processes
+# directly would just make systemd restart them.
+if command -v systemctl >/dev/null 2>&1 \
+   && systemctl --user is-active --quiet flux-server 2>/dev/null; then
+    echo "Stopping flux-server systemd unit..."
+    systemctl --user stop flux-server
+    log "systemd unit stopped — it will not restart until 'systemctl --user start flux-server' or reboot"
+    killed=1
+fi
+
 # Kill the supervisor process via server.pid
 log "Checking for server.pid file..."
 if [ -f server.pid ]; then
