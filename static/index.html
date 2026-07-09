@@ -93,6 +93,10 @@
                         </div>
                     </div>
                 </div>
+                <div class="url-import-row" id="urlImportRow">
+                    <input type="url" id="imageUrlInput" placeholder="…or paste an image URL (https://…)" autocomplete="off">
+                    <button type="button" id="addUrlBtn">Add</button>
+                </div>
                 <div class="multi-ref-hint" id="multiRefHint" style="display: none;">
                     Multiple references: FLUX.2 uses each image directly. The Kontext
                     editor stitches them side-by-side — write the instruction using
@@ -253,6 +257,10 @@
                 <label class="checkbox-label">
                     <input type="checkbox" id="showPreview" checked>
                     Show live preview (slower — decodes each step)
+                </label>
+                <label class="checkbox-label" id="savePreviewsLabel" style="margin-top: 6px;">
+                    <input type="checkbox" id="savePreviews">
+                    Save each preview frame (kept in web-generated/steps/)
                 </label>
             </div>
         </div>

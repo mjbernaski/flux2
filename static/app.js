@@ -114,6 +114,7 @@ function saveSwitchState() {
         spectrumGrid: chk('spectrumGrid'),
         spectrumSameSeed: chk('spectrumSameSeed'),
         showPreview: chk('showPreview'),
+        savePreviews: chk('savePreviews'),
         strength: strengthSlider ? strengthSlider.value : null,
         aspectMode: aspectModeEl ? aspectModeEl.value : null,
         cells: Array.from(selectedCells),
@@ -602,6 +603,8 @@ function syncRefUI() {
     }
     const n = currentInputImages.length;
     if (uploadArea) uploadArea.style.display = n >= MAX_REFERENCE_IMAGES ? 'none' : 'block';
+    const urlImportRow = document.getElementById('urlImportRow');
+    if (urlImportRow) urlImportRow.style.display = n >= MAX_REFERENCE_IMAGES ? 'none' : 'flex';
     if (uploadPlaceholder) {
         const span = uploadPlaceholder.querySelector('span');
         if (span) span.textContent = n === 0
@@ -666,6 +669,33 @@ function handleRawFile(file) {
             });
         })
         .catch(function(err) { alert('RAW conversion failed: ' + err.message); })
+        .then(function() { syncRefUI(); }); // also restores the placeholder label
+}
+
+// Import a reference straight from a web URL. The server fetches it
+// (/fetch-image-url) so browser CORS restrictions don't apply, and returns a
+// JPEG data URL that then behaves like any uploaded reference.
+function addImageUrl(url) {
+    url = (url || '').trim();
+    if (!url) return;
+    if (currentInputImages.length >= MAX_REFERENCE_IMAGES) return;
+    if (!/^https?:\/\//i.test(url)) { alert('Enter an http(s) image URL.'); return; }
+    var span = uploadPlaceholder ? uploadPlaceholder.querySelector('span') : null;
+    if (span) span.textContent = 'Fetching image from URL…';
+    fetch('/fetch-image-url', {
+        method: 'POST',
+        headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ url: url })
+    })
+        .then(function(res) {
+            return res.json().catch(function() { return {}; }).then(function(data) {
+                if (!res.ok || !data.success) throw new Error(data.error || ('HTTP ' + res.status));
+                if (currentInputImages.length < MAX_REFERENCE_IMAGES) currentInputImages.push(data.image);
+                var input = document.getElementById('imageUrlInput');
+                if (input) input.value = '';
+            });
+        })
+        .catch(function(err) { alert('Could not fetch image URL: ' + err.message); })
         .then(function() { syncRefUI(); }); // also restores the placeholder label
 }
 
@@ -790,10 +820,36 @@ if (uploadArea) {
     uploadArea.addEventListener('drop', function(e) {
         e.preventDefault();
         uploadArea.classList.remove('dragover');
-        addImageFiles(e.dataTransfer.files);
+        if (e.dataTransfer.files && e.dataTransfer.files.length) {
+            addImageFiles(e.dataTransfer.files);
+            return;
+        }
+        // An image dragged from another browser tab arrives as a URL, not a file.
+        var uri = e.dataTransfer.getData('text/uri-list') || e.dataTransfer.getData('text/plain');
+        if (uri) addImageUrl(uri.split('\n')[0]);
     });
 }
 if (inputImage) inputImage.addEventListener('change', function(e) { addImageFiles(e.target.files); });
+
+const imageUrlInput = document.getElementById('imageUrlInput');
+const addUrlBtn = document.getElementById('addUrlBtn');
+if (addUrlBtn) addUrlBtn.addEventListener('click', function() { addImageUrl(imageUrlInput ? imageUrlInput.value : ''); });
+if (imageUrlInput) imageUrlInput.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') { e.preventDefault(); addImageUrl(imageUrlInput.value); }
+});
+
+// The save-each-frame toggle only means something while live previews are on
+// (the saved frames ARE the preview decodes), so hide it otherwise.
+function syncSavePreviewsVisibility() {
+    var show = document.getElementById('showPreview');
+    var label = document.getElementById('savePreviewsLabel');
+    if (label) label.style.display = (show && show.checked) ? '' : 'none';
+}
+(function() {
+    var show = document.getElementById('showPreview');
+    if (show) show.addEventListener('change', syncSavePreviewsVisibility);
+    syncSavePreviewsVisibility();
+})();
 
 // ---- Inpainting brush (FLUX.2 only) ----
 const inpaintControl = document.getElementById('inpaintControl');
@@ -1001,6 +1057,8 @@ if (resetBtn) resetBtn.addEventListener('click', async function() {
     var sg = document.getElementById('spectrumGrid'); if (sg) sg.checked = false;
     var sss = document.getElementById('spectrumSameSeed'); if (sss) sss.checked = false;
     var spv = document.getElementById('showPreview'); if (spv) spv.checked = true;
+    var svp = document.getElementById('savePreviews'); if (svp) svp.checked = false;
+    if (typeof syncSavePreviewsVisibility === 'function') syncSavePreviewsVisibility();
     if (gridContainer) gridContainer.style.display = 'none';
     selectedCells.clear();
     if (gridSelector) {
@@ -1260,9 +1318,12 @@ function renderRecentDone(recent) {
     if (latest.id !== lastCompletedJobId) {
         lastCompletedJobId = latest.id;
         if (latest.state === 'done') {
-            const info = latest.composite
+            let info = latest.composite
                 ? `Generated ${(latest.images || []).length} images + 1 composite in ${(latest.generation_time || 0).toFixed(1)}s`
                 : `Generated ${(latest.images || []).length} image(s) in ${(latest.generation_time || 0).toFixed(1)}s`;
+            if (latest.saved_previews) {
+                info += ` — ${latest.saved_previews} preview frames saved to web-generated/steps/`;
+            }
             generationInfo.textContent = info;
             loadHistory();
         } else if (latest.state === 'failed') {
@@ -1406,6 +1467,8 @@ async function doGenerate() {
     const spectrumSameSeed = spectrumSameSeedEl ? spectrumSameSeedEl.checked : true;
     const showPreviewEl = document.getElementById('showPreview');
     const showPreview = showPreviewEl ? showPreviewEl.checked : false;
+    const savePreviewsEl = document.getElementById('savePreviews');
+    const savePreviews = showPreview && (savePreviewsEl ? savePreviewsEl.checked : false);
     const allOrientationsEl = document.getElementById('allOrientations');
     const allOrientations = allOrientationsEl ? allOrientationsEl.checked : false;
 
@@ -1423,6 +1486,7 @@ async function doGenerate() {
         spectrum_grid: spectrumGrid,
         spectrum_same_seed: spectrumSameSeed,
         show_preview: showPreview,
+        save_previews: savePreviews,
         selected_cells: Array.from(selectedCells)
     };
     if (currentInputImages.length > 0) {
@@ -2074,6 +2138,8 @@ if (loopAcceptBtn) loopAcceptBtn.addEventListener('click', function() {
     setChk('spectrumGrid', saved.spectrumGrid);
     setChk('spectrumSameSeed', saved.spectrumSameSeed);
     setChk('showPreview', saved.showPreview);
+    setChk('savePreviews', saved.savePreviews);
+    if (typeof syncSavePreviewsVisibility === 'function') syncSavePreviewsVisibility();
     if (strengthSlider && saved.strength !== null && saved.strength !== undefined) {
         strengthSlider.value = saved.strength;
         if (strengthValue) strengthValue.textContent = saved.strength;

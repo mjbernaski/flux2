@@ -380,6 +380,38 @@ button:disabled {
     font-size: 12px;
     font-weight: bold;
 }
+.url-import-row {
+    flex-basis: 100%;
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+}
+.url-import-row input {
+    flex: 1;
+    min-width: 0;
+    padding: 8px 10px;
+    background: #0a0a15;
+    border: 1px solid #333;
+    border-radius: 6px;
+    color: #eee;
+    font-size: 13px;
+}
+.url-import-row input:focus {
+    outline: none;
+    border-color: #00d4ff;
+}
+.url-import-row button {
+    padding: 8px 16px;
+    background: transparent;
+    border: 1px solid #00d4ff;
+    border-radius: 6px;
+    color: #00d4ff;
+    cursor: pointer;
+    font-size: 13px;
+}
+.url-import-row button:hover {
+    background: rgba(0, 212, 255, 0.15);
+}
 .multi-ref-hint {
     flex-basis: 100%;
     font-size: 12px;

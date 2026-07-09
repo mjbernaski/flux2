@@ -234,6 +234,7 @@ class Job:
     preview: Optional[str] = None
     preview_step: int = 0
     preview_ts: int = 0
+    saved_previews: int = 0  # preview frames written to steps/ (save_previews on)
     step_times: list = field(default_factory=list)  # per-step durations (s) of the current image
     generation_time: float = 0.0
 
@@ -276,6 +277,7 @@ class Job:
             'preview': self.preview,
             'preview_step': self.preview_step,
             'preview_ts': self.preview_ts,
+            'saved_previews': self.saved_previews,
             'step_times': list(self.step_times),
             'generation_time': self.generation_time,
             'error': self.error,
@@ -418,6 +420,12 @@ def _run_job(job: Job):
                   f"in {time.perf_counter() - t_enc:.2f}s", flush=True)
 
     show_preview = bool(data.get('show_preview', False))
+    # Keep every preview frame as its own file under steps/ (a subdir, so the
+    # frames stay out of gallery listings, archiving, and delete-today, which
+    # only iterate top-level files). Requires show_preview: the frames ARE the
+    # preview decodes.
+    save_previews = show_preview and bool(data.get('save_previews', False))
+    steps_dir = os.path.join(OUTPUT_DIR, 'steps')
     preview_state = {"last_decode": 0.0}
 
     def _check_cancel():
@@ -443,7 +451,9 @@ def _run_job(job: Job):
         if show_preview:
             now = time.perf_counter()
             is_final = (step_index + 1) >= job.total_steps
-            if is_final or (now - preview_state["last_decode"]) >= PREVIEW_MIN_INTERVAL_S:
+            # save_previews bypasses the decode throttle: "each frame" means
+            # every step, not just the ones the 0.75s interval lets through.
+            if is_final or save_previews or (now - preview_state["last_decode"]) >= PREVIEW_MIN_INTERVAL_S:
                 latents = callback_kwargs.get("latents")
                 preview_img = flux_core.decode_latents_to_preview(
                     pipe_obj, latents, height, width
@@ -457,6 +467,14 @@ def _run_job(job: Job):
                         preview_state["last_decode"] = now
                     except Exception as e:
                         print(f"[preview] save failed: {e}", flush=True)
+                    if save_previews:
+                        try:
+                            os.makedirs(steps_dir, exist_ok=True)
+                            frame = f"{job.id}_img{max(job.current, 1):02d}_step{step_index + 1:03d}.png"
+                            preview_img.save(os.path.join(steps_dir, frame))
+                            job.saved_previews += 1
+                        except Exception as e:
+                            print(f"[preview] frame save failed: {e}", flush=True)
         return callback_kwargs
 
     start_time = time.perf_counter()
@@ -805,7 +823,9 @@ def generate():
     return jsonify({'success': True, 'job_id': job.id, 'position': position})
 
 
-@app.route('/images/<filename>')
+# <path:> so saved preview frames under steps/ are reachable too;
+# send_from_directory rejects anything escaping OUTPUT_DIR.
+@app.route('/images/<path:filename>')
 def serve_image(filename):
     return send_from_directory(OUTPUT_DIR, filename)
 
@@ -1195,6 +1215,66 @@ def convert_raw():
         # from the client-side error alone.
         print(f"convert-raw failed: {f.filename!r}, {len(data)} bytes, header {data[:12].hex()}: {e}")
         return jsonify({'success': False, 'error': f'could not decode RAW file ({len(data)} bytes, header {data[:12].hex()}): {e}'}), 400
+    image.thumbnail((MAX_RAW_EDGE, MAX_RAW_EDGE), Image.LANCZOS)
+    buf = io.BytesIO()
+    image.save(buf, format='JPEG', quality=92)
+    b64 = base64.b64encode(buf.getvalue()).decode('ascii')
+    return jsonify({'success': True,
+                    'image': 'data:image/jpeg;base64,' + b64,
+                    'width': image.width, 'height': image.height})
+
+
+# Cap on a fetched remote image, mirroring the request body cap so a URL
+# can't pull in more than an upload could.
+MAX_URL_FETCH_BYTES = 64 * 1024 * 1024
+
+
+@app.route('/fetch-image-url', methods=['POST'])
+def fetch_image_url():
+    """Fetch an image from a remote http(s) URL server-side (no browser CORS
+    restrictions) and return it as a JPEG data URL for use as a reference
+    image. JSON body: {"url": "https://..."}. Response shape matches
+    /convert-raw."""
+    import requests
+    payload = request.get_json(silent=True) or {}
+    url = (payload.get('url') or '').strip()
+    if not url.lower().startswith(('http://', 'https://')):
+        return jsonify({'success': False, 'error': 'url must start with http:// or https://'}), 400
+    # Browser-like header set: Wikimedia (and similar CDNs) 429 requests that
+    # carry a browser User-Agent without the matching Accept/Accept-Language
+    # headers, so the UA alone is not enough.
+    browser_headers = {
+        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0',
+        'Accept': 'image/avif,image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Sec-Fetch-Dest': 'image',
+        'Sec-Fetch-Mode': 'no-cors',
+        'Sec-Fetch-Site': 'cross-site',
+    }
+    try:
+        resp = requests.get(url, timeout=30, stream=True, allow_redirects=True,
+                            headers=browser_headers)
+        resp.raise_for_status()
+        chunks, total = [], 0
+        for chunk in resp.iter_content(1024 * 1024):
+            total += len(chunk)
+            if total > MAX_URL_FETCH_BYTES:
+                return jsonify({'success': False, 'error': f'image exceeds the {MAX_URL_FETCH_BYTES // (1024 * 1024)}MB fetch limit'}), 400
+            chunks.append(chunk)
+        data = b''.join(chunks)
+    except requests.RequestException as e:
+        return jsonify({'success': False, 'error': f'could not fetch URL: {e}'}), 400
+    if not data:
+        return jsonify({'success': False, 'error': 'URL returned an empty response'}), 400
+    try:
+        image = Image.open(io.BytesIO(data)).convert('RGB')
+    except Exception:
+        try:
+            # A URL can point at a camera RAW file too; reuse the RAW pipeline.
+            image = _raw_to_pil(data).convert('RGB')
+        except Exception:
+            print(f"fetch-image-url failed: {url!r}, {len(data)} bytes, header {data[:12].hex()}")
+            return jsonify({'success': False, 'error': f'URL did not return a decodable image ({len(data)} bytes, header {data[:12].hex()})'}), 400
     image.thumbnail((MAX_RAW_EDGE, MAX_RAW_EDGE), Image.LANCZOS)
     buf = io.BytesIO()
     image.save(buf, format='JPEG', quality=92)
