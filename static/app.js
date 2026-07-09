@@ -1535,6 +1535,7 @@ async function doGenerate() {
         save_previews: savePreviews,
         selected_cells: Array.from(selectedCells)
     };
+    recordPromptHistory(baseFormData.prompt);
     if (currentInputImages.length > 0) {
         baseFormData.input_images = currentInputImages.slice(0, MAX_REFERENCE_IMAGES);
         // Legacy single-image field too, so this UI still works against an
@@ -1668,6 +1669,90 @@ schedulePoll(1500);
 
 if (submitBtn) submitBtn.addEventListener('click', function(e) { e.preventDefault(); doGenerate(); });
 if (form) form.addEventListener('submit', function(e) { e.preventDefault(); doGenerate(); });
+
+// ---- Prompt history (◀ ▶ above the prompt box) ----
+// Shell-style: each submitted prompt appends to a localStorage-backed list.
+// ◀ walks back through prior prompts; ▶ returns toward the in-progress
+// draft, which is stashed when navigation leaves it. Editing while on a
+// history entry forks that text into a new draft (replacing any stashed
+// one); the history entry itself is untouched.
+const PROMPT_HISTORY_KEY = 'flux_prompt_history';
+const PROMPT_HISTORY_MAX = 100;
+let promptHistory = [];
+try { promptHistory = JSON.parse(localStorage.getItem(PROMPT_HISTORY_KEY) || '[]') || []; } catch (e) {}
+let promptHistoryIdx = promptHistory.length;  // == length means "at the draft"
+let promptDraft = '';
+
+function syncPromptNav() {
+    const prev = document.getElementById('promptPrevBtn');
+    const next = document.getElementById('promptNextBtn');
+    const pos = document.getElementById('promptHistoryPos');
+    if (prev) prev.disabled = promptHistoryIdx <= 0;
+    if (next) next.disabled = promptHistoryIdx >= promptHistory.length;
+    if (pos) pos.textContent = promptHistoryIdx < promptHistory.length
+        ? (promptHistoryIdx + 1) + '/' + promptHistory.length : '';
+    const clear = document.getElementById('promptClearBtn');
+    const ta = document.getElementById('prompt');
+    if (clear) clear.disabled = !ta || ta.value.length === 0;
+}
+
+function promptHistoryGo(delta) {
+    const ta = document.getElementById('prompt');
+    if (!ta) return;
+    const target = promptHistoryIdx + delta;
+    if (target < 0 || target > promptHistory.length) return;
+    if (promptHistoryIdx === promptHistory.length) promptDraft = ta.value;
+    promptHistoryIdx = target;
+    ta.value = promptHistoryIdx === promptHistory.length ? promptDraft : promptHistory[promptHistoryIdx];
+    syncPromptNav();
+}
+
+function recordPromptHistory(text) {
+    text = (text || '').trim();
+    if (!text) return;
+    if (promptHistory[promptHistory.length - 1] !== text) {
+        promptHistory.push(text);
+        if (promptHistory.length > PROMPT_HISTORY_MAX) promptHistory = promptHistory.slice(-PROMPT_HISTORY_MAX);
+        try { localStorage.setItem(PROMPT_HISTORY_KEY, JSON.stringify(promptHistory)); } catch (e) {}
+    }
+    promptHistoryIdx = promptHistory.length;
+    promptDraft = '';
+    syncPromptNav();
+}
+
+(function() {
+    const prev = document.getElementById('promptPrevBtn');
+    const next = document.getElementById('promptNextBtn');
+    const ta = document.getElementById('prompt');
+    const clear = document.getElementById('promptClearBtn');
+    if (prev) prev.addEventListener('click', function() { promptHistoryGo(-1); });
+    if (next) next.addEventListener('click', function() { promptHistoryGo(1); });
+    // Clear just the prompt (not the whole form like Reset): empty the box,
+    // drop back to an empty draft, and let the 'input' event refresh autogrow.
+    if (clear) clear.addEventListener('click', function() {
+        if (!ta) return;
+        promptDraft = '';
+        promptHistoryIdx = promptHistory.length;
+        ta.value = '';
+        ta.dispatchEvent(new Event('input'));
+        // Also clear the negative prompt (SDXL) so Clear resets both boxes.
+        const neg = document.getElementById('negativePrompt');
+        if (neg) { neg.value = ''; neg.dispatchEvent(new Event('input')); }
+        syncPromptNav();
+        ta.focus();
+    });
+    // Typing while viewing a history entry forks it into the draft slot
+    // (programmatic .value writes don't fire 'input', so navigation and
+    // Boost rewrites don't trip this).
+    if (ta) ta.addEventListener('input', function() {
+        if (promptHistoryIdx < promptHistory.length) {
+            promptHistoryIdx = promptHistory.length;
+            promptDraft = ta.value;
+        }
+        syncPromptNav();
+    });
+    syncPromptNav();
+})();
 // Cmd/Ctrl+Return: start the generation that's available in context — when
 // the edit loop is paused between iterations, that's "Continue" (with the
 // possibly-edited next instruction); otherwise queue a normal generation

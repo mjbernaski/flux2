@@ -56,7 +56,15 @@
 
     <form id="generateForm" action="#">
         <div class="form-group">
-            <label for="prompt">Prompt</label>
+            <div class="prompt-label-row">
+                <label for="prompt">Prompt</label>
+                <div class="prompt-history-nav">
+                    <button type="button" id="promptPrevBtn" title="Previous prompt">&#9664;</button>
+                    <span id="promptHistoryPos"></span>
+                    <button type="button" id="promptNextBtn" title="Next prompt (forward to your draft)">&#9654;</button>
+                    <button type="button" id="promptClearBtn" class="prompt-clear-btn" title="Clear the prompt">Clear</button>
+                </div>
+            </div>
             <textarea id="prompt" name="prompt" rows="5" placeholder="A majestic mountain landscape at sunset..." required></textarea>
             <div class="boost-control">
                 <button type="button" id="boostBtn" class="describe-btn boost-btn"

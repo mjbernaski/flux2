@@ -36,6 +36,41 @@ h1 { color: #00d4ff; margin-bottom: 5px; }
 .subtitle { color: #888; margin-bottom: 20px; }
 .form-group { margin-bottom: 15px; }
 label { display: block; margin-bottom: 5px; color: #aaa; }
+.prompt-label-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+.prompt-label-row label { margin-bottom: 5px; }
+.prompt-history-nav {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.prompt-history-nav button {
+    padding: 2px 10px;
+    background: transparent;
+    border: 1px solid #333;
+    border-radius: 4px;
+    color: #00d4ff;
+    cursor: pointer;
+    font-size: 11px;
+    line-height: 1.5;
+}
+.prompt-history-nav button:disabled {
+    color: #444;
+    border-color: #222;
+    cursor: default;
+}
+.prompt-history-nav button:not(:disabled):hover { border-color: #00d4ff; }
+.prompt-history-nav button.prompt-clear-btn { color: #888; margin-left: 4px; }
+.prompt-history-nav button.prompt-clear-btn:not(:disabled):hover { color: #ff6b6b; border-color: #ff6b6b; }
+#promptHistoryPos {
+    min-width: 38px;
+    text-align: center;
+    font-size: 11px;
+    color: #888;
+}
 input[type="text"], select, textarea {
     width: 100%;
     padding: 12px;
