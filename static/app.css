@@ -412,6 +412,21 @@ button:disabled {
 .url-import-row button:hover {
     background: rgba(0, 212, 255, 0.15);
 }
+.step-frames-link {
+    color: #00d4ff;
+}
+.step-frames {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 8px;
+}
+.step-frames img {
+    width: 96px;
+    border: 1px solid #333;
+    border-radius: 4px;
+    display: block;
+}
 .multi-ref-hint {
     flex-basis: 100%;
     font-size: 12px;

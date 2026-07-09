@@ -823,6 +823,20 @@ def generate():
     return jsonify({'success': True, 'job_id': job.id, 'position': position})
 
 
+@app.route('/steps/<job_id>')
+def list_step_frames(job_id):
+    """List a job's saved preview frames (the save_previews toggle), in
+    image/step order, as paths servable via /images/."""
+    if not job_id.isalnum():
+        return jsonify({'success': False, 'error': 'invalid job id'}), 400
+    try:
+        names = sorted(f for f in os.listdir(os.path.join(OUTPUT_DIR, 'steps'))
+                       if f.startswith(job_id + '_') and f.endswith('.png'))
+    except FileNotFoundError:
+        names = []
+    return jsonify({'success': True, 'frames': ['steps/' + n for n in names]})
+
+
 # <path:> so saved preview frames under steps/ are reachable too;
 # send_from_directory rejects anything escaping OUTPUT_DIR.
 @app.route('/images/<path:filename>')

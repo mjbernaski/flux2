@@ -1077,6 +1077,7 @@ if (resetBtn) resetBtn.addEventListener('click', async function() {
     if (imageGrid) imageGrid.innerHTML = '';
     resultLbItems.length = 0;
     if (generationInfo) generationInfo.textContent = '';
+    if (stepFrames) { stepFrames.style.display = 'none'; stepFrames.innerHTML = ''; }
     if (result) result.className = 'result';
     if (status) {
         status.className = 'status';
@@ -1097,6 +1098,7 @@ if (clearRecentBtn) clearRecentBtn.addEventListener('click', async function() {
     if (imageGrid) imageGrid.innerHTML = '';
     resultLbItems.length = 0;
     if (generationInfo) generationInfo.textContent = '';
+    if (stepFrames) { stepFrames.style.display = 'none'; stepFrames.innerHTML = ''; }
     if (result) result.className = 'result';
     if (knownImageFilenames) knownImageFilenames.clear();
     seenDoneJobIds.clear();
@@ -1289,6 +1291,49 @@ function renderRunning(running) {
     }
 }
 
+// "view frames" link on the completion line: lazily lists a job's saved
+// intermediate frames (/steps/<id>) and toggles a filmstrip of thumbnails,
+// each opening the full frame in a new tab.
+const stepFrames = document.getElementById('stepFrames');
+function attachStepFramesLink(job) {
+    if (!stepFrames) return;
+    stepFrames.style.display = 'none';
+    stepFrames.innerHTML = '';
+    if (!job.saved_previews || !generationInfo) return;
+    const link = document.createElement('a');
+    link.href = '#';
+    link.className = 'step-frames-link';
+    link.textContent = 'view frames';
+    link.addEventListener('click', function(e) {
+        e.preventDefault();
+        if (stepFrames.style.display !== 'none') {
+            stepFrames.style.display = 'none';
+            return;
+        }
+        if (stepFrames.children.length) { stepFrames.style.display = 'flex'; return; }
+        fetch('/steps/' + job.id, { headers: getAuthHeaders() })
+            .then(function(r) { return r.json(); })
+            .then(function(d) {
+                if (!d.success) throw new Error(d.error || 'listing failed');
+                (d.frames || []).forEach(function(p) {
+                    const a = document.createElement('a');
+                    a.href = '/images/' + p;
+                    a.target = '_blank';
+                    const im = document.createElement('img');
+                    im.src = '/images/' + p;
+                    im.loading = 'lazy';
+                    im.title = p.split('/').pop();
+                    a.appendChild(im);
+                    stepFrames.appendChild(a);
+                });
+                stepFrames.style.display = 'flex';
+            })
+            .catch(function(err) { alert('Could not load frames: ' + err.message); });
+    });
+    generationInfo.appendChild(document.createTextNode(' '));
+    generationInfo.appendChild(link);
+}
+
 function renderRecentDone(recent) {
     if (!recent || recent.length === 0) return;
     const latest = recent[0];
@@ -1322,9 +1367,10 @@ function renderRecentDone(recent) {
                 ? `Generated ${(latest.images || []).length} images + 1 composite in ${(latest.generation_time || 0).toFixed(1)}s`
                 : `Generated ${(latest.images || []).length} image(s) in ${(latest.generation_time || 0).toFixed(1)}s`;
             if (latest.saved_previews) {
-                info += ` — ${latest.saved_previews} preview frames saved to web-generated/steps/`;
+                info += ` — ${latest.saved_previews} preview frames saved`;
             }
             generationInfo.textContent = info;
+            attachStepFramesLink(latest);
             loadHistory();
         } else if (latest.state === 'failed') {
             status.className = 'status error';
