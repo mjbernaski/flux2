@@ -1322,11 +1322,12 @@ def _boost_family(has_image=False):
     return 'flux1-img2img' if has_image else 'flux1'
 
 
-def _run_boost(cid, model, prompt, family, model_desc, level, think):
+def _run_boost(cid, model, prompt, family, model_desc, level, think, variant=None):
     from edit_loop import vlm_boost
     try:
         boosted = vlm_boost(model, prompt, family=family, model_desc=model_desc,
-                            level=level, think=think, ollama_url=OLLAMA_URL)
+                            level=level, think=think, variant=variant,
+                            ollama_url=OLLAMA_URL)
         if boosted:
             payload = {'success': True, 'prompt': boosted}
         else:
@@ -1346,8 +1347,11 @@ def boost():
     references are attached), via the local ollama model. `level` 1-5 sets
     how far the rewrite may depart from the draft (1 = polish wording only,
     5 = reimagine boldly); `think` (default true) toggles the VLM's
-    thinking phase — off is faster but shallower. Returns a boost_id
-    immediately; poll GET /boost/<id> for the improved prompt."""
+    thinking phase — off is faster but shallower. Optional `variant_index` +
+    `variant_count` mark this as one of N independent rewrites of the same
+    draft (the evolve feature): the VLM is pushed toward a direction the
+    other rewrites are unlikely to take. Returns a boost_id immediately;
+    poll GET /boost/<id> for the improved prompt."""
     data = request.json or {}
     prompt = (data.get('prompt') or '').strip()
     if not prompt:
@@ -1358,11 +1362,23 @@ def boost():
         return jsonify({'success': False, 'error': 'level must be an integer 1-5'}), 400
     if not 1 <= level <= 5:
         return jsonify({'success': False, 'error': 'level must be an integer 1-5'}), 400
+    variant = None
+    if data.get('variant_count') is not None:
+        try:
+            v_idx = int(data.get('variant_index', 0))
+            v_cnt = int(data['variant_count'])
+        except (TypeError, ValueError):
+            return jsonify({'success': False,
+                            'error': 'variant_index/variant_count must be integers'}), 400
+        if not 1 <= v_idx <= v_cnt:
+            return jsonify({'success': False,
+                            'error': 'variant_index must be between 1 and variant_count'}), 400
+        variant = (v_idx, v_cnt)
     has_image = bool(data.get('has_image'))
     think = bool(data.get('think', True))
     model = data.get('model') or CRITIQUE_MODEL
     cid = _vlm_job_start(_run_boost, model, prompt, _boost_family(has_image),
-                         _model_type_string(), level, think)
+                         _model_type_string(), level, think, variant)
     return jsonify({'success': True, 'boost_id': cid})
 
 

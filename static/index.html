@@ -81,6 +81,18 @@
                     <input type="checkbox" id="boostThink" checked> think
                 </label>
             </div>
+            <div class="boost-control evolve-control">
+                <button type="button" id="evolveBtn" class="describe-btn boost-btn"
+                        title="Evolves your prompt into N independent variations (each boosted separately with the settings above, nudged in different directions) and queues one generation per variation">&#129516; Evolve &amp; generate</button>
+                <select id="evolveCount" title="How many separately evolved variations to generate">
+                    <option value="2">2 variations</option>
+                    <option value="3">3 variations</option>
+                    <option value="4" selected>4 variations</option>
+                    <option value="5">5 variations</option>
+                    <option value="6">6 variations</option>
+                    <option value="8">8 variations</option>
+                </select>
+            </div>
         </div>
 
         <!-- SDXL only (shown when the server reports negative-prompt support) -->

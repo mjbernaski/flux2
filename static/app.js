@@ -110,6 +110,7 @@ function saveSwitchState() {
         seed: val('seed'),
         guidance: val('guidance'),
         batch: val('batch'),
+        evolveCount: val('evolveCount'),
         allOrientations: chk('allOrientations'),
         spectrumGrid: chk('spectrumGrid'),
         spectrumSameSeed: chk('spectrumSameSeed'),
@@ -816,6 +817,92 @@ async function runBoost() {
 const boostBtn = document.getElementById('boostBtn');
 if (boostBtn) boostBtn.addEventListener('click', runBoost);
 
+// Evolve & generate: boost the base prompt N times independently (each call
+// told it is variation i of N so the VLM takes divergent directions, using
+// the boost level/think settings above), and queue one generation per evolved
+// prompt as soon as its boost lands. The prompt box keeps the base prompt;
+// the evolved prompts show up on the finished jobs and in .prompt sidecars.
+async function runEvolveGenerate() {
+    const btn = document.getElementById('evolveBtn');
+    const promptEl = document.getElementById('prompt');
+    const levelEl = document.getElementById('boostLevel');
+    const thinkEl = document.getElementById('boostThink');
+    const countEl = document.getElementById('evolveCount');
+    const base = (promptEl.value || '').trim();
+    if (!base) { alert('Type a base prompt to evolve first.'); return; }
+    const n = countEl ? parseInt(countEl.value, 10) : 4;
+
+    const built = buildGenerateFormData();
+    if (!built) return;
+    recordPromptHistory(base);
+
+    const oldLabel = btn.textContent;
+    btn.disabled = true;
+    let evolved = 0, queued = 0, failed = 0;
+    const tick = function() {
+        btn.textContent = `Evolving ${evolved}/${n}…`;
+        if (status && statusText) {
+            status.className = 'status generating';
+            statusText.textContent = `Evolving ${n} prompt variations — `
+                + `${evolved} evolved, ${queued} queued`
+                + (failed ? `, ${failed} failed` : '');
+        }
+    };
+    tick();
+    try {
+        await Promise.all(Array.from({ length: n }, async function(_, i) {
+            try {
+                const res = await fetch('/boost', {
+                    method: 'POST',
+                    headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+                    body: JSON.stringify({
+                        prompt: base,
+                        level: levelEl ? parseInt(levelEl.value, 10) : 3,
+                        think: thinkEl ? thinkEl.checked : true,
+                        has_image: currentInputImages.length > 0,
+                        variant_index: i + 1,
+                        variant_count: n
+                    })
+                });
+                const submitted = await res.json().catch(() => ({}));
+                if (!res.ok || !submitted.success) throw new Error(submitted.error || `HTTP ${res.status}`);
+                const data = await pollVlmJob('/boost/' + submitted.boost_id);
+                if (!data.prompt) throw new Error('boost returned no prompt');
+                evolved += 1; tick();
+                const gres = await fetch('/generate', {
+                    method: 'POST',
+                    headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+                    body: JSON.stringify(Object.assign({}, built.formData, { prompt: data.prompt }))
+                });
+                const gdata = await gres.json().catch(() => ({}));
+                if (!gres.ok || !gdata.success) throw new Error(gdata.error || `HTTP ${gres.status}`);
+                queued += 1; tick();
+                noteActivity();
+                schedulePoll(0);
+            } catch (err) {
+                failed += 1; tick();
+                console.warn(`evolve variation ${i + 1} failed:`, err);
+            }
+        }));
+    } finally {
+        btn.disabled = false;
+        btn.textContent = oldLabel;
+    }
+    if (status && statusText) {
+        if (queued > 0) {
+            status.className = 'status generating';
+            statusText.textContent = `Queued ${queued} evolved variation${queued > 1 ? 's' : ''}`
+                + (failed ? ` (${failed} failed)` : '');
+        } else {
+            status.className = 'status error';
+            statusText.textContent = 'Evolve failed: no variation could be boosted or queued.';
+        }
+    }
+}
+
+const evolveBtn = document.getElementById('evolveBtn');
+if (evolveBtn) evolveBtn.addEventListener('click', runEvolveGenerate);
+
 if (uploadArea) {
     uploadArea.addEventListener('click', function() { if (inputImage) inputImage.click(); });
     uploadArea.addEventListener('dragover', function(e) { e.preventDefault(); uploadArea.classList.add('dragover'); });
@@ -1498,10 +1585,11 @@ function addCompositeToGrid(filename) {
     imageGrid.insertBefore(compositeCard, imageGrid.firstChild);
 }
 
-async function doGenerate() {
-    if (!submitBtn || !status || !statusText || !result || !imageGrid || !generationInfo) return;
-    if (submitBtn.disabled) return;
-
+// Snapshot the whole generation form (including inpaint state) into the JSON
+// body /generate expects. Shared by doGenerate and the evolve path. Returns
+// { formData, inpaintOn }, or null after reporting the error when inpaint is
+// active but no mask has been painted.
+function buildGenerateFormData() {
     const seedEl = document.getElementById('seed');
     const seedValue = seedEl ? seedEl.value.trim() : '';
     const promptEl = document.getElementById('prompt');
@@ -1518,8 +1606,6 @@ async function doGenerate() {
     const showPreview = showPreviewEl ? showPreviewEl.checked : false;
     const savePreviewsEl = document.getElementById('savePreviews');
     const savePreviews = showPreview && (savePreviewsEl ? savePreviewsEl.checked : false);
-    const allOrientationsEl = document.getElementById('allOrientations');
-    const allOrientations = allOrientationsEl ? allOrientationsEl.checked : false;
 
     const negativeEl = document.getElementById('negativePrompt');
     const baseFormData = {
@@ -1538,7 +1624,6 @@ async function doGenerate() {
         save_previews: savePreviews,
         selected_cells: Array.from(selectedCells)
     };
-    recordPromptHistory(baseFormData.prompt);
     if (currentInputImages.length > 0) {
         baseFormData.input_images = currentInputImages.slice(0, MAX_REFERENCE_IMAGES);
         // Legacy single-image field too, so this UI still works against an
@@ -1556,7 +1641,7 @@ async function doGenerate() {
         if (!maskUrl) {
             status.className = 'status error';
             statusText.textContent = 'Inpaint: paint a region to regenerate first.';
-            return;
+            return null;
         }
         baseFormData.input_images = [currentInputImage];
         baseFormData.input_image = currentInputImage;  // legacy-server compat
@@ -1568,7 +1653,21 @@ async function doGenerate() {
         if (window.__fluxVersion === 2) delete baseFormData.strength;
         inpaintOn = true;
     }
+    return { formData: baseFormData, inpaintOn: inpaintOn };
+}
 
+async function doGenerate() {
+    if (!submitBtn || !status || !statusText || !result || !imageGrid || !generationInfo) return;
+    if (submitBtn.disabled) return;
+
+    const built = buildGenerateFormData();
+    if (!built) return;
+    const baseFormData = built.formData;
+    const inpaintOn = built.inpaintOn;
+    recordPromptHistory(baseFormData.prompt);
+
+    const allOrientationsEl = document.getElementById('allOrientations');
+    const allOrientations = allOrientationsEl ? allOrientationsEl.checked : false;
     const orientationsToQueue = (allOrientations && !inpaintOn)
         ? ['square', 'landscape', 'portrait', 'widescreen', 'extra-tall']
         : [baseFormData.orientation];
@@ -2268,6 +2367,7 @@ if (loopAcceptBtn) loopAcceptBtn.addEventListener('click', function() {
     setVal('seed', saved.seed);
     setVal('guidance', saved.guidance);
     setVal('batch', saved.batch);
+    setVal('evolveCount', saved.evolveCount);
     setChk('allOrientations', saved.allOrientations);
     setChk('spectrumGrid', saved.spectrumGrid);
     setChk('spectrumSameSeed', saved.spectrumSameSeed);

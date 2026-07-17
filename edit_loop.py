@@ -469,21 +469,40 @@ BOOST_LEVELS = {
 
 
 def vlm_boost(model, prompt, family="flux2", model_desc="", level=3,
-              think=True, ollama_url="http://127.0.0.1:11434"):
+              think=True, ollama_url="http://127.0.0.1:11434", variant=None):
     """Rewrite the user's draft prompt into a stronger one tuned to the
     prompting idiom of the loaded image model (`family` picks the guidance;
     `model_desc` is the human-readable model name for context; `level` 1-5
     sets how far the rewrite may depart from the draft; `think=False`
     disables the model's thinking phase for a faster, shallower rewrite).
+    `variant=(i, n)` marks this call as one of n independent rewrites of the
+    same draft: the model is told to commit to a direction the other rewrites
+    are unlikely to take, and sampling runs hot enough to actually diverge.
     Text-only chat — no images. Returns the improved prompt string, or
     None on any failure."""
     guidance = BOOST_GUIDANCE.get(family, BOOST_GUIDANCE["flux2"])
     degree, temperature = BOOST_LEVELS.get(level, BOOST_LEVELS[3])
+    variant_line = ""
+    if variant:
+        v_idx, v_cnt = variant
+        variant_line = (
+            f"This is variation {v_idx} of {v_cnt} independent rewrites of "
+            "this same draft, each generated without seeing the others. "
+            "Commit to one distinctive interpretation — an angle of style, "
+            "mood, composition, lighting or setting that the obvious rewrite "
+            f"would not take — so the {v_cnt} variations diverge clearly "
+            "while every one preserves the user's stated subject and "
+            "details.\n"
+        )
+        # Each variation is a separate call; sampling heat is the only thing
+        # that separates them, and the level-1/2 temperatures are too cold.
+        temperature = max(temperature, 0.7)
     ask = (
         "You improve prompts for a local text-to-image system"
         + (f" currently running {model_desc}" if model_desc else "") + ".\n"
         f"{guidance}\n"
         f"The user's draft prompt: {prompt}\n"
+        f"{variant_line}"
         "Rewrite it into a stronger prompt for this model. Preserve the "
         "user's intent and every explicit detail they gave (subjects, "
         "counts, colors, names, any text to render verbatim). "
