@@ -1108,10 +1108,10 @@ def critique_result(cid):
     return _vlm_job_status(cid)
 
 
-def _run_describe(cid, model, image, think):
+def _run_describe(cid, model, images, think):
     from edit_loop import vlm_describe
     try:
-        prompt = vlm_describe(model, image, think=think, ollama_url=OLLAMA_URL)
+        prompt = vlm_describe(model, images, think=think, ollama_url=OLLAMA_URL)
         if prompt:
             payload = {'success': True, 'prompt': prompt}
         else:
@@ -1126,23 +1126,32 @@ def _run_describe(cid, model, image, think):
 def describe():
     """The reverse path: have the local vision model write a detailed
     text-to-image prompt that would recreate the posted photo, for
-    generating a fresh image from that prompt alone. `think` (default true)
-    toggles the VLM's deliberation phase — off is faster but shallower.
-    Returns a describe_id immediately; poll GET /describe/<id> for the
-    prompt."""
+    generating a fresh image from that prompt alone. Accepts `images` (a
+    list, up to MAX_REFERENCE_IMAGES) or legacy single `image`; with several
+    images the prompt is a composite describing one scene that combines
+    them. `think` (default true) toggles the VLM's deliberation phase — off
+    is faster but shallower. Returns a describe_id immediately; poll
+    GET /describe/<id> for the prompt."""
     data = request.json or {}
-    img_b64 = data.get('image') or ''
-    if not img_b64:
+    imgs_b64 = data.get('images') if isinstance(data.get('images'), list) else []
+    if not imgs_b64 and data.get('image'):
+        imgs_b64 = [data['image']]
+    if not imgs_b64:
         return jsonify({'success': False, 'error': 'image is required'}), 400
+    if len(imgs_b64) > MAX_REFERENCE_IMAGES:
+        return jsonify({'success': False,
+                        'error': f'at most {MAX_REFERENCE_IMAGES} images are supported'}), 400
+    images = []
     try:
-        if img_b64.startswith('data:'):
-            img_b64 = img_b64.split(',', 1)[1]
-        image = Image.open(io.BytesIO(base64.b64decode(img_b64))).convert('RGB')
+        for img_b64 in imgs_b64:
+            if img_b64.startswith('data:'):
+                img_b64 = img_b64.split(',', 1)[1]
+            images.append(Image.open(io.BytesIO(base64.b64decode(img_b64))).convert('RGB'))
     except Exception:
         return jsonify({'success': False, 'error': 'image is not a decodable base64 image'}), 400
     think = bool(data.get('think', True))
     model = data.get('model') or CRITIQUE_MODEL
-    cid = _vlm_job_start(_run_describe, model, image, think)
+    cid = _vlm_job_start(_run_describe, model, images, think)
     return jsonify({'success': True, 'describe_id': cid})
 
 

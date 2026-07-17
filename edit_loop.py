@@ -326,23 +326,45 @@ def _prompt_from_reply(text):
 
 def vlm_describe(model, image, think=True, ollama_url="http://127.0.0.1:11434"):
     """The reverse path: ask the local vision model to write a detailed
-    text-to-image prompt that would recreate `image` from scratch.
+    text-to-image prompt that would recreate `image` from scratch. `image`
+    may also be a list of images — then the prompt is a composite describing
+    one coherent scene that merges the images' subjects and elements.
     `think=False` skips the deliberation phase for a faster, shallower
     description. Returns the prompt string, or None on any failure."""
-    ask = (
-        "Write a detailed text-to-image generation prompt that would recreate "
-        "this photograph from scratch. Describe the subject and their exact "
-        "appearance, pose and expression; the setting and background; the "
-        "composition and camera framing (angle, distance, lens feel); the "
-        "lighting and time of day; the color palette and mood; and the overall "
-        "style (photorealistic photo, film stock, illustration, etc.). Be "
-        "specific and concrete — name colors, materials, textures and spatial "
-        "relationships. Do not mention that you are describing an image; just "
-        "write the prompt as one dense paragraph."
-    )
+    images = image if isinstance(image, (list, tuple)) else [image]
+    if len(images) > 1:
+        ask = (
+            f"You are given {len(images)} photographs. Write a detailed "
+            "text-to-image generation prompt for a SINGLE new image that "
+            "combines them into one coherent scene: merge their subjects, "
+            "settings and distinctive elements so each photograph is "
+            "recognizably represented. Describe the combined subjects and "
+            "their exact appearance, pose and spatial arrangement; the "
+            "unified setting and background; the composition and camera "
+            "framing (angle, distance, lens feel); the lighting and time of "
+            "day; the color palette and mood; and the overall style "
+            "(photorealistic photo, film stock, illustration, etc.). Be "
+            "specific and concrete — name colors, materials, textures and "
+            "spatial relationships. Do not mention the source photographs or "
+            "that you are describing images; just write the prompt as one "
+            "dense paragraph describing the single combined scene."
+        )
+    else:
+        ask = (
+            "Write a detailed text-to-image generation prompt that would recreate "
+            "this photograph from scratch. Describe the subject and their exact "
+            "appearance, pose and expression; the setting and background; the "
+            "composition and camera framing (angle, distance, lens feel); the "
+            "lighting and time of day; the color palette and mood; and the overall "
+            "style (photorealistic photo, film stock, illustration, etc.). Be "
+            "specific and concrete — name colors, materials, textures and spatial "
+            "relationships. Do not mention that you are describing an image; just "
+            "write the prompt as one dense paragraph."
+        )
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": ask, "images": [img_b64(image)]}],
+        "messages": [{"role": "user", "content": ask,
+                      "images": [img_b64(im) for im in images]}],
         "stream": False,
         "think": bool(think),
         "format": DESCRIBE_SCHEMA,

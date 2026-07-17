@@ -727,7 +727,8 @@ function clearRefs() {
 }
 
 // The reverse path: have the local vision model write a detailed prompt from
-// the first reference photo, drop it into the prompt box, and generate a
+// the reference photo(s) — a composite description of one combined scene
+// when several are attached — drop it into the prompt box, and generate a
 // fresh image from that prompt alone (the references are set aside for the
 // submission so the result comes from the description, not img2img).
 async function runReversePath() {
@@ -736,14 +737,16 @@ async function runReversePath() {
     const promptEl = document.getElementById('prompt');
     const oldLabel = btn.textContent;
     btn.disabled = true;
-    btn.textContent = 'Describing photo with vision model…';
+    btn.textContent = currentInputImages.length > 1
+        ? 'Describing ' + currentInputImages.length + ' photos as one scene…'
+        : 'Describing photo with vision model…';
     try {
         const thinkEl = document.getElementById('describeThink');
         const res = await fetch('/describe', {
             method: 'POST',
             headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
             body: JSON.stringify({
-                image: currentInputImages[0],
+                images: currentInputImages,
                 think: thinkEl ? thinkEl.checked : true
             })
         });
