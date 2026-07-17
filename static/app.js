@@ -116,6 +116,8 @@ function saveSwitchState() {
         spectrumSameSeed: chk('spectrumSameSeed'),
         showPreview: chk('showPreview'),
         savePreviews: chk('savePreviews'),
+        boostThink: chk('boostThink'),
+        describeThink: chk('describeThink'),
         strength: strengthSlider ? strengthSlider.value : null,
         aspectMode: aspectModeEl ? aspectModeEl.value : null,
         cells: Array.from(selectedCells),
@@ -727,6 +729,45 @@ function clearRefs() {
     if (typeof resetInpaint === 'function') resetInpaint();
 }
 
+// ---- Live progress for slow VLM workflows (describe / boost / evolve) ----
+// Each workflow shows "label — 12s" on its trigger button and in the main
+// status bar, ticking on every poll cycle. While any of them is active,
+// renderRunning's idle reset of the status bar is suppressed (vlmActiveCount)
+// so the message isn't hidden between generation polls.
+let vlmActiveCount = 0;
+
+function fmtElapsed(t0) {
+    const s = Math.round((Date.now() - t0) / 1000);
+    return s < 60 ? s + 's' : Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+}
+
+function vlmStatusStart(btn, label) {
+    const t0 = Date.now();
+    vlmActiveCount += 1;
+    let ended = false;
+    const handle = {
+        elapsed: function() { return fmtElapsed(t0); },
+        // Refresh button + status bar. `detail` replaces the base label when
+        // given; `btnText` overrides the button text when the bar line is too
+        // long for a button.
+        tick: function(detail, btnText) {
+            const msg = (detail || label) + ' — ' + fmtElapsed(t0);
+            if (btn) btn.textContent = btnText || msg;
+            if (status && statusText) {
+                status.className = 'status generating';
+                statusText.textContent = msg;
+            }
+        },
+        end: function() {
+            if (ended) return;
+            ended = true;
+            vlmActiveCount = Math.max(0, vlmActiveCount - 1);
+        }
+    };
+    handle.tick();
+    return handle;
+}
+
 // The reverse path: have the local vision model write a detailed prompt from
 // the reference photo(s) — a composite description of one combined scene
 // when several are attached — drop it into the prompt box, and generate a
@@ -738,9 +779,9 @@ async function runReversePath() {
     const promptEl = document.getElementById('prompt');
     const oldLabel = btn.textContent;
     btn.disabled = true;
-    btn.textContent = currentInputImages.length > 1
-        ? 'Describing ' + currentInputImages.length + ' photos as one scene…'
-        : 'Describing photo with vision model…';
+    const prog = vlmStatusStart(btn, currentInputImages.length > 1
+        ? 'Reverse: describing ' + currentInputImages.length + ' photos as one scene'
+        : 'Reverse: describing photo with the vision model');
     try {
         const thinkEl = document.getElementById('describeThink');
         const res = await fetch('/describe', {
@@ -748,13 +789,19 @@ async function runReversePath() {
             headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
             body: JSON.stringify({
                 images: currentInputImages,
-                think: thinkEl ? thinkEl.checked : true
+                think: thinkEl ? thinkEl.checked : false
             })
         });
         const submitted = await res.json().catch(() => ({}));
         if (!res.ok || !submitted.success) throw new Error(submitted.error || `HTTP ${res.status}`);
-        const data = await pollVlmJob('/describe/' + submitted.describe_id);
+        const data = await pollVlmJob('/describe/' + submitted.describe_id, null,
+                                      function() { prog.tick(); });
         if (promptEl) promptEl.value = data.prompt;
+        if (status && statusText) {
+            status.className = 'status generating';
+            statusText.textContent = 'Description ready in ' + prog.elapsed() + ' — generating from it…';
+        }
+        prog.end();  // generation progress takes over the status bar from here
         const refs = currentInputImages;
         currentInputImages = [];
         syncRefUI();
@@ -767,6 +814,7 @@ async function runReversePath() {
     } catch (err) {
         alert('Reverse path failed: ' + err.message);
     } finally {
+        prog.end();
         btn.disabled = false;
         btn.textContent = oldLabel;
     }
@@ -790,25 +838,32 @@ async function runBoost() {
     if (!draft) { alert('Type a prompt to boost first.'); return; }
     const oldLabel = btn.textContent;
     btn.disabled = true;
-    btn.textContent = 'Boosting prompt…';
+    const level = levelEl ? parseInt(levelEl.value, 10) : 3;
+    const prog = vlmStatusStart(btn, 'Boosting prompt (level ' + level + ')');
     try {
         const res = await fetch('/boost', {
             method: 'POST',
             headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
             body: JSON.stringify({
                 prompt: draft,
-                level: levelEl ? parseInt(levelEl.value, 10) : 3,
-                think: thinkEl ? thinkEl.checked : true,
+                level: level,
+                think: thinkEl ? thinkEl.checked : false,
                 has_image: currentInputImages.length > 0
             })
         });
         const submitted = await res.json().catch(() => ({}));
         if (!res.ok || !submitted.success) throw new Error(submitted.error || `HTTP ${res.status}`);
-        const data = await pollVlmJob('/boost/' + submitted.boost_id);
+        const data = await pollVlmJob('/boost/' + submitted.boost_id, null,
+                                      function() { prog.tick(); });
         if (data.prompt) promptEl.value = data.prompt;
+        if (status && statusText) {
+            status.className = 'status generating';
+            statusText.textContent = 'Prompt boosted in ' + prog.elapsed() + '.';
+        }
     } catch (err) {
         alert('Prompt boost failed: ' + err.message);
     } finally {
+        prog.end();
         btn.disabled = false;
         btn.textContent = oldLabel;
     }
@@ -839,14 +894,18 @@ async function runEvolveGenerate() {
     const oldLabel = btn.textContent;
     btn.disabled = true;
     let evolved = 0, queued = 0, failed = 0;
+    const prog = vlmStatusStart(btn, `Evolving ${n} prompt variations`);
     const tick = function() {
-        btn.textContent = `Evolving ${evolved}/${n}…`;
-        if (status && statusText) {
-            status.className = 'status generating';
-            statusText.textContent = `Evolving ${n} prompt variations — `
-                + `${evolved} evolved, ${queued} queued`
-                + (failed ? `, ${failed} failed` : '');
+        const btnText = `Evolving ${evolved}/${n}… ${prog.elapsed()}`;
+        // Once a generation is running, its step-by-step progress owns the
+        // status bar; keep the evolve tally on the button only.
+        if (runningJobId) {
+            btn.textContent = btnText;
+            return;
         }
+        prog.tick(`Evolving ${n} prompt variations — ${evolved} evolved, `
+                  + `${queued} queued` + (failed ? `, ${failed} failed` : ''),
+                  btnText);
     };
     tick();
     try {
@@ -858,7 +917,7 @@ async function runEvolveGenerate() {
                     body: JSON.stringify({
                         prompt: base,
                         level: levelEl ? parseInt(levelEl.value, 10) : 3,
-                        think: thinkEl ? thinkEl.checked : true,
+                        think: thinkEl ? thinkEl.checked : false,
                         has_image: currentInputImages.length > 0,
                         variant_index: i + 1,
                         variant_count: n
@@ -866,7 +925,7 @@ async function runEvolveGenerate() {
                 });
                 const submitted = await res.json().catch(() => ({}));
                 if (!res.ok || !submitted.success) throw new Error(submitted.error || `HTTP ${res.status}`);
-                const data = await pollVlmJob('/boost/' + submitted.boost_id);
+                const data = await pollVlmJob('/boost/' + submitted.boost_id, null, tick);
                 if (!data.prompt) throw new Error('boost returned no prompt');
                 evolved += 1; tick();
                 const gres = await fetch('/generate', {
@@ -885,17 +944,19 @@ async function runEvolveGenerate() {
             }
         }));
     } finally {
+        prog.end();
         btn.disabled = false;
         btn.textContent = oldLabel;
     }
     if (status && statusText) {
-        if (queued > 0) {
-            status.className = 'status generating';
-            statusText.textContent = `Queued ${queued} evolved variation${queued > 1 ? 's' : ''}`
-                + (failed ? ` (${failed} failed)` : '');
-        } else {
+        if (!queued) {
             status.className = 'status error';
             statusText.textContent = 'Evolve failed: no variation could be boosted or queued.';
+        } else if (!runningJobId) {
+            // With a generation already running, its live progress owns the bar.
+            status.className = 'status generating';
+            statusText.textContent = `Queued ${queued} evolved variation${queued > 1 ? 's' : ''}`
+                + ` in ${prog.elapsed()}` + (failed ? ` (${failed} failed)` : '');
         }
     }
 }
@@ -1305,7 +1366,9 @@ function renderRunning(running) {
     const watchBtn = document.getElementById('watchBtn');
 
     if (!running) {
-        status.className = 'status';
+        // Don't hide the status bar while a VLM workflow (describe/boost/
+        // evolve) is showing its own progress there.
+        if (!vlmActiveCount) status.className = 'status';
         if (progressTracker) progressTracker.style.display = 'none';
         if (pwrap) pwrap.style.display = 'none';
         if (watchBtn) watchBtn.style.display = 'none';
@@ -2048,7 +2111,7 @@ async function loopSubmitJob(prompt, refDataUrl) {
     return data.job_id;
 }
 
-async function loopAwaitJob(jobId) {
+async function loopAwaitJob(jobId, onTick) {
     for (;;) {
         await new Promise(r => setTimeout(r, 2000));
         const res = await fetch('/status', { headers: getAuthHeaders() });
@@ -2060,6 +2123,7 @@ async function loopAwaitJob(jobId) {
             }
             return done.images[0].filename;
         }
+        if (onTick) onTick(st);
         if (loopRun && loopRun.stop) {
             // Cancel if it's still queued; a running job has to finish on its own.
             await fetch('/jobs/' + jobId + '/cancel', {
@@ -2073,10 +2137,12 @@ async function loopAwaitJob(jobId) {
 // Slow VLM calls (/critique, /describe, /boost) can run for minutes — far past the
 // ~60s cap Safari puts on a single fetch — so their POST endpoints return an
 // id right away and the result is collected by polling. The optional
-// `cancelled` callback aborts the wait.
-async function pollVlmJob(url, cancelled) {
+// `cancelled` callback aborts the wait; `onTick` fires once per poll cycle
+// so callers can show live elapsed-time progress.
+async function pollVlmJob(url, cancelled, onTick) {
     for (;;) {
         await new Promise(r => setTimeout(r, 2000));
+        if (onTick) onTick();
         const res = await fetch(url, { headers: getAuthHeaders() });
         const data = await res.json().catch(() => ({}));
         if (!res.ok || !data.success) throw new Error(data.error || `HTTP ${res.status}`);
@@ -2085,8 +2151,8 @@ async function pollVlmJob(url, cancelled) {
     }
 }
 
-function loopAwaitCritique(critiqueId) {
-    return pollVlmJob('/critique/' + critiqueId, () => loopRun && loopRun.stop);
+function loopAwaitCritique(critiqueId, onTick) {
+    return pollVlmJob('/critique/' + critiqueId, () => loopRun && loopRun.stop, onTick);
 }
 
 async function loopFetchAsDataUrl(filename) {
@@ -2187,7 +2253,17 @@ async function runEditLoop() {
         for (let i = 1; i <= maxIter && !loopRun.stop; i++) {
             loopSetStatus(`Iteration ${i}/${maxIter}: generating…`);
             const jobId = await loopSubmitJob(prompt, refDataUrl);
-            const filename = await loopAwaitJob(jobId);
+            const genT0 = Date.now();
+            const filename = await loopAwaitJob(jobId, function(st) {
+                const r = st.running;
+                let phase = '';
+                if (r && r.id === jobId && r.total_steps > 0 && r.step > 0) {
+                    phase = ` — step ${r.step} of ${r.total_steps}`;
+                } else if ((st.queued || []).some(q => q.id === jobId)) {
+                    phase = ' — waiting in queue';
+                }
+                loopSetStatus(`Iteration ${i}/${maxIter}: generating${phase} — ${fmtElapsed(genT0)}`);
+            });
             completed.push({ filename: filename, prompt: prompt });
             const verdictEl = loopAddCard(i, prompt, filename);
 
@@ -2209,7 +2285,10 @@ async function runEditLoop() {
                 });
                 const submitted = await res.json().catch(() => ({}));
                 if (!res.ok || !submitted.success) throw new Error(submitted.error || `HTTP ${res.status}`);
-                critique = await loopAwaitCritique(submitted.critique_id);
+                const critT0 = Date.now();
+                critique = await loopAwaitCritique(submitted.critique_id, function() {
+                    loopSetStatus(`Iteration ${i}/${maxIter}: comparing input and output — ${fmtElapsed(critT0)}`);
+                });
             } catch (err) {
                 critique = null;
                 verdictEl.textContent = 'Critique unavailable: ' + err.message;
@@ -2373,6 +2452,8 @@ if (loopAcceptBtn) loopAcceptBtn.addEventListener('click', function() {
     setChk('spectrumSameSeed', saved.spectrumSameSeed);
     setChk('showPreview', saved.showPreview);
     setChk('savePreviews', saved.savePreviews);
+    setChk('boostThink', saved.boostThink);
+    setChk('describeThink', saved.describeThink);
     if (typeof syncSavePreviewsVisibility === 'function') syncSavePreviewsVisibility();
     if (strengthSlider && saved.strength !== null && saved.strength !== undefined) {
         strengthSlider.value = saved.strength;

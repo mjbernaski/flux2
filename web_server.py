@@ -1129,8 +1129,8 @@ def describe():
     generating a fresh image from that prompt alone. Accepts `images` (a
     list, up to MAX_REFERENCE_IMAGES) or legacy single `image`; with several
     images the prompt is a composite describing one scene that combines
-    them. `think` (default true) toggles the VLM's deliberation phase — off
-    is faster but shallower. Returns a describe_id immediately; poll
+    them. `think` (default false) enables the VLM's deliberation phase —
+    deeper but much slower. Returns a describe_id immediately; poll
     GET /describe/<id> for the prompt."""
     data = request.json or {}
     imgs_b64 = data.get('images') if isinstance(data.get('images'), list) else []
@@ -1149,7 +1149,7 @@ def describe():
             images.append(Image.open(io.BytesIO(base64.b64decode(img_b64))).convert('RGB'))
     except Exception:
         return jsonify({'success': False, 'error': 'image is not a decodable base64 image'}), 400
-    think = bool(data.get('think', True))
+    think = bool(data.get('think', False))
     model = data.get('model') or CRITIQUE_MODEL
     cid = _vlm_job_start(_run_describe, model, images, think)
     return jsonify({'success': True, 'describe_id': cid})
@@ -1346,8 +1346,8 @@ def boost():
     shifted to edit-instruction / final-image idiom when `has_image` says
     references are attached), via the local ollama model. `level` 1-5 sets
     how far the rewrite may depart from the draft (1 = polish wording only,
-    5 = reimagine boldly); `think` (default true) toggles the VLM's
-    thinking phase — off is faster but shallower. Optional `variant_index` +
+    5 = reimagine boldly); `think` (default false) enables the VLM's
+    thinking phase — deeper but much slower. Optional `variant_index` +
     `variant_count` mark this as one of N independent rewrites of the same
     draft (the evolve feature): the VLM is pushed toward a direction the
     other rewrites are unlikely to take. Returns a boost_id immediately;
@@ -1375,7 +1375,7 @@ def boost():
                             'error': 'variant_index must be between 1 and variant_count'}), 400
         variant = (v_idx, v_cnt)
     has_image = bool(data.get('has_image'))
-    think = bool(data.get('think', True))
+    think = bool(data.get('think', False))
     model = data.get('model') or CRITIQUE_MODEL
     cid = _vlm_job_start(_run_boost, model, prompt, _boost_family(has_image),
                          _model_type_string(), level, think, variant)

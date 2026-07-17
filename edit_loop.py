@@ -324,13 +324,13 @@ def _prompt_from_reply(text):
         return text.strip()
 
 
-def vlm_describe(model, image, think=True, ollama_url="http://127.0.0.1:11434"):
+def vlm_describe(model, image, think=False, ollama_url="http://127.0.0.1:11434"):
     """The reverse path: ask the local vision model to write a detailed
     text-to-image prompt that would recreate `image` from scratch. `image`
     may also be a list of images — then the prompt is a composite describing
     one coherent scene that merges the images' subjects and elements.
-    `think=False` skips the deliberation phase for a faster, shallower
-    description. Returns the prompt string, or None on any failure."""
+    `think=True` (default off) enables the deliberation phase — deeper but
+    much slower. Returns the prompt string, or None on any failure."""
     images = image if isinstance(image, (list, tuple)) else [image]
     if len(images) > 1:
         ask = (
@@ -469,12 +469,12 @@ BOOST_LEVELS = {
 
 
 def vlm_boost(model, prompt, family="flux2", model_desc="", level=3,
-              think=True, ollama_url="http://127.0.0.1:11434", variant=None):
+              think=False, ollama_url="http://127.0.0.1:11434", variant=None):
     """Rewrite the user's draft prompt into a stronger one tuned to the
     prompting idiom of the loaded image model (`family` picks the guidance;
     `model_desc` is the human-readable model name for context; `level` 1-5
-    sets how far the rewrite may depart from the draft; `think=False`
-    disables the model's thinking phase for a faster, shallower rewrite).
+    sets how far the rewrite may depart from the draft; `think=True`,
+    default off, enables the model's thinking phase — deeper but slower).
     `variant=(i, n)` marks this call as one of n independent rewrites of the
     same draft: the model is told to commit to a direction the other rewrites
     are unlikely to take, and sampling runs hot enough to actually diverge.

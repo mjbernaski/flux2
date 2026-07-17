@@ -78,7 +78,7 @@
                 </select>
                 <label class="boost-think" for="boostThink"
                        title="On: the VLM deliberates before rewriting — better results, slower. Off: instant-ish shallow rewrite.">
-                    <input type="checkbox" id="boostThink" checked> think
+                    <input type="checkbox" id="boostThink"> think
                 </label>
             </div>
             <div class="boost-control evolve-control">
@@ -129,13 +129,14 @@
                         <button type="button" id="describeBtn" class="describe-btn">&#8646; Reverse: photo &rarr; prompt &rarr; new image</button>
                         <label class="boost-think" for="describeThink"
                                title="On: the vision model deliberates before writing the prompt — better results, slower. Off: faster, shallower description.">
-                            <input type="checkbox" id="describeThink" checked> think
+                            <input type="checkbox" id="describeThink"> think
                         </label>
                     </div>
                     <div class="strength-hint">
-                        The local vision model writes a detailed prompt from the first
-                        reference; it lands in the prompt box and a fresh image is
-                        generated from the prompt alone (the photo itself is not sent).
+                        The local vision model writes a detailed prompt from the
+                        attached reference(s) — combined into one scene when several
+                        are attached; it lands in the prompt box and a fresh image is
+                        generated from the prompt alone (the photos are not sent).
                     </div>
                 </div>
                 <div class="strength-control" id="strengthControl" style="display: none;">
