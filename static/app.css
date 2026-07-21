@@ -150,6 +150,22 @@ button:disabled {
     z-index: 900;
     pointer-events: none;
 }
+.latest-thumb {
+    position: fixed;
+    bottom: calc(48px + env(safe-area-inset-bottom, 0px));
+    right: calc(12px + env(safe-area-inset-right, 0px));
+    width: 96px;
+    padding: 0;
+    border: 1px solid #333;
+    border-radius: 8px;
+    background: rgba(22, 33, 62, 0.9);
+    overflow: hidden;
+    cursor: pointer;
+    z-index: 900;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5);
+}
+.latest-thumb img { display: block; width: 100%; }
+.latest-thumb:hover { border-color: #00d4ff; }
 .model-switch {
     display: flex;
     align-items: center;

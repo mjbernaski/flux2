@@ -1932,6 +1932,8 @@ document.addEventListener('keydown', function(e) {
 
 const historyGrid = document.getElementById('historyGrid');
 const deleteAllBtn = document.getElementById('deleteAllBtn');
+const latestThumb = document.getElementById('latestThumb');
+const latestThumbImg = document.getElementById('latestThumbImg');
 async function loadHistory() {
     try {
         const response = await fetch('/history', { headers: getAuthHeaders() });
@@ -1942,12 +1944,19 @@ async function loadHistory() {
         if (deleteAllBtn) deleteAllBtn.style.display = hasImages ? 'block' : 'none';
         if (!hasImages) {
             historyGrid.innerHTML = '<p class="history-empty">No images generated today</p>';
+            if (latestThumb) latestThumb.style.display = 'none';
             return;
         }
         const lbList = data.images.map(im => ({
             src: `/images/${encodeURIComponent(im.filename)}`,
             caption: (im.time ? im.time + ' — ' : '') + (im.prompt || im.filename)
         }));
+        if (latestThumb && latestThumbImg) {
+            latestThumbImg.src = lbList[0].src;
+            latestThumb.title = lbList[0].caption;
+            latestThumb.onclick = () => openLightbox(lbList, 0);
+            latestThumb.style.display = 'block';
+        }
         data.images.forEach((img, idx) => {
             const item = document.createElement('div');
             item.className = 'history-item';
