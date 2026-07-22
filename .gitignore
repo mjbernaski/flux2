@@ -56,6 +56,7 @@ nohup.out
 server.log
 server.pid
 .next_config
+.multi_run.json
 
 # Generated image artifacts
 web-generated/

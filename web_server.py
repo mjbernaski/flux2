@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Version number - update this when releasing new versions
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 # Import model components from flux_core (model loading + generation).
 # `--sdxl` swaps in sd_core, the uncensored Stable Diffusion XL backend —
@@ -237,6 +237,7 @@ class Job:
     saved_previews: int = 0  # preview frames written to steps/ (save_previews on)
     step_times: list = field(default_factory=list)  # per-step durations (s) of the current image
     generation_time: float = 0.0
+    multi_run: Optional[str] = None  # id of the multi-model run this job belongs to
 
     @property
     def prompt(self) -> str:
@@ -259,6 +260,7 @@ class Job:
             # Note: reference payloads are dropped from finished jobs, so this
             # is only meaningful while the job is queued/running.
             'refs': len(self.params.get('input_images') or []),
+            'multi_run': self.multi_run,
         }
 
     def full(self) -> dict:
@@ -677,6 +679,12 @@ def _queue_worker():
                 _running_job = None
                 _recent_done.insert(0, job)
                 del _recent_done[RECENT_DONE_MAX:]
+            # Multi-model run bookkeeping: record this job's results, then
+            # advance the run (queue its next job, restart into the next
+            # config once the queue is idle, or mark it finished).
+            if job.multi_run:
+                _multi_run_record(job)
+            _multi_run_advance()
 
 
 def _start_queue_worker():
@@ -684,6 +692,122 @@ def _start_queue_worker():
     if _queue_worker_thread is None or not _queue_worker_thread.is_alive():
         _queue_worker_thread = threading.Thread(target=_queue_worker, daemon=True, name="queue-worker")
         _queue_worker_thread.start()
+
+
+# ---- Multi-model runs ----
+# One prompt generated on several run_server.sh configs in sequence. Each
+# model switch is a full supervised restart (see /switch-model), so the run's
+# state can't live in memory: it's a JSON file that survives the restarts.
+# The cycle is: queue a job on the current model -> record its results in the
+# file -> restart into the next config -> on ready, _multi_run_advance() picks
+# the file back up and queues the next job.
+MULTI_RUN_FILE = ".multi_run.json"
+_multi_run_lock = threading.RLock()
+
+
+def _multi_run_load():
+    try:
+        with open(MULTI_RUN_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def _multi_run_save(state):
+    # Atomic write: the supervisor can kill the process at any point and a
+    # half-written state file would strand the run.
+    tmp = MULTI_RUN_FILE + ".tmp"
+    with open(tmp, 'w') as f:
+        json.dump(state, f)
+    os.replace(tmp, MULTI_RUN_FILE)
+
+
+def _multi_run_clear():
+    try:
+        os.remove(MULTI_RUN_FILE)
+    except FileNotFoundError:
+        pass
+
+
+def _multi_run_next_config(state):
+    done = {r['config'] for r in state['results']}
+    for c in state['configs']:
+        if c not in done:
+            return c
+    return None
+
+
+def _multi_run_enqueue(state):
+    job = Job(id=uuid.uuid4().hex[:12], params=dict(state['params']), submitted_at=time.time())
+    job.multi_run = state['id']
+    with _queue_cv:
+        _pending.append(job)
+        _queue_cv.notify()
+    print(f"[multi-run] queued job {job.id} on config {_current_config} "
+          f"({SERVER_CONFIGS.get(_current_config)})", flush=True)
+
+
+def _multi_run_switch(target):
+    with open(SWITCH_CONFIG_FILE, 'w') as f:
+        f.write(str(target))
+    print(f"[multi-run] restarting into config {target} ({SERVER_CONFIGS[target]})", flush=True)
+    # Small delay so any in-flight HTTP responses flush before the exit.
+    threading.Timer(0.5, lambda: os._exit(SWITCH_EXIT_CODE)).start()
+
+
+def _multi_run_record(job):
+    """Append a finished multi-run job's results to the run's state file."""
+    with _multi_run_lock:
+        state = _multi_run_load()
+        if not state or state.get('id') != job.multi_run or state.get('finished'):
+            return
+        state['results'].append({
+            'config': _current_config,
+            'label': SERVER_CONFIGS.get(_current_config, str(_current_config)),
+            'model': _model_type_string(),
+            'state': job.state,
+            'error': job.error,
+            'images': [{'filename': i['filename'], 'seed': i['seed']} for i in job.images],
+            'generation_time': round(job.generation_time, 2),
+        })
+        if job.state == 'canceled':
+            # Interrupting the run's job cancels the whole run.
+            state['finished'] = time.time()
+            state['canceled'] = True
+        _multi_run_save(state)
+
+
+def _multi_run_advance():
+    """Drive the active multi-model run one step forward.
+
+    Called when the model becomes ready (startup / after a switch) and after
+    every finished job. Queues the run's job if the current config is next;
+    otherwise restarts into the next config — but only once the queue is
+    idle, so user-submitted jobs are never killed mid-generation.
+    """
+    if _current_config is None or not _model_ready:
+        return
+    with _multi_run_lock:
+        state = _multi_run_load()
+        if not state or state.get('finished'):
+            return
+        nxt = _multi_run_next_config(state)
+        if nxt is None:
+            state['finished'] = time.time()
+            _multi_run_save(state)
+            print(f"[multi-run] run {state['id']} complete", flush=True)
+            return
+        if nxt == _current_config:
+            with _queue_cv:
+                queued = any(j.multi_run == state['id'] for j in _pending) or \
+                    (_running_job is not None and _running_job.multi_run == state['id'])
+            if not queued:
+                _multi_run_enqueue(state)
+        else:
+            with _queue_cv:
+                idle = _running_job is None and not _pending
+            if idle:
+                _multi_run_switch(nxt)
 
 
 @app.route('/')
@@ -938,12 +1062,138 @@ def switch_model():
                 'error': 'Jobs are running or queued. Interrupt/cancel them before switching models.',
             }), 409
 
+    state = _multi_run_load()
+    if state and not state.get('finished'):
+        return jsonify({
+            'success': False,
+            'error': 'A multi-model run is active. Cancel it before switching models manually.',
+        }), 409
+
     with open(SWITCH_CONFIG_FILE, 'w') as f:
         f.write(str(target))
     print(f"[switch] restarting into config {target} ({SERVER_CONFIGS[target]})", flush=True)
     # Give Flask a moment to flush this response before the process exits.
     threading.Timer(0.5, lambda: os._exit(SWITCH_EXIT_CODE)).start()
     return jsonify({'success': True, 'switching_to': SERVER_CONFIGS[target]})
+
+
+@app.route('/multi-run', methods=['POST'])
+def multi_run_start():
+    """Start a multi-model run: the same prompt generated on each selected
+    run_server.sh config in turn (see the multi-run engine above).
+
+    Body: {configs: [ids], prompt, and the usual /generate params}. Reference
+    images, masks, and negative prompts are per-model capabilities, so runs
+    are text-to-image only. Unless a seed is given, one is drawn here and
+    shared by every model so the outputs are comparable.
+    """
+    if _current_config is None:
+        return jsonify({
+            'success': False,
+            'error': 'Multi-model runs require launching via run_server.sh (no supervisor detected).',
+        }), 400
+    if not _model_ready:
+        return jsonify({'success': False, 'error': 'Model still loading. Please wait.'}), 503
+
+    data = request.json or {}
+    prompt = (data.get('prompt') or '').strip()
+    if not prompt:
+        return jsonify({'success': False, 'error': 'prompt is required'}), 400
+
+    configs = data.get('configs')
+    if not isinstance(configs, list) or not configs:
+        return jsonify({'success': False, 'error': 'configs must be a non-empty list'}), 400
+    try:
+        configs = list(dict.fromkeys(int(c) for c in configs))
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'configs must be a list of integers'}), 400
+    bad = [c for c in configs if c not in SERVER_CONFIGS]
+    if bad:
+        return jsonify({'success': False, 'error': f'unknown configs: {bad}'}), 400
+
+    if data.get('input_images') or data.get('input_image') or data.get('mask_image'):
+        return jsonify({'success': False,
+                        'error': 'multi-model runs are text-to-image only (remove reference images)'}), 400
+    if data.get('negative_prompt'):
+        return jsonify({'success': False,
+                        'error': 'negative_prompt is SDXL-only and not supported in multi-model runs'}), 400
+
+    params = {'prompt': prompt}
+    for k in ('orientation', 'size', 'steps', 'seed', 'guidance', 'batch', 'show_preview'):
+        if data.get(k) is not None:
+            params[k] = data[k]
+    error = _validate_generate_params(params)
+    if error:
+        return jsonify({'success': False, 'error': error}), 400
+    # One shared seed (unless given) so the models' outputs are comparable.
+    if params.get('seed') is None:
+        params['seed'] = random.randint(0, 2**32 - 1)
+
+    with _multi_run_lock:
+        state = _multi_run_load()
+        if state and not state.get('finished'):
+            return jsonify({'success': False,
+                            'error': 'A multi-model run is already active. Cancel it first.'}), 409
+        with _queue_cv:
+            if _running_job is not None or _pending:
+                return jsonify({
+                    'success': False,
+                    'error': 'Jobs are running or queued. Wait for or cancel them before a multi-model run.',
+                }), 409
+        # Run the current model first when it's selected — saves one restart.
+        if _current_config in configs:
+            configs.remove(_current_config)
+            configs.insert(0, _current_config)
+        state = {
+            'id': uuid.uuid4().hex[:12],
+            'created': time.time(),
+            'prompt': prompt,
+            'params': params,
+            'configs': configs,
+            'results': [],
+        }
+        _multi_run_save(state)
+        _multi_run_advance()
+    return jsonify({'success': True, 'id': state['id'], 'configs': configs, 'seed': params['seed']})
+
+
+@app.route('/multi-run', methods=['GET'])
+def multi_run_status():
+    """State of the active (or last finished, un-dismissed) multi-model run."""
+    state = _multi_run_load()
+    if not state:
+        return jsonify({'active': False, 'run': None})
+    return jsonify({
+        'active': not state.get('finished'),
+        'run': state,
+        'labels': {str(k): v for k, v in SERVER_CONFIGS.items()},
+        'current_config': _current_config,
+        'next_config': _multi_run_next_config(state),
+    })
+
+
+@app.route('/multi-run/cancel', methods=['POST'])
+def multi_run_cancel():
+    """Cancel the active multi-model run (interrupting its job if one is
+    queued or generating), or dismiss a finished run's results."""
+    with _multi_run_lock:
+        state = _multi_run_load()
+        _multi_run_clear()
+    if not state:
+        return jsonify({'success': True})
+    rid = state['id']
+    with _queue_cv:
+        for i, j in enumerate(_pending):
+            if j.multi_run == rid:
+                j.state = 'canceled'
+                j.finished_at = time.time()
+                del _pending[i]
+                _recent_done.insert(0, j)
+                del _recent_done[RECENT_DONE_MAX:]
+                break
+        if _running_job is not None and _running_job.multi_run == rid:
+            _running_job.cancel_requested = True
+    return jsonify({'success': True})
 
 
 def _model_type_string():
@@ -1647,6 +1897,10 @@ if __name__ == '__main__':
             _model_load_status = "ready"
             _model_ready = True
             print("Model ready.")
+            # Resume an in-flight multi-model run (this launch may BE the
+            # switch it requested): queue its job for this config, or keep
+            # switching if this config's turn is already done.
+            _multi_run_advance()
         except Exception as e:
             _model_load_error = str(e)
             _model_load_status = "error"
@@ -1654,8 +1908,14 @@ if __name__ == '__main__':
 
     _model_load_start_ts = time.perf_counter()
     threading.Thread(target=_load_in_background, daemon=True).start()
-    threading.Thread(target=_warm_critique_model, daemon=True,
-                     name='critique-warmup').start()
+    if _flux2 and _full_model:
+        # Full FLUX.2 (32B bf16 + Mistral3 encoder) fills nearly all unified
+        # memory during load; preloading the critique VLM alongside it has
+        # OOM-killed the box. Let ollama cold-load on the first real VLM call.
+        print("Skipping critique model preload (full FLUX.2 config; VLM loads on first use).")
+    else:
+        threading.Thread(target=_warm_critique_model, daemon=True,
+                         name='critique-warmup').start()
     _start_queue_worker()
     print(f"\nStarting web server on http://0.0.0.0:{args.port} (model loading in background)")
     app.run(host='0.0.0.0', port=args.port, threaded=True)

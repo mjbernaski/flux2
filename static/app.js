@@ -2492,3 +2492,256 @@ if (loopAcceptBtn) loopAcceptBtn.addEventListener('click', function() {
     }
 })();
 
+
+// ---- Multi-model comparison ----
+// Run the prompt on a subset of the run_server.sh configs, one after another
+// (POST /multi-run). The server orchestrates via a state file that survives
+// the restart each model switch requires; this module just submits, polls
+// GET /multi-run to render per-model progress/results, and hands off to
+// watchServerRestart (overlay + reload) whenever the server goes down to
+// load the next model. After the reload, the on-load block below resumes.
+(function() {
+    const section = document.getElementById('multiRunSection');
+    const content = document.getElementById('multiRunContent');
+    const configsWrap = document.getElementById('multiRunConfigs');
+    const startBtn = document.getElementById('multiRunStartBtn');
+    const cancelBtn = document.getElementById('multiRunCancelBtn');
+    const statusEl = document.getElementById('multiRunStatus');
+    const rowsEl = document.getElementById('multiRunRows');
+    if (!section || !configsWrap || !startBtn || !cancelBtn || !statusEl || !rowsEl) return;
+
+    let labels = {};          // config id (number) -> label
+    let mrPollTimer = null;
+    let mrFailCount = 0;      // consecutive /multi-run fetch failures
+    let mrNextLabel = null;   // label of the config the server switches to next
+    let mrActive = false;
+
+    fetch('/configs', { headers: getAuthHeaders() })
+        .then(function(r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+        .then(function(data) {
+            if (!data.switchable || !data.configs) { section.style.display = 'none'; return; }
+            data.configs.forEach(function(c) {
+                labels[c.id] = c.label;
+                const lab = document.createElement('label');
+                lab.className = 'checkbox-label';
+                const cb = document.createElement('input');
+                cb.type = 'checkbox';
+                cb.value = String(c.id);
+                lab.appendChild(cb);
+                lab.appendChild(document.createTextNode(
+                    ' ' + c.id + ' — ' + c.label + (c.id === data.current ? ' (current)' : '')));
+                configsWrap.appendChild(lab);
+            });
+        })
+        .catch(function() { section.style.display = 'none'; });
+
+    function selectedIds() {
+        return Array.from(configsWrap.querySelectorAll('input:checked'))
+            .map(function(cb) { return parseInt(cb.value, 10); });
+    }
+    configsWrap.addEventListener('change', function() {
+        startBtn.disabled = mrActive || selectedIds().length === 0;
+    });
+
+    function setStatus(msg, cls) {
+        statusEl.style.display = msg ? 'block' : 'none';
+        statusEl.textContent = msg || '';
+        statusEl.className = 'edit-loop-status' + (cls ? ' ' + cls : '');
+    }
+
+    function stopPolling() {
+        if (mrPollTimer) { clearTimeout(mrPollTimer); mrPollTimer = null; }
+    }
+
+    function render(data) {
+        const run = data.run;
+        if (!run) {
+            mrActive = false;
+            cancelBtn.style.display = 'none';
+            rowsEl.innerHTML = '';
+            setStatus(null);
+            startBtn.disabled = selectedIds().length === 0;
+            return;
+        }
+        mrActive = data.active;
+        startBtn.disabled = mrActive || selectedIds().length === 0;
+        cancelBtn.style.display = '';
+        cancelBtn.textContent = mrActive ? 'Cancel run' : 'Dismiss results';
+        // The label the restart watcher shows when the server goes down: the
+        // first config still pending other than the one generating right now.
+        const pendingOther = run.configs.find(function(c) {
+            return c !== data.current_config &&
+                !run.results.some(function(r) { return r.config === c; });
+        });
+        mrNextLabel = pendingOther != null ? (labels[pendingOther] || ('config ' + pendingOther)) : null;
+
+        if (mrActive) {
+            const doneCount = run.results.length;
+            setStatus('Running on ' + run.configs.length + ' models — ' + doneCount + ' done. Seed ' +
+                      run.params.seed + '.', '');
+        } else if (run.canceled) {
+            setStatus('Run canceled.', 'error');
+        } else {
+            setStatus('Run complete. Seed ' + run.params.seed + '.', 'done');
+        }
+
+        // One lightbox across every image of the run, captioned by model.
+        const lbItems = [];
+        run.results.forEach(function(r) {
+            (r.images || []).forEach(function(img) {
+                lbItems.push({ src: '/images/' + img.filename,
+                               caption: r.label + ' — seed ' + img.seed });
+            });
+        });
+
+        rowsEl.innerHTML = '';
+        let lbIdx = 0;
+        run.configs.forEach(function(cid) {
+            const res = run.results.find(function(r) { return r.config === cid; });
+            const row = document.createElement('div');
+            row.className = 'mr-row';
+            const name = document.createElement('div');
+            name.className = 'mr-row-label';
+            name.textContent = (res && res.label) || labels[cid] || ('config ' + cid);
+            row.appendChild(name);
+            const state = document.createElement('div');
+            state.className = 'mr-row-state';
+            if (res) {
+                if (res.state === 'done') {
+                    state.textContent = '✓ ' + (res.generation_time ? res.generation_time.toFixed(1) + 's' : 'done');
+                    state.classList.add('done');
+                } else {
+                    state.textContent = '✗ ' + (res.error || res.state);
+                    state.classList.add('failed');
+                }
+            } else if (!mrActive) {
+                state.textContent = 'not run';
+            } else if (cid === data.current_config) {
+                state.textContent = 'generating…';
+                state.classList.add('active');
+            } else if (cid === data.next_config) {
+                state.textContent = 'next — switching model…';
+                state.classList.add('active');
+            } else {
+                state.textContent = 'waiting';
+            }
+            row.appendChild(state);
+            if (res && res.images && res.images.length) {
+                const thumbs = document.createElement('div');
+                thumbs.className = 'mr-thumbs';
+                res.images.forEach(function(img) {
+                    const t = document.createElement('img');
+                    t.className = 'mr-thumb';
+                    t.src = '/images/' + img.filename;
+                    t.alt = name.textContent;
+                    const idx = lbIdx++;
+                    t.addEventListener('click', function() { openLightbox(lbItems, idx); });
+                    thumbs.appendChild(t);
+                });
+                row.appendChild(thumbs);
+            }
+            rowsEl.appendChild(row);
+        });
+    }
+
+    async function poll() {
+        try {
+            const res = await fetch('/multi-run', { headers: getAuthHeaders(), cache: 'no-store' });
+            if (res.status === 401) { stopPolling(); return; }
+            const data = await res.json();
+            mrFailCount = 0;
+            render(data);
+            // A pending config differing from the current one means the server
+            // is restarting (or about to) into the next model. Detect it from
+            // the state rather than waiting to catch the brief down-window —
+            // Flask is back up in seconds while the model load takes minutes,
+            // so the failure path below usually never fires.
+            if (data.active && data.next_config != null &&
+                data.next_config !== data.current_config) {
+                stopPolling();
+                watchServerRestart(labels[data.next_config] || ('config ' + data.next_config));
+                return;
+            }
+            if (data.active) {
+                mrPollTimer = setTimeout(poll, 2000);
+            } else {
+                stopPolling();
+            }
+        } catch (err) {
+            // The server has likely exited to load the next model. Require two
+            // consecutive failures (vs a transient blip) before handing off to
+            // the restart watcher, which overlays and reloads when it's back.
+            mrFailCount += 1;
+            if (mrFailCount >= 2) {
+                stopPolling();
+                watchServerRestart(mrNextLabel || 'next model');
+            } else {
+                mrPollTimer = setTimeout(poll, 2000);
+            }
+        }
+    }
+
+    startBtn.addEventListener('click', async function() {
+        const ids = selectedIds();
+        if (!ids.length || startBtn.disabled) return;
+        if (currentInputImages.length > 0) {
+            setStatus('Multi-model runs are text-to-image only — remove the reference images first.', 'error');
+            return;
+        }
+        const built = buildGenerateFormData();
+        if (!built) return;
+        const f = built.formData;
+        if (!f.prompt || !f.prompt.trim()) {
+            setStatus('Enter a prompt first.', 'error');
+            return;
+        }
+        startBtn.disabled = true;
+        try {
+            const res = await fetch('/multi-run', {
+                method: 'POST',
+                headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+                body: JSON.stringify({
+                    configs: ids,
+                    prompt: f.prompt,
+                    orientation: f.orientation,
+                    size: f.size,
+                    steps: f.steps,
+                    seed: f.seed,
+                    guidance: f.guidance,
+                    batch: f.batch,
+                    show_preview: f.show_preview
+                })
+            });
+            const data = await res.json().catch(function() { return {}; });
+            if (!res.ok || !data.success) throw new Error(data.error || ('HTTP ' + res.status));
+            recordPromptHistory(f.prompt);
+            noteActivity();
+            schedulePoll(0);  // the run's jobs show as normal jobs in the status area
+            mrFailCount = 0;
+            poll();
+        } catch (err) {
+            setStatus('Could not start run: ' + err.message, 'error');
+            startBtn.disabled = selectedIds().length === 0;
+        }
+    });
+
+    cancelBtn.addEventListener('click', async function() {
+        try {
+            await fetch('/multi-run/cancel', { method: 'POST', headers: getAuthHeaders() });
+        } catch (err) {}
+        stopPolling();
+        render({ run: null });
+    });
+
+    // On load: resume/display an existing run (e.g. right after the reload a
+    // mid-run model switch causes).
+    fetch('/multi-run', { headers: getAuthHeaders(), cache: 'no-store' })
+        .then(function(r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+        .then(function(data) {
+            if (!data.run) return;
+            if (content) content.style.display = 'block';
+            render(data);
+            if (data.active) { mrFailCount = 0; mrPollTimer = setTimeout(poll, 2000); }
+        })
+        .catch(function() {});
+})();

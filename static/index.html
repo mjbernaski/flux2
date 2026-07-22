@@ -358,6 +358,30 @@
         </div>
     </div>
 
+    <div class="edit-loop-section" id="multiRunSection">
+        <div class="edit-loop-header" onclick="document.getElementById('multiRunContent').style.display = document.getElementById('multiRunContent').style.display === 'none' ? 'block' : 'none'">
+            <div class="edit-loop-title">
+                <span>&#8645; Multi-Model Comparison</span>
+            </div>
+            <span style="font-size: 12px; color: #888;">Click to toggle</span>
+        </div>
+        <div id="multiRunContent" style="display: none; padding-top: 10px;">
+            <p class="edit-loop-hint">
+                Generate the prompt above on several models back to back, with
+                the same seed and settings, and compare the results. Each model
+                change restarts the server (a model-load wait between results).
+                Text-to-image only.
+            </p>
+            <div class="multi-run-configs" id="multiRunConfigs"></div>
+            <div class="button-row">
+                <button type="button" id="multiRunStartBtn" disabled>Run on selected models</button>
+                <button type="button" class="reset-btn" id="multiRunCancelBtn" style="display: none;">Cancel run</button>
+            </div>
+            <div class="edit-loop-status" id="multiRunStatus" style="display: none;"></div>
+            <div id="multiRunRows"></div>
+        </div>
+    </div>
+
     <div class="status" id="status">
         <span class="spinner"></span>
         <span id="statusText">Generating...</span>

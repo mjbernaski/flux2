@@ -70,6 +70,13 @@ diffusers, transformers, flask, python-dotenv, huggingface_hub, requests.
 - **Web queue**: one worker thread, `QUEUE_MAX_SIZE=10`, jobs carry progress
   state polled by the UI via `/status`. `/generate` validates all params at the
   API boundary and returns 400s.
+- **Multi-model runs**: `/multi-run` generates one prompt (same seed) on a
+  subset of the server configs sequentially. Each model switch is a supervised
+  restart (the `/switch-model` exit-86 flow), so run state lives in
+  `.multi_run.json`, not memory: `_multi_run_advance()` — called on
+  model-ready and after every finished job — queues the current config's job,
+  restarts into the next config once the queue is idle, or marks the run
+  finished. Text-to-image only.
 - **Performance**: batch jobs pre-encode the prompt once
   (`encode_prompt_once` → `prompt_embeds_kwargs`) instead of re-running the
   LLM-sized FLUX.2 encoders per image; LoRAs are fused after loading
