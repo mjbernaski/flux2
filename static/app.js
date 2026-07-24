@@ -136,7 +136,7 @@ function saveSwitchState() {
 // After a model switch: show the loading overlay and reload the page once the
 // server has gone down and come back up ready with the new model. (A reload
 // re-fetches /model-info so all capability toggles match the new backend.)
-function watchServerRestart(label) {
+function watchServerRestart(label, progress) {
     saveSwitchState();
     // The restarting server can't answer /status; this watcher's own /ready
     // poll takes over until the page reloads.
@@ -146,9 +146,14 @@ function watchServerRestart(label) {
     const statusEl = document.getElementById('loadingStatus');
     const elapsedEl = document.getElementById('loadingElapsed');
     const titleEl = document.getElementById('loadingTitle');
+    const progressEl = document.getElementById('loadingProgress');
     if (!overlay) { setTimeout(() => location.reload(), 5000); return; }
     overlay.classList.remove('error');
     if (titleEl) titleEl.textContent = 'Switching to ' + label + '…';
+    if (progressEl) {
+        progressEl.textContent = progress || '';
+        progressEl.style.display = progress ? '' : 'none';
+    }
     if (statusEl) statusEl.textContent = 'restarting server';
     if (elapsedEl) elapsedEl.textContent = '0s';
     overlay.style.display = 'flex';
@@ -2511,21 +2516,40 @@ if (loopAcceptBtn) loopAcceptBtn.addEventListener('click', function() {
     if (!section || !configsWrap || !startBtn || !cancelBtn || !statusEl || !rowsEl) return;
 
     let labels = {};          // config id (number) -> label
+    let selectAllCb = null;   // the "Select all" checkbox, once configs render
     let mrPollTimer = null;
     let mrFailCount = 0;      // consecutive /multi-run fetch failures
     let mrNextLabel = null;   // label of the config the server switches to next
+    let mrNextProgress = null; // "Model N of M" line for the restart overlay
     let mrActive = false;
+
+    // Position of config `cid` within the run, for the switching overlay:
+    // "Model 3 of 5 in this comparison run".
+    function runProgress(run, cid) {
+        if (!run || !run.configs) return null;
+        const idx = run.configs.indexOf(cid);
+        if (idx < 0) return null;
+        return 'Model ' + (idx + 1) + ' of ' + run.configs.length + ' in this comparison run';
+    }
 
     fetch('/configs', { headers: getAuthHeaders() })
         .then(function(r) { if (!r.ok) throw new Error(r.status); return r.json(); })
         .then(function(data) {
             if (!data.switchable || !data.configs) { section.style.display = 'none'; return; }
+            const allLab = document.createElement('label');
+            allLab.className = 'checkbox-label multi-run-select-all';
+            selectAllCb = document.createElement('input');
+            selectAllCb.type = 'checkbox';
+            allLab.appendChild(selectAllCb);
+            allLab.appendChild(document.createTextNode(' Select all'));
+            configsWrap.appendChild(allLab);
             data.configs.forEach(function(c) {
                 labels[c.id] = c.label;
                 const lab = document.createElement('label');
                 lab.className = 'checkbox-label';
                 const cb = document.createElement('input');
                 cb.type = 'checkbox';
+                cb.className = 'multi-run-cb';
                 cb.value = String(c.id);
                 lab.appendChild(cb);
                 lab.appendChild(document.createTextNode(
@@ -2535,11 +2559,22 @@ if (loopAcceptBtn) loopAcceptBtn.addEventListener('click', function() {
         })
         .catch(function() { section.style.display = 'none'; });
 
+    function configCheckboxes() {
+        return Array.from(configsWrap.querySelectorAll('input.multi-run-cb'));
+    }
     function selectedIds() {
-        return Array.from(configsWrap.querySelectorAll('input:checked'))
+        return configCheckboxes().filter(function(cb) { return cb.checked; })
             .map(function(cb) { return parseInt(cb.value, 10); });
     }
-    configsWrap.addEventListener('change', function() {
+    configsWrap.addEventListener('change', function(e) {
+        const boxes = configCheckboxes();
+        if (selectAllCb && e.target === selectAllCb) {
+            boxes.forEach(function(cb) { cb.checked = selectAllCb.checked; });
+        } else if (selectAllCb) {
+            const checked = boxes.filter(function(cb) { return cb.checked; }).length;
+            selectAllCb.checked = checked === boxes.length;
+            selectAllCb.indeterminate = checked > 0 && checked < boxes.length;
+        }
         startBtn.disabled = mrActive || selectedIds().length === 0;
     });
 
@@ -2574,6 +2609,7 @@ if (loopAcceptBtn) loopAcceptBtn.addEventListener('click', function() {
                 !run.results.some(function(r) { return r.config === c; });
         });
         mrNextLabel = pendingOther != null ? (labels[pendingOther] || ('config ' + pendingOther)) : null;
+        mrNextProgress = pendingOther != null ? runProgress(run, pendingOther) : null;
 
         if (mrActive) {
             const doneCount = run.results.length;
@@ -2659,7 +2695,8 @@ if (loopAcceptBtn) loopAcceptBtn.addEventListener('click', function() {
             if (data.active && data.next_config != null &&
                 data.next_config !== data.current_config) {
                 stopPolling();
-                watchServerRestart(labels[data.next_config] || ('config ' + data.next_config));
+                watchServerRestart(labels[data.next_config] || ('config ' + data.next_config),
+                                   runProgress(data.run, data.next_config));
                 return;
             }
             if (data.active) {
@@ -2674,7 +2711,7 @@ if (loopAcceptBtn) loopAcceptBtn.addEventListener('click', function() {
             mrFailCount += 1;
             if (mrFailCount >= 2) {
                 stopPolling();
-                watchServerRestart(mrNextLabel || 'next model');
+                watchServerRestart(mrNextLabel || 'next model', mrNextProgress);
             } else {
                 mrPollTimer = setTimeout(poll, 2000);
             }
@@ -2741,7 +2778,19 @@ if (loopAcceptBtn) loopAcceptBtn.addEventListener('click', function() {
             if (!data.run) return;
             if (content) content.style.display = 'block';
             render(data);
-            if (data.active) { mrFailCount = 0; mrPollTimer = setTimeout(poll, 2000); }
+            if (data.active) {
+                // If the page came up mid-run while a model is still loading,
+                // the plain "Loading model…" overlay is showing — give it the
+                // run's progress line too.
+                const progressEl = document.getElementById('loadingProgress');
+                const p = runProgress(data.run, data.current_config);
+                if (progressEl && p) {
+                    progressEl.textContent = p;
+                    progressEl.style.display = '';
+                }
+                mrFailCount = 0;
+                mrPollTimer = setTimeout(poll, 2000);
+            }
         })
         .catch(function() {});
 })();

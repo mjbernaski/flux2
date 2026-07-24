@@ -979,6 +979,11 @@ button:disabled {
     margin: 0;
     font-size: 22px;
 }
+.loading-overlay .loading-progress {
+    color: #00d4ff;
+    font-size: 14px;
+    margin-bottom: 4px;
+}
 .loading-overlay .loading-status {
     color: #aaa;
     font-size: 15px;
@@ -1145,6 +1150,12 @@ button:disabled {
     margin-bottom: 12px;
 }
 .multi-run-configs .checkbox-label { font-size: 13px; }
+.multi-run-configs .multi-run-select-all {
+    grid-column: 1 / -1;
+    padding-bottom: 4px;
+    border-bottom: 1px solid #333;
+    color: #aaa;
+}
 .mr-row {
     display: flex;
     align-items: center;
