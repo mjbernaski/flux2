@@ -9,6 +9,7 @@ import base64
 import io
 import socket
 import shutil
+import traceback
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
@@ -1905,6 +1906,7 @@ if __name__ == '__main__':
             _model_load_error = str(e)
             _model_load_status = "error"
             print(f"FATAL: model load failed: {e}")
+            traceback.print_exc()
 
     _model_load_start_ts = time.perf_counter()
     threading.Thread(target=_load_in_background, daemon=True).start()

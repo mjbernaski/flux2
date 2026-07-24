@@ -37,6 +37,42 @@ def _patched_load_file(filename, device="cpu"):
 
 safetensors.torch.load_file = _patched_load_file
 
+# transformers v5 passes extra kwargs (e.g. _is_hf_initialized, via the old
+# param's __dict__) when rebuilding bnb quantized params; bitsandbytes only
+# tolerates them from v0.50.0 (PR #1900). Mirror that fix until it releases.
+import bitsandbytes.nn as _bnb_nn
+
+def _bnb_accept_extra_kwargs(cls):
+    orig_new = cls.__new__
+    params = inspect.signature(orig_new).parameters
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return  # already fixed upstream
+    allowed = set(params) - {"cls"}
+
+    def patched_new(cls, *args, **kwargs):
+        return orig_new(cls, *args, **{k: v for k, v in kwargs.items() if k in allowed})
+
+    cls.__new__ = patched_new
+
+_bnb_accept_extra_kwargs(_bnb_nn.Params4bit)
+_bnb_accept_extra_kwargs(_bnb_nn.Int8Params)
+
+
+def _gpu_max_memory():
+    """Explicit accelerate memory budget: everything on GPU 0, no CPU offload.
+
+    On unified-memory systems torch.cuda.mem_get_info() mirrors the kernel's
+    *free* figure, which excludes reclaimable page cache. Streaming tens of GB
+    of weights off disk fills that cache, so by pipeline-assembly time
+    accelerate's auto placement (device_map="auto"/"balanced") believes the
+    GPU is full and silently offloads modules to CPU — leaving their params on
+    meta with dispatch hooks, which later breaks .to() and forward passes.
+    Memory is one physical pool here, so budget from total instead; if a
+    config genuinely doesn't fit, fail loudly rather than offload.
+    """
+    total = torch.cuda.mem_get_info()[1]
+    return {0: int(total * 0.97), "cpu": 0}
+
 # FLUX.1 classes
 from diffusers import FluxPipeline, FluxImg2ImgPipeline, FluxTransformer2DModel, FluxKontextPipeline
 # FLUX.2 classes (different architecture - img2img is built into Flux2Pipeline)
@@ -335,6 +371,7 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
         pipe = FluxKontextPipeline.from_pretrained(
             repo_id, transformer=transformer, text_encoder_2=text_encoder_2,
             torch_dtype=torch_dtype, device_map="balanced",
+            max_memory=_gpu_max_memory(),
         )
         load_timings['pipeline'] = time.perf_counter() - t0
         load_timings['to_device'] = 0  # Already on GPU via device_map
@@ -362,13 +399,13 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
         if local_encoder:
             pipe = FluxPipeline.from_pretrained(
                 repo_full, transformer=transformer, torch_dtype=torch_dtype,
-                device_map="balanced"
+                device_map="balanced", max_memory=_gpu_max_memory()
             )
         else:
             pipe = FluxPipeline.from_pretrained(
                 repo_full, transformer=transformer, text_encoder=None,
                 text_encoder_2=None, torch_dtype=torch_dtype,
-                device_map="balanced"
+                device_map="balanced", max_memory=_gpu_max_memory()
             )
         load_timings['pipeline'] = time.perf_counter() - t0
         load_timings['to_device'] = 0  # Already on GPU via device_map
@@ -424,7 +461,8 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
             t_trans = time.perf_counter()
             transformer = Flux2Transformer2DModel.from_pretrained(
                 repo_id, subfolder="transformer", torch_dtype=torch_dtype,
-                device_map="auto", low_cpu_mem_usage=True, use_safetensors=True
+                device_map="auto", max_memory=_gpu_max_memory(),
+                low_cpu_mem_usage=True, use_safetensors=True
             )
             load_timings['transformer'] = time.perf_counter() - t_trans
             print(f"    Transformer loaded in {load_timings['transformer']:.2f}s")
@@ -459,6 +497,7 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
                 text_encoder=text_encoder,
                 torch_dtype=torch_dtype,
                 device_map="balanced",
+                max_memory=_gpu_max_memory(),
                 use_safetensors=True,
             )
         else:
@@ -470,7 +509,8 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
                 # meta tensor errors (especially with schnell model)
                 return FluxTransformer2DModel.from_pretrained(
                     repo_id, subfolder="transformer", torch_dtype=torch_dtype,
-                    device_map="auto", use_safetensors=True
+                    device_map="auto", max_memory=_gpu_max_memory(),
+                    use_safetensors=True
                 )
 
             def load_text_encoder():
@@ -478,14 +518,16 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
                 # (causes meta tensor dispatch error). Use device_map="auto" instead.
                 return T5EncoderModel.from_pretrained(
                     repo_id, subfolder="text_encoder_2", torch_dtype=torch_dtype,
-                    device_map="auto", use_safetensors=True
+                    device_map="auto", max_memory=_gpu_max_memory(),
+                    use_safetensors=True
                 )
 
             def load_text_encoder_clip():
                 # CLIP is small enough to load directly to CUDA
                 return CLIPTextModel.from_pretrained(
                     repo_id, subfolder="text_encoder", torch_dtype=torch_dtype,
-                    device_map="auto", use_safetensors=True
+                    device_map="auto", max_memory=_gpu_max_memory(),
+                    use_safetensors=True
                 )
 
             # Load heavy components in parallel
@@ -513,6 +555,7 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
                 text_encoder_2=text_encoder_2,
                 torch_dtype=torch_dtype,
                 device_map="balanced",
+                max_memory=_gpu_max_memory(),
                 use_safetensors=True,
             )
 
@@ -557,12 +600,13 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
                 ).to(device)
                 pipe = Flux2Pipeline.from_pretrained(
                     repo_id, transformer=transformer, text_encoder=text_encoder,
-                    torch_dtype=torch_dtype, device_map="balanced"
+                    torch_dtype=torch_dtype, device_map="balanced",
+                    max_memory=_gpu_max_memory()
                 )
             else:
                 pipe = Flux2Pipeline.from_pretrained(
                     repo_id, transformer=transformer, text_encoder=None, torch_dtype=torch_dtype,
-                    device_map="balanced"
+                    device_map="balanced", max_memory=_gpu_max_memory()
                 )
         else:
             # FLUX.1 pipeline
@@ -579,12 +623,12 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
                 print("Loading local text encoders (this requires more VRAM)...")
                 pipe = FluxPipeline.from_pretrained(
                     repo_id, transformer=transformer, torch_dtype=torch_dtype,
-                    device_map="balanced"
+                    device_map="balanced", max_memory=_gpu_max_memory()
                 )
             else:
                 pipe = FluxPipeline.from_pretrained(
                     repo_id, transformer=transformer, text_encoder=None, torch_dtype=torch_dtype,
-                    device_map="balanced"
+                    device_map="balanced", max_memory=_gpu_max_memory()
                 )
         load_timings['pipeline'] = time.perf_counter() - t0
         load_timings['to_device'] = 0  # Already on GPU via device_map
