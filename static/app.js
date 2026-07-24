@@ -549,7 +549,7 @@ async function useAsReference(filename) {
     }
 }
 
-// Copy an image into the server-side .hidden subdir (preserves it from
+// Copy an image into the server-side .saved subdir (preserves it from
 // archive/delete-today). `el` is the clicked button; we reflect status on it.
 // Text-label buttons get a label swap; compact icon buttons just restyle.
 async function saveHidden(el, filename) {
@@ -566,7 +566,7 @@ async function saveHidden(el, filename) {
         if (body.success) {
             if (el) {
                 el.classList.remove('saving'); el.classList.add('saved');
-                if (labeled) el.textContent = '★ Saved'; else el.title = 'Saved to hidden';
+                if (labeled) el.textContent = '★ Saved'; else el.title = 'Saved';
             }
         } else {
             if (el) { el.classList.remove('saving'); if (labeled) el.textContent = original; }
@@ -1968,7 +1968,7 @@ async function loadHistory() {
             item.innerHTML = `
                 <img loading="lazy">
                 <button type="button" class="item-ref" title="Use as reference">↪</button>
-                <button type="button" class="item-save" title="Save to hidden">★</button>
+                <button type="button" class="item-save" title="Save (survives housekeeping)">★</button>
                 <button type="button" class="item-delete" title="Delete">X</button>
                 <div class="overlay">
                     <span class="time"></span>
@@ -2380,7 +2380,7 @@ async function runEditLoop() {
                 stripCard.className = 'loop-strip';
                 const title = document.createElement('div');
                 title.className = 'loop-card-title';
-                title.textContent = 'Film strip — input plus each edit in sequence (iterations preserved in .hidden)';
+                title.textContent = 'Film strip — input plus each edit in sequence (iterations preserved in .saved)';
                 const img = document.createElement('img');
                 img.src = '/images/' + body.filename;
                 img.alt = 'Edit loop film strip';

@@ -67,7 +67,20 @@ def sidecar_path(abs_image_path):
     return os.path.splitext(abs_image_path)[0] + ".prompt"
 
 
+def _is_image(name):
+    return (name not in SKIP_FILES and not name.startswith(SKIP_PREFIXES)
+            and name.lower().endswith(IMG_EXTS))
+
+
 def folder_tree(abs_dir, rel=""):
+    if os.path.basename(abs_dir) == ".hide":
+        # The hidden tree presents as a single folder: no children, and the
+        # count spans every subfolder (originals keep their subpaths inside
+        # .hide so unhide can restore them).
+        count = 0
+        for dirpath, _dirs, files in os.walk(abs_dir):
+            count += sum(1 for n in files if _is_image(n))
+        return {"rel": rel, "name": ".hide", "hidden": True, "count": count, "children": []}
     children = []
     try:
         for item in sorted(os.listdir(abs_dir), key=str.lower):
@@ -80,16 +93,14 @@ def folder_tree(abs_dir, rel=""):
     count = 0
     try:
         for name in os.listdir(abs_dir):
-            if name in SKIP_FILES or name.startswith(SKIP_PREFIXES):
-                continue
-            if name.lower().endswith(IMG_EXTS) and os.path.isfile(os.path.join(abs_dir, name)):
+            if _is_image(name) and os.path.isfile(os.path.join(abs_dir, name)):
                 count += 1
     except Exception:
         pass
     return {
         "rel": rel,
         "name": os.path.basename(abs_dir) if rel else "(root)",
-        "hidden": os.path.basename(abs_dir) == ".hide",
+        "hidden": False,
         "count": count,
         "children": children,
     }
@@ -130,12 +141,15 @@ def api_list():
         return jsonify({"error": "Invalid folder"}), 400
     items = []
     try:
-        for name in os.listdir(abs_dir):
-            if name in SKIP_FILES or name.startswith(SKIP_PREFIXES):
+        if ".hide" in [p for p in folder.replace("\\", "/").split("/") if p]:
+            # The hidden tree shows as one folder — list it recursively.
+            file_iter = ((dp, n) for dp, _dirs, files in os.walk(abs_dir) for n in files)
+        else:
+            file_iter = ((abs_dir, n) for n in os.listdir(abs_dir))
+        for parent, name in file_iter:
+            if not _is_image(name):
                 continue
-            if not name.lower().endswith(IMG_EXTS):
-                continue
-            full = os.path.join(abs_dir, name)
+            full = os.path.join(parent, name)
             if not os.path.isfile(full):
                 continue
             try:
@@ -245,24 +259,29 @@ def api_move():
 
 @app.route("/api/hide", methods=["POST"])
 def api_hide():
-    """Toggle hidden: move into (or out of) a .hide/ subfolder of the image's parent."""
+    """Toggle hidden: move into (or out of) the single .hide/ tree at ROOT.
+
+    The image's subfolder path is preserved inside .hide/ (archive/foo.png
+    hides to .hide/archive/foo.png), so unhide restores it to where it came
+    from. Unhide also accepts legacy per-folder locations like
+    archive/.hide/foo.png by dropping the .hide path component.
+    """
     body = request.get_json(silent=True) or {}
     rel = body.get("path", "")
     abs_path = safe_resolve(rel)
     if not abs_path or not os.path.isfile(abs_path):
         return jsonify({"success": False, "error": "File not found"}), 404
-    parent = os.path.dirname(abs_path)
-    name = os.path.basename(abs_path)
-    if os.path.basename(parent) == ".hide":
-        dst_dir = os.path.dirname(parent)
+    parts = rel_of(abs_path).split("/")
+    if ".hide" in parts:
+        parts.remove(".hide")
         action = "unhide"
     else:
-        dst_dir = os.path.join(parent, ".hide")
-        os.makedirs(dst_dir, exist_ok=True)
+        parts.insert(0, ".hide")
         action = "hide"
-    dst_abs = os.path.join(dst_dir, name)
+    dst_abs = os.path.join(ROOT, *parts)
     if os.path.exists(dst_abs):
-        return jsonify({"success": False, "error": f"Destination already has a file named {name}"}), 409
+        return jsonify({"success": False, "error": f"Destination already has a file named {parts[-1]}"}), 409
+    os.makedirs(os.path.dirname(dst_abs), exist_ok=True)
     try:
         shutil.move(abs_path, dst_abs)
         src_prompt = sidecar_path(abs_path)
@@ -365,6 +384,9 @@ HTML_PAGE = r"""<!doctype html>
   .card .actions button.danger:hover { background: var(--danger); border-color: var(--danger); }
   .card { position: relative; }
   .card.selected { outline: 2px solid var(--accent); outline-offset: -2px; }
+  #selRect { position: absolute; border: 1px solid var(--accent);
+             background: rgba(90,168,255,0.12); z-index: 50;
+             pointer-events: none; display: none; }
   .card .select-cb { position: absolute; top: 6px; left: 6px; width: 22px; height: 22px;
                      background: rgba(0,0,0,0.6); border: 1px solid var(--border);
                      border-radius: 4px; cursor: pointer; z-index: 2; user-select: none;
@@ -433,6 +455,7 @@ HTML_PAGE = r"""<!doctype html>
   <span id="count" class="muted"></span>
   <button id="selectAllBtn" title="Select all images in this folder">Select all</button>
   <span id="selCount" class="muted" style="display:none"></span>
+  <button id="bulkHideBtn" style="display:none">Hide selected</button>
   <button id="bulkDeleteBtn" class="danger" style="display:none">Delete selected</button>
   <button id="clearSelBtn" style="display:none">Clear</button>
   <span class="flex-grow"></span>
@@ -595,6 +618,9 @@ function updateSelectionUI() {
   $('#selCount').style.display = n ? 'inline' : 'none';
   $('#selCount').textContent = n ? `${n} selected` : '';
   $('#bulkDeleteBtn').style.display = n ? 'inline-block' : 'none';
+  $('#bulkHideBtn').style.display = n ? 'inline-block' : 'none';
+  $('#bulkHideBtn').textContent =
+    $('#folderSel').value.split('/').includes('.hide') ? 'Unhide selected' : 'Hide selected';
   $('#clearSelBtn').style.display = n ? 'inline-block' : 'none';
   $('#selectAllBtn').style.display = state.items.length ? 'inline-block' : 'none';
   $('#selectAllBtn').textContent =
@@ -694,6 +720,69 @@ async function quickHide(it) {
     refresh();
   } catch (e) { toast(e.message, true); }
 }
+
+// ---- Drag (rubber-band) selection ----
+(function setupDragSelect() {
+  const grid = $('#grid');
+  const rect = document.createElement('div');
+  rect.id = 'selRect';
+  document.body.appendChild(rect);
+  let anchor = null;        // drag start, page coords
+  let active = false;       // true once the pointer moved past the threshold
+  let baseSelected = null;  // selection at drag start (drag adds to it)
+
+  grid.addEventListener('mousedown', e => {
+    if (e.button !== 0) return;
+    if (e.target.closest('button') || e.target.closest('.select-cb')) return;
+    anchor = { x: e.pageX, y: e.pageY };
+    baseSelected = new Set(state.selected);
+    active = false;
+    e.preventDefault();  // stop native image drag / text selection
+  });
+
+  document.addEventListener('mousemove', e => {
+    if (!anchor) return;
+    if (!(e.buttons & 1)) {
+      // Button already released (e.g. mouseup happened outside the window):
+      // abandon the drag instead of letting it stick to the pointer.
+      anchor = null; active = false; baseSelected = null;
+      rect.style.display = 'none';
+      return;
+    }
+    if (!active && Math.hypot(e.pageX - anchor.x, e.pageY - anchor.y) < 6) return;
+    active = true;
+    const x1 = Math.min(anchor.x, e.pageX), x2 = Math.max(anchor.x, e.pageX);
+    const y1 = Math.min(anchor.y, e.pageY), y2 = Math.max(anchor.y, e.pageY);
+    Object.assign(rect.style, { display: 'block', left: x1 + 'px', top: y1 + 'px',
+                                width: (x2 - x1) + 'px', height: (y2 - y1) + 'px' });
+    state.selected = new Set(baseSelected);
+    for (const card of grid.children) {
+      const r = card.getBoundingClientRect();
+      const cx1 = r.left + scrollX, cy1 = r.top + scrollY;
+      if (cx1 < x2 && cx1 + r.width > x1 && cy1 < y2 && cy1 + r.height > y1)
+        state.selected.add(card.dataset.rel);
+      card.classList.toggle('selected', state.selected.has(card.dataset.rel));
+    }
+    updateSelectionUI();
+  });
+
+  document.addEventListener('mouseup', () => {
+    if (!anchor) return;
+    const wasDrag = active;
+    anchor = null; active = false; baseSelected = null;
+    rect.style.display = 'none';
+    if (wasDrag) suppressNextClick = true;  // don't open the modal under the cursor
+  });
+
+  let suppressNextClick = false;
+  document.addEventListener('click', e => {
+    if (suppressNextClick) {
+      suppressNextClick = false;
+      e.stopPropagation();
+      e.preventDefault();
+    }
+  }, true);
+})();
 
 // ---- Modal ----
 function openModal(it) {
@@ -867,7 +956,19 @@ $('#deleteBtn').addEventListener('click', async () => {
 
 $('#closeBtn').addEventListener('click', closeModal);
 $('#modal').addEventListener('click', e => { if (e.target.id === 'modal') closeModal(); });
-document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') { closeModal(); return; }
+  if ((e.key === 'ArrowLeft' || e.key === 'ArrowRight') && state.current) {
+    const tag = (e.target.tagName || '').toLowerCase();
+    if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
+    const idx = state.items.findIndex(it => it.rel === state.current.rel);
+    if (idx === -1) return;
+    const next = idx + (e.key === 'ArrowRight' ? 1 : -1);
+    if (next < 0 || next >= state.items.length) return;
+    e.preventDefault();
+    openModal(state.items[next]);
+  }
+});
 
 $('#folderSel').addEventListener('change', () => {
   state.selected.clear();
@@ -893,6 +994,31 @@ $('#clearSelBtn').addEventListener('click', () => {
   updateSelectionUI();
 });
 
+$('#bulkHideBtn').addEventListener('click', async () => {
+  const targets = state.items.filter(it => state.selected.has(it.rel));
+  if (targets.length === 0) return;
+  const btn = $('#bulkHideBtn');
+  btn.disabled = true;
+  const origLabel = btn.textContent;
+  const verb = origLabel.startsWith('Unhide') ? 'Unhiding' : 'Hiding';
+  let ok = 0, failed = 0, lastErr = '';
+  for (let i = 0; i < targets.length; i++) {
+    btn.textContent = `${verb} ${i + 1}/${targets.length}...`;
+    try {
+      await api('/api/hide', { method: 'POST', body: { path: targets[i].rel } });
+      state.selected.delete(targets[i].rel);
+      ok++;
+    } catch (e) { failed++; lastErr = e.message; }
+  }
+  btn.textContent = origLabel;
+  btn.disabled = false;
+  state.lastClickedRel = null;
+  state.selected.clear();
+  const done = verb === 'Hiding' ? 'Hid' : 'Unhid';
+  toast(failed ? `${done} ${ok}, ${failed} failed: ${lastErr}` : `${done} ${ok}`, failed > 0);
+  refresh();
+});
+
 $('#bulkDeleteBtn').addEventListener('click', async () => {
   const targets = state.items.filter(it => state.selected.has(it.rel));
   if (targets.length === 0) return;
@@ -912,6 +1038,7 @@ $('#bulkDeleteBtn').addEventListener('click', async () => {
   btn.textContent = origLabel;
   btn.disabled = false;
   state.lastClickedRel = null;
+  state.selected.clear();
   toast(failed ? `Deleted ${ok}, ${failed} failed: ${lastErr}` : `Deleted ${ok}`, failed > 0);
   refresh();
 });

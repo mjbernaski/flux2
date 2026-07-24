@@ -1664,7 +1664,7 @@ def _warm_critique_model():
 
 @app.route('/loop-strip', methods=['POST'])
 def loop_strip():
-    """Finish an edit-loop run: preserve every iteration image in `.hidden`
+    """Finish an edit-loop run: preserve every iteration image in `.saved`
     (so Archive/Delete Today don't remove them) and compose a film strip of
     the reference plus each edit in sequence, saved as a regular output so it
     appears in history."""
@@ -1688,17 +1688,17 @@ def loop_strip():
         except Exception:
             return jsonify({'success': False, 'error': 'ref_image is not a decodable base64 image'}), 400
 
-    hidden_dir = os.path.join(OUTPUT_DIR, '.hidden')
-    os.makedirs(hidden_dir, exist_ok=True)
+    saved_dir = os.path.join(OUTPUT_DIR, '.saved')
+    os.makedirs(saved_dir, exist_ok=True)
     for i, fn in enumerate(filenames, start=1):
         path = os.path.join(OUTPUT_DIR, fn)
         if not os.path.isfile(path):
             return jsonify({'success': False, 'error': f'unknown image {fn}'}), 404
         frames.append((str(i), Image.open(path).convert('RGB')))
-        shutil.copy2(path, os.path.join(hidden_dir, fn))
+        shutil.copy2(path, os.path.join(saved_dir, fn))
         sidecar = fn.rsplit('.', 1)[0] + '.prompt'
         if os.path.isfile(os.path.join(OUTPUT_DIR, sidecar)):
-            shutil.copy2(os.path.join(OUTPUT_DIR, sidecar), os.path.join(hidden_dir, sidecar))
+            shutil.copy2(os.path.join(OUTPUT_DIR, sidecar), os.path.join(saved_dir, sidecar))
 
     strip = build_film_strip(frames)
     strip_name = f"{_output_prefix()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_editloop_strip.png"
@@ -1710,8 +1710,8 @@ def loop_strip():
             p = prompts[i] if i < len(prompts) else ''
             f.write(f"# Iteration {i + 1}: {fn} — {p}\n")
     # The strip itself survives housekeeping too.
-    shutil.copy2(os.path.join(OUTPUT_DIR, strip_name), os.path.join(hidden_dir, strip_name))
-    shutil.copy2(sidecar_path, os.path.join(hidden_dir, os.path.basename(sidecar_path)))
+    shutil.copy2(os.path.join(OUTPUT_DIR, strip_name), os.path.join(saved_dir, strip_name))
+    shutil.copy2(sidecar_path, os.path.join(saved_dir, os.path.basename(sidecar_path)))
 
     return jsonify({'success': True, 'filename': strip_name, 'kept': filenames})
 
@@ -1811,9 +1811,9 @@ def delete_today():
 
 @app.route('/save-hidden', methods=['POST'])
 def save_hidden():
-    """Copy an image (and its .prompt sidecar) into a hidden subdir.
+    """Copy an image (and its .prompt sidecar) into the .saved subdir.
 
-    The `.hidden` dir lives inside OUTPUT_DIR but is excluded from listings,
+    The `.saved` dir lives inside OUTPUT_DIR but is excluded from listings,
     archiving, and delete-today (those only iterate top-level files), so saving
     an image here preserves it independently of the day's housekeeping.
     """
@@ -1826,14 +1826,14 @@ def save_hidden():
     if not os.path.isfile(src):
         return jsonify({'success': False, 'error': 'File not found'}), 404
 
-    hidden_dir = os.path.join(OUTPUT_DIR, '.hidden')
-    os.makedirs(hidden_dir, exist_ok=True)
+    saved_dir = os.path.join(OUTPUT_DIR, '.saved')
+    os.makedirs(saved_dir, exist_ok=True)
     try:
-        shutil.copy2(src, os.path.join(hidden_dir, target))
+        shutil.copy2(src, os.path.join(saved_dir, target))
         sidecar = target.rsplit('.', 1)[0] + '.prompt'
         src_sidecar = os.path.join(OUTPUT_DIR, sidecar)
         if os.path.isfile(src_sidecar):
-            shutil.copy2(src_sidecar, os.path.join(hidden_dir, sidecar))
+            shutil.copy2(src_sidecar, os.path.join(saved_dir, sidecar))
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
     return jsonify({'success': True, 'saved': target})

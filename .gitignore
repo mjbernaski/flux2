@@ -54,6 +54,7 @@ Thumbs.db
 # Runtime artifacts
 nohup.out
 server.log
+image_manager.log
 server.pid
 .next_config
 .multi_run.json
