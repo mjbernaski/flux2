@@ -6,7 +6,7 @@
     <meta name="theme-color" content="#1a1a2e">
     <title>flux</title>
     <script>document.title = window.location.hostname + ' flux';</script>
-    <link rel="stylesheet" href="/static/app.css">
+    <link rel="stylesheet" href="/static/app.css?v=3">
 </head>
 <body>
     <div class="loading-overlay" id="loadingOverlay">
@@ -115,8 +115,9 @@
                     </div>
                 </div>
                 <div class="url-import-row" id="urlImportRow">
-                    <input type="url" id="imageUrlInput" placeholder="…or paste an image URL (https://…)" autocomplete="off">
+                    <input type="text" id="imageUrlInput" placeholder="…or paste an image URL (https://…) or a server file path" autocomplete="off">
                     <button type="button" id="addUrlBtn">Add</button>
+                    <button type="button" id="browseArchiveBtn">Browse server files…</button>
                 </div>
                 <div class="multi-ref-hint" id="multiRefHint" style="display: none;">
                     Multiple references: FLUX.2 uses each image directly. The Kontext
@@ -423,6 +424,25 @@
         <div class="lightbox-caption" id="lightboxCaption"></div>
     </div>
 
+    <!-- Server file browser: navigate folders on the server's filesystem and
+         click a thumbnail to attach it as a reference image (goes through
+         the same /fetch-image-path path as typing a path into the URL
+         import row). Opens rooted at the archive folder. -->
+    <div class="archive-picker" id="archivePicker">
+        <div class="archive-picker-panel">
+            <div class="archive-picker-header">
+                <button type="button" class="archive-picker-up" id="archivePickerUp" title="Up one folder">&uarr;</button>
+                <div class="archive-picker-path" id="archivePickerPath"></div>
+                <button type="button" class="archive-picker-close" id="archivePickerClose">✕</button>
+            </div>
+            <div class="archive-picker-jump-row">
+                <input type="text" id="archivePickerJumpInput" placeholder="Jump to a folder path (absolute, ~, or relative to web-generated/)…" autocomplete="off">
+                <button type="button" id="archivePickerJumpBtn">Go</button>
+            </div>
+            <div class="archive-picker-grid" id="archivePickerGrid"></div>
+        </div>
+    </div>
+
     <div class="queue-panel" id="queuePanel" style="display: none;">
         <div class="queue-header">
             <h3>Queue</h3>
@@ -459,6 +479,6 @@
         <div class="history-grid" id="historyGrid"></div>
     </div>
 
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=3"></script>
 </body>
 </html>

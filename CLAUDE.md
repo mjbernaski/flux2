@@ -65,8 +65,10 @@ diffusers, transformers, flask, python-dotenv, huggingface_hub, requests.
   to `MAX_REFERENCE_IMAGES` (3). FLUX.2 pipelines take the list natively;
   Kontext stitches multiple refs side-by-side (`_stitch_references`) since its
   diffusers pipeline conditions on a single image; FLUX.1 img2img rejects >1.
-  The API field is `input_images` (list); legacy single `input_image` is
-  normalized into it at validation.
+  The API field is `input_images` (list); legacy single `input_image` and
+  `input_paths` (server-side file paths, resolved against `web-generated/`
+  when relative) are normalized into it at validation. `/fetch-image-path`
+  serves the UI's "server path → data URL" import (mirrors `/fetch-image-url`).
 - **Web queue**: one worker thread, `QUEUE_MAX_SIZE=10`, jobs carry progress
   state polled by the UI via `/status`. `/generate` validates all params at the
   API boundary and returns 400s.

@@ -469,7 +469,8 @@ BOOST_LEVELS = {
 
 
 def vlm_boost(model, prompt, family="flux2", model_desc="", level=3,
-              think=False, ollama_url="http://127.0.0.1:11434", variant=None):
+              think=False, ollama_url="http://127.0.0.1:11434", variant=None,
+              negative_prompt=None):
     """Rewrite the user's draft prompt into a stronger one tuned to the
     prompting idiom of the loaded image model (`family` picks the guidance;
     `model_desc` is the human-readable model name for context; `level` 1-5
@@ -478,8 +479,11 @@ def vlm_boost(model, prompt, family="flux2", model_desc="", level=3,
     `variant=(i, n)` marks this call as one of n independent rewrites of the
     same draft: the model is told to commit to a direction the other rewrites
     are unlikely to take, and sampling runs hot enough to actually diverge.
-    Text-only chat — no images. Returns the improved prompt string, or
-    None on any failure."""
+    `negative_prompt`, when set (SDXL), is what the user is already excluding
+    via CFG — the rewrite must not add positive-prompt detail that fights or
+    duplicates it (e.g. don't add "vibrant colors" when the negative prompt
+    says "oversaturated"). Text-only chat — no images. Returns the improved
+    prompt string, or None on any failure."""
     guidance = BOOST_GUIDANCE.get(family, BOOST_GUIDANCE["flux2"])
     degree, temperature = BOOST_LEVELS.get(level, BOOST_LEVELS[3])
     variant_line = ""
@@ -497,11 +501,21 @@ def vlm_boost(model, prompt, family="flux2", model_desc="", level=3,
         # Each variation is a separate call; sampling heat is the only thing
         # that separates them, and the level-1/2 temperatures are too cold.
         temperature = max(temperature, 0.7)
+    negative_line = ""
+    if negative_prompt:
+        negative_line = (
+            f"The user is separately excluding this via a negative prompt: "
+            f"\"{negative_prompt}\". Do not add positive-prompt detail that "
+            "fights or duplicates it — nothing that describes, however "
+            "positively framed, what the negative prompt is already ruling "
+            "out.\n"
+        )
     ask = (
         "You improve prompts for a local text-to-image system"
         + (f" currently running {model_desc}" if model_desc else "") + ".\n"
         f"{guidance}\n"
         f"The user's draft prompt: {prompt}\n"
+        f"{negative_line}"
         f"{variant_line}"
         "Rewrite it into a stronger prompt for this model. Preserve the "
         "user's intent and every explicit detail they gave (subjects, "

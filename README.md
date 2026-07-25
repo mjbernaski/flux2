@@ -66,6 +66,12 @@ output aspect ratio. How they're used depends on the model:
 Strength only applies to single-image FLUX.1 img2img; inpainting requires
 exactly one reference.
 
+References can come from an upload, a web URL, or a file already on the
+server: the UI's import box takes either an `https://` URL or a server file
+path (absolute, `~`-prefixed, or relative to `web-generated/`), and the JSON
+API accepts `input_paths` (a list of server paths) alongside `input_images`
+(base64) — paths are loaded server-side and count toward the same 3-image cap.
+
 ## Web frontend
 
 The UI is plain static files in `static/` (`index.html`, `app.css`, `app.js`)

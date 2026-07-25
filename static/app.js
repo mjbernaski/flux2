@@ -680,20 +680,23 @@ function handleRawFile(file) {
         .then(function() { syncRefUI(); }); // also restores the placeholder label
 }
 
-// Import a reference straight from a web URL. The server fetches it
-// (/fetch-image-url) so browser CORS restrictions don't apply, and returns a
-// JPEG data URL that then behaves like any uploaded reference.
-function addImageUrl(url) {
-    url = (url || '').trim();
-    if (!url) return;
+// Import a reference from either a web URL or a file path on the server's
+// own filesystem. URLs go through /fetch-image-url (server-side fetch, so
+// browser CORS restrictions don't apply); anything else is treated as a
+// server path and goes through /fetch-image-path (absolute, ~, or relative
+// to web-generated/). Both return a JPEG data URL that then behaves like any
+// uploaded reference.
+function addImageSource(value) {
+    value = (value || '').trim();
+    if (!value) return;
     if (currentInputImages.length >= MAX_REFERENCE_IMAGES) return;
-    if (!/^https?:\/\//i.test(url)) { alert('Enter an http(s) image URL.'); return; }
+    var isUrl = /^https?:\/\//i.test(value);
     var span = uploadPlaceholder ? uploadPlaceholder.querySelector('span') : null;
-    if (span) span.textContent = 'Fetching image from URL…';
-    fetch('/fetch-image-url', {
+    if (span) span.textContent = isUrl ? 'Fetching image from URL…' : 'Loading image from server path…';
+    fetch(isUrl ? '/fetch-image-url' : '/fetch-image-path', {
         method: 'POST',
         headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ url: url })
+        body: JSON.stringify(isUrl ? { url: value } : { path: value })
     })
         .then(function(res) {
             return res.json().catch(function() { return {}; }).then(function(data) {
@@ -703,9 +706,125 @@ function addImageUrl(url) {
                 if (input) input.value = '';
             });
         })
-        .catch(function(err) { alert('Could not fetch image URL: ' + err.message); })
+        .catch(function(err) {
+            alert((isUrl ? 'Could not fetch image URL: ' : 'Could not load server image: ') + err.message);
+        })
         .then(function() { syncRefUI(); }); // also restores the placeholder label
 }
+
+// Server file browser: navigate folders on the server's filesystem (starting
+// at the archive folder) and click a thumbnail to attach it as a reference,
+// instead of typing a path into the URL import row by hand. Thumbnails go
+// through /browse-thumb (authenticated — unlike /images/, it can read any
+// path on disk, so it can't be exempted from the API-key check) fetched as
+// a blob and turned into an object URL; those are revoked whenever the grid
+// is rebuilt or the picker closes so they don't leak.
+const archivePicker = document.getElementById('archivePicker');
+const archivePickerGrid = document.getElementById('archivePickerGrid');
+const archivePickerPath = document.getElementById('archivePickerPath');
+const archivePickerUp = document.getElementById('archivePickerUp');
+const archivePickerClose = document.getElementById('archivePickerClose');
+const archivePickerJumpInput = document.getElementById('archivePickerJumpInput');
+const archivePickerJumpBtn = document.getElementById('archivePickerJumpBtn');
+const browseArchiveBtn = document.getElementById('browseArchiveBtn');
+
+let archiveCurrentDir = 'archive';
+let archiveParentDir = null;
+let archiveThumbUrls = [];
+
+function revokeArchiveThumbUrls() {
+    archiveThumbUrls.forEach(function(u) { URL.revokeObjectURL(u); });
+    archiveThumbUrls = [];
+}
+
+function closeArchivePicker() {
+    if (archivePicker) archivePicker.classList.remove('visible');
+    revokeArchiveThumbUrls();
+}
+
+function loadArchiveThumb(img, path) {
+    fetch('/browse-thumb?path=' + encodeURIComponent(path), { headers: getAuthHeaders() })
+        .then(function(res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.blob(); })
+        .then(function(blob) {
+            const url = URL.createObjectURL(blob);
+            archiveThumbUrls.push(url);
+            img.src = url;
+        })
+        .catch(function() {});
+}
+
+function loadArchiveDir(dir) {
+    if (!archivePicker || !archivePickerGrid) return;
+    archivePickerGrid.innerHTML = '<div class="archive-picker-empty">Loading…</div>';
+    revokeArchiveThumbUrls();
+    fetch('/browse-files?dir=' + encodeURIComponent(dir), { headers: getAuthHeaders() })
+        .then(function(res) { return res.json().then(function(data) { return { ok: res.ok, data: data }; }); })
+        .then(function(r) {
+            if (!r.ok || !r.data.success) throw new Error((r.data && r.data.error) || 'could not list folder');
+            const data = r.data;
+            archiveCurrentDir = data.dir;
+            archiveParentDir = data.parent;
+            if (archivePickerPath) archivePickerPath.textContent = data.dir;
+            if (archivePickerUp) archivePickerUp.disabled = !data.parent;
+            const dirs = data.dirs || [], files = data.files || [];
+            archivePickerGrid.innerHTML = '';
+            if (!dirs.length && !files.length) {
+                archivePickerGrid.innerHTML = '<div class="archive-picker-empty">Empty folder.</div>';
+                return;
+            }
+            dirs.forEach(function(name) {
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'archive-picker-folder';
+                btn.title = name;
+                btn.innerHTML = '<span class="folder-icon">&#128193;</span><span class="folder-name"></span>';
+                btn.querySelector('.folder-name').textContent = name;
+                btn.addEventListener('click', function() { loadArchiveDir(data.dir + '/' + name); });
+                archivePickerGrid.appendChild(btn);
+            });
+            files.forEach(function(f) {
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'archive-picker-thumb';
+                btn.title = f.filename;
+                const img = document.createElement('img');
+                img.alt = f.filename;
+                const fullPath = data.dir + '/' + f.filename;
+                loadArchiveThumb(img, fullPath);
+                btn.appendChild(img);
+                btn.addEventListener('click', function() {
+                    addImageSource(fullPath);
+                    closeArchivePicker();
+                });
+                archivePickerGrid.appendChild(btn);
+            });
+        })
+        .catch(function(err) {
+            archivePickerGrid.innerHTML = '<div class="archive-picker-empty">Could not load folder: ' + err.message + '</div>';
+        });
+}
+
+function openArchivePicker() {
+    if (!archivePicker) return;
+    archivePicker.classList.add('visible');
+    loadArchiveDir(archiveCurrentDir);
+}
+
+if (browseArchiveBtn) browseArchiveBtn.addEventListener('click', openArchivePicker);
+if (archivePickerClose) archivePickerClose.addEventListener('click', closeArchivePicker);
+if (archivePickerUp) archivePickerUp.addEventListener('click', function() {
+    if (archiveParentDir) loadArchiveDir(archiveParentDir);
+});
+if (archivePickerJumpBtn) archivePickerJumpBtn.addEventListener('click', function() {
+    const v = archivePickerJumpInput ? archivePickerJumpInput.value.trim() : '';
+    if (v) loadArchiveDir(v);
+});
+if (archivePickerJumpInput) archivePickerJumpInput.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') { e.preventDefault(); archivePickerJumpBtn.click(); }
+});
+if (archivePicker) archivePicker.addEventListener('click', function(e) {
+    if (e.target === archivePicker) closeArchivePicker();
+});
 
 function handleImageFile(file) {
     if (currentInputImages.length >= MAX_REFERENCE_IMAGES) return;
@@ -844,6 +963,7 @@ async function runBoost() {
     const oldLabel = btn.textContent;
     btn.disabled = true;
     const level = levelEl ? parseInt(levelEl.value, 10) : 3;
+    const negativeEl = document.getElementById('negativePrompt');
     const prog = vlmStatusStart(btn, 'Boosting prompt (level ' + level + ')');
     try {
         const res = await fetch('/boost', {
@@ -853,7 +973,8 @@ async function runBoost() {
                 prompt: draft,
                 level: level,
                 think: thinkEl ? thinkEl.checked : false,
-                has_image: currentInputImages.length > 0
+                has_image: currentInputImages.length > 0,
+                negative_prompt: negativeEl && negativeEl.value.trim() ? negativeEl.value.trim() : null
             })
         });
         const submitted = await res.json().catch(() => ({}));
@@ -888,6 +1009,7 @@ async function runEvolveGenerate() {
     const levelEl = document.getElementById('boostLevel');
     const thinkEl = document.getElementById('boostThink');
     const countEl = document.getElementById('evolveCount');
+    const negativeEl = document.getElementById('negativePrompt');
     const base = (promptEl.value || '').trim();
     if (!base) { alert('Type a base prompt to evolve first.'); return; }
     const n = countEl ? parseInt(countEl.value, 10) : 4;
@@ -924,6 +1046,7 @@ async function runEvolveGenerate() {
                         level: levelEl ? parseInt(levelEl.value, 10) : 3,
                         think: thinkEl ? thinkEl.checked : false,
                         has_image: currentInputImages.length > 0,
+                        negative_prompt: negativeEl && negativeEl.value.trim() ? negativeEl.value.trim() : null,
                         variant_index: i + 1,
                         variant_count: n
                     })
@@ -982,16 +1105,16 @@ if (uploadArea) {
         }
         // An image dragged from another browser tab arrives as a URL, not a file.
         var uri = e.dataTransfer.getData('text/uri-list') || e.dataTransfer.getData('text/plain');
-        if (uri) addImageUrl(uri.split('\n')[0]);
+        if (uri) addImageSource(uri.split('\n')[0]);
     });
 }
 if (inputImage) inputImage.addEventListener('change', function(e) { addImageFiles(e.target.files); });
 
 const imageUrlInput = document.getElementById('imageUrlInput');
 const addUrlBtn = document.getElementById('addUrlBtn');
-if (addUrlBtn) addUrlBtn.addEventListener('click', function() { addImageUrl(imageUrlInput ? imageUrlInput.value : ''); });
+if (addUrlBtn) addUrlBtn.addEventListener('click', function() { addImageSource(imageUrlInput ? imageUrlInput.value : ''); });
 if (imageUrlInput) imageUrlInput.addEventListener('keydown', function(e) {
-    if (e.key === 'Enter') { e.preventDefault(); addImageUrl(imageUrlInput.value); }
+    if (e.key === 'Enter') { e.preventDefault(); addImageSource(imageUrlInput.value); }
 });
 
 // The save-each-frame toggle only means something while live previews are on

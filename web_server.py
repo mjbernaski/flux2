@@ -898,11 +898,25 @@ def _validate_generate_params(data):
     imgs = list(imgs or [])
     if not imgs and data.get('input_image'):
         imgs = [data['input_image']]
-    if len(imgs) > MAX_REFERENCE_IMAGES:
-        return f"at most {MAX_REFERENCE_IMAGES} reference images are supported"
     for i, b64 in enumerate(imgs):
         if not isinstance(b64, str) or not _decodable(b64):
             return f"input_images[{i}] is not a decodable base64 image"
+    # Server-side reference images: `input_paths` lists files already on this
+    # machine (absolute, ~-prefixed, or relative to web-generated/). They are
+    # loaded here and appended to input_images so the rest of the server only
+    # ever sees the base64 list.
+    paths = data.pop('input_paths', None)
+    if paths is not None and not isinstance(paths, list):
+        return "input_paths must be a list of server file paths"
+    for i, p in enumerate(paths or []):
+        if not isinstance(p, str):
+            return f"input_paths[{i}] must be a string"
+        image, perr = _load_server_image(p)
+        if perr:
+            return f"input_paths[{i}]: {perr}"
+        imgs.append(_image_to_data_url(image))
+    if len(imgs) > MAX_REFERENCE_IMAGES:
+        return f"at most {MAX_REFERENCE_IMAGES} reference images are supported"
     if len(imgs) > 1 and not (flux_core._kontext_enabled or flux_core._flux_version == 2):
         return ("multiple reference images require the Kontext editor or a "
                 "FLUX.2 server; this server's FLUX.1 img2img takes one image")
@@ -1112,7 +1126,7 @@ def multi_run_start():
     if bad:
         return jsonify({'success': False, 'error': f'unknown configs: {bad}'}), 400
 
-    if data.get('input_images') or data.get('input_image') or data.get('mask_image'):
+    if data.get('input_images') or data.get('input_image') or data.get('input_paths') or data.get('mask_image'):
         return jsonify({'success': False,
                         'error': 'multi-model runs are text-to-image only (remove reference images)'}), 400
     if data.get('negative_prompt'):
@@ -1558,6 +1572,118 @@ def fetch_image_url():
                     'width': image.width, 'height': image.height})
 
 
+def _load_server_image(raw_path):
+    """Open an image that already lives on this machine's filesystem for use
+    as a reference. Bare/relative paths resolve against OUTPUT_DIR; absolute
+    and ~-prefixed paths are used as-is (the global API-key check is what
+    gates this — the server owner reading their own disk). Returns
+    (PIL image, None) on success or (None, error string) on failure."""
+    path = os.path.expanduser(raw_path)
+    if not os.path.isabs(path):
+        path = os.path.join(OUTPUT_DIR, path)
+    if not os.path.isfile(path):
+        return None, f'no such file on the server: {path}'
+    if os.path.getsize(path) > MAX_URL_FETCH_BYTES:
+        return None, f'{path} exceeds the {MAX_URL_FETCH_BYTES // (1024 * 1024)}MB limit'
+    with open(path, 'rb') as f:
+        data = f.read()
+    try:
+        return Image.open(io.BytesIO(data)).convert('RGB'), None
+    except Exception:
+        try:
+            # A server path can point at a camera RAW file too.
+            return _raw_to_pil(data).convert('RGB'), None
+        except Exception:
+            print(f"load server image failed: {path!r}, {len(data)} bytes, header {data[:12].hex()}")
+            return None, f'{path} is not a decodable image ({len(data)} bytes, header {data[:12].hex()})'
+
+
+def _image_to_data_url(image):
+    """Bound a reference image to MAX_RAW_EDGE and encode it as a JPEG data
+    URL, matching what /convert-raw and /fetch-image-url return."""
+    image.thumbnail((MAX_RAW_EDGE, MAX_RAW_EDGE), Image.LANCZOS)
+    buf = io.BytesIO()
+    image.save(buf, format='JPEG', quality=92)
+    return 'data:image/jpeg;base64,' + base64.b64encode(buf.getvalue()).decode('ascii')
+
+
+@app.route('/fetch-image-path', methods=['POST'])
+def fetch_image_path():
+    """Load an image from the server's own filesystem and return it as a JPEG
+    data URL for use as a reference image. JSON body: {"path": "..."} —
+    absolute, ~-prefixed, or relative to web-generated/. Response shape
+    matches /convert-raw and /fetch-image-url."""
+    payload = request.get_json(silent=True) or {}
+    raw_path = (payload.get('path') or '').strip()
+    if not raw_path:
+        return jsonify({'success': False, 'error': 'path is required'}), 400
+    image, err = _load_server_image(raw_path)
+    if err:
+        return jsonify({'success': False, 'error': err}), 400
+    data_url = _image_to_data_url(image)
+    return jsonify({'success': True, 'image': data_url,
+                    'width': image.width, 'height': image.height})
+
+
+@app.route('/browse-files')
+def browse_files():
+    """List subfolders and displayable images in a directory on this
+    machine's filesystem, for the reference-image picker's folder browser.
+    `dir` query param resolves the same way /fetch-image-path resolves a
+    reference path: relative to OUTPUT_DIR, or used as-is if absolute/~
+    (the API-key check is what gates this — the server owner browsing their
+    own disk). Defaults to the archive folder. Returns the resolved absolute
+    `dir` plus its `parent` (null at filesystem root) so the client can
+    navigate up/down without doing its own path arithmetic."""
+    raw_dir = (request.args.get('dir') or 'archive').strip() or 'archive'
+    path = os.path.expanduser(raw_dir)
+    if not os.path.isabs(path):
+        path = os.path.join(OUTPUT_DIR, path)
+    # Always return an absolute dir: the client round-trips it verbatim for
+    # "up" navigation and thumbnail paths, and a relative value here would
+    # get OUTPUT_DIR joined onto it a second time on the next request.
+    path = os.path.abspath(path)
+    if not os.path.isdir(path):
+        return jsonify({'success': False, 'error': f'no such directory on the server: {path}'}), 400
+    exts = ('.png', '.jpg', '.jpeg', '.webp')
+    dirs, files = [], []
+    try:
+        for entry in os.scandir(path):
+            if entry.name.startswith('.'):
+                continue
+            if entry.is_dir():
+                dirs.append(entry.name)
+            elif entry.is_file() and entry.name.lower().endswith(exts):
+                files.append({'filename': entry.name, 'mtime': entry.stat().st_mtime})
+    except PermissionError:
+        return jsonify({'success': False, 'error': f'permission denied: {path}'}), 400
+    dirs.sort(key=str.lower)
+    files.sort(key=lambda f: f['mtime'], reverse=True)
+    for f in files:
+        del f['mtime']
+    parent = os.path.dirname(path) if os.path.dirname(path) != path else None
+    return jsonify({'success': True, 'dir': path, 'parent': parent, 'dirs': dirs, 'files': files})
+
+
+@app.route('/browse-thumb')
+def browse_thumb():
+    """Small JPEG thumbnail for an image anywhere on this machine's
+    filesystem, for the /browse-files picker grid. Unlike /images/<path>
+    (exempt from auth, restricted to OUTPUT_DIR by send_from_directory),
+    this can read any path _load_server_image can reach, so — unlike
+    /images/ — it stays behind the normal API-key check."""
+    raw_path = (request.args.get('path') or '').strip()
+    if not raw_path:
+        return '', 400
+    image, err = _load_server_image(raw_path)
+    if err:
+        return '', 404
+    image.thumbnail((240, 240), Image.LANCZOS)
+    buf = io.BytesIO()
+    image.save(buf, format='JPEG', quality=80)
+    return Response(buf.getvalue(), mimetype='image/jpeg')
+
+
 def _boost_family(has_image=False):
     """Prompting idiom of the loaded backend, keying edit_loop.BOOST_GUIDANCE.
     With reference image(s) attached the idiom shifts: FLUX.2 and Kontext
@@ -1573,12 +1699,13 @@ def _boost_family(has_image=False):
     return 'flux1-img2img' if has_image else 'flux1'
 
 
-def _run_boost(cid, model, prompt, family, model_desc, level, think, variant=None):
+def _run_boost(cid, model, prompt, family, model_desc, level, think, variant=None,
+               negative_prompt=None):
     from edit_loop import vlm_boost
     try:
         boosted = vlm_boost(model, prompt, family=family, model_desc=model_desc,
                             level=level, think=think, variant=variant,
-                            ollama_url=OLLAMA_URL)
+                            negative_prompt=negative_prompt, ollama_url=OLLAMA_URL)
         if boosted:
             payload = {'success': True, 'prompt': boosted}
         else:
@@ -1598,10 +1725,13 @@ def boost():
     references are attached), via the local ollama model. `level` 1-5 sets
     how far the rewrite may depart from the draft (1 = polish wording only,
     5 = reimagine boldly); `think` (default false) enables the VLM's
-    thinking phase — deeper but much slower. Optional `variant_index` +
-    `variant_count` mark this as one of N independent rewrites of the same
-    draft (the evolve feature): the VLM is pushed toward a direction the
-    other rewrites are unlikely to take. Returns a boost_id immediately;
+    thinking phase — deeper but much slower. Optional `negative_prompt`
+    (SDXL) is passed through so the rewrite doesn't add detail that fights
+    or duplicates what's already being excluded via CFG. Optional
+    `variant_index` + `variant_count` mark this as one of N independent
+    rewrites of the same draft (the evolve feature): the VLM is pushed
+    toward a direction the other rewrites are unlikely to take. Returns a
+    boost_id immediately;
     poll GET /boost/<id> for the improved prompt."""
     data = request.json or {}
     prompt = (data.get('prompt') or '').strip()
@@ -1628,8 +1758,9 @@ def boost():
     has_image = bool(data.get('has_image'))
     think = bool(data.get('think', False))
     model = data.get('model') or CRITIQUE_MODEL
+    negative_prompt = (data.get('negative_prompt') or '').strip() or None
     cid = _vlm_job_start(_run_boost, model, prompt, _boost_family(has_image),
-                         _model_type_string(), level, think, variant)
+                         _model_type_string(), level, think, variant, negative_prompt)
     return jsonify({'success': True, 'boost_id': cid})
 
 
