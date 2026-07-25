@@ -982,6 +982,7 @@ async function runBoost() {
         const data = await pollVlmJob('/boost/' + submitted.boost_id, null,
                                       function() { prog.tick(); });
         if (data.prompt) promptEl.value = data.prompt;
+        if (data.negative_prompt && negativeEl) negativeEl.value = data.negative_prompt;
         if (status && statusText) {
             status.className = 'status generating';
             statusText.textContent = 'Prompt boosted in ' + prog.elapsed() + '.';
@@ -1056,10 +1057,12 @@ async function runEvolveGenerate() {
                 const data = await pollVlmJob('/boost/' + submitted.boost_id, null, tick);
                 if (!data.prompt) throw new Error('boost returned no prompt');
                 evolved += 1; tick();
+                const overrides = { prompt: data.prompt };
+                if (data.negative_prompt) overrides.negative_prompt = data.negative_prompt;
                 const gres = await fetch('/generate', {
                     method: 'POST',
                     headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
-                    body: JSON.stringify(Object.assign({}, built.formData, { prompt: data.prompt }))
+                    body: JSON.stringify(Object.assign({}, built.formData, overrides))
                 });
                 const gdata = await gres.json().catch(() => ({}));
                 if (!gres.ok || !gdata.success) throw new Error(gdata.error || `HTTP ${gres.status}`);

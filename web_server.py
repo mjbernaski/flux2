@@ -1707,7 +1707,8 @@ def _run_boost(cid, model, prompt, family, model_desc, level, think, variant=Non
                             level=level, think=think, variant=variant,
                             negative_prompt=negative_prompt, ollama_url=OLLAMA_URL)
         if boosted:
-            payload = {'success': True, 'prompt': boosted}
+            payload = {'success': True, 'prompt': boosted['prompt'],
+                       'negative_prompt': boosted.get('negative_prompt')}
         else:
             payload = {'success': False,
                        'error': 'vision model unavailable or returned no rewrite'}
@@ -1726,13 +1727,13 @@ def boost():
     how far the rewrite may depart from the draft (1 = polish wording only,
     5 = reimagine boldly); `think` (default false) enables the VLM's
     thinking phase — deeper but much slower. Optional `negative_prompt`
-    (SDXL) is passed through so the rewrite doesn't add detail that fights
-    or duplicates what's already being excluded via CFG. Optional
-    `variant_index` + `variant_count` mark this as one of N independent
-    rewrites of the same draft (the evolve feature): the VLM is pushed
-    toward a direction the other rewrites are unlikely to take. Returns a
-    boost_id immediately;
-    poll GET /boost/<id> for the improved prompt."""
+    (SDXL) is rewritten alongside the positive prompt in the same call, so
+    the pair stays consistent — the poll response then carries both `prompt`
+    and `negative_prompt`. Optional `variant_index` + `variant_count` mark
+    this as one of N independent rewrites of the same draft (the evolve
+    feature): the VLM is pushed toward a direction the other rewrites are
+    unlikely to take. Returns a boost_id immediately;
+    poll GET /boost/<id> for the improved prompt (+ negative_prompt)."""
     data = request.json or {}
     prompt = (data.get('prompt') or '').strip()
     if not prompt:

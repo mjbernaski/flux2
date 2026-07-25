@@ -30,6 +30,7 @@ import base64
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -310,6 +311,20 @@ DESCRIBE_SCHEMA = {
     "required": ["prompt"],
 }
 
+# Structured-output schema for /boost when a negative prompt is also being
+# rewritten: both fields come back from the same call so the pair stays
+# consistent (the negative rewrite can react to what actually landed in the
+# positive rewrite, and vice versa) instead of two independent calls that
+# might contradict each other.
+BOOST_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "prompt": {"type": "string"},
+        "negative_prompt": {"type": "string"},
+    },
+    "required": ["prompt", "negative_prompt"],
+}
+
 
 def _prompt_from_reply(text):
     """Extract the prompt from a DESCRIBE_SCHEMA-formatted reply. With think
@@ -322,6 +337,38 @@ def _prompt_from_reply(text):
         return str(parsed).strip()
     except json.JSONDecodeError:
         return text.strip()
+
+
+# Matches the plain-text shape think-disabled models fall back to instead of
+# BOOST_SCHEMA's JSON: a "prompt"-ish label, then a "negative_prompt"-ish
+# label, each followed by its text, on separate lines.
+_BOOST_TEXT_RE = re.compile(
+    r"(?is)^\**(?:positive[_ ]?prompt|prompt)\**\s*:\s*(.*?)\s*\n+\s*"
+    r"\**negative[_ ]?prompt\**\s*:\s*(.*)$"
+)
+
+
+def _boost_from_reply(text, want_negative):
+    """Extract prompt (+ negative_prompt when `want_negative`) from a
+    BOOST_SCHEMA/DESCRIBE_SCHEMA-formatted reply. With think disabled,
+    qwen3.6 ignores the format schema and returns plain text instead of
+    JSON — for the single-field case that plain text IS the prompt, but
+    once a negative_prompt is also requested the model instead labels both
+    fields inline (e.g. "prompt: ...\\nnegative_prompt: ..."), so that shape
+    needs its own split rather than being swallowed whole as the prompt."""
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            prompt = (parsed.get("prompt") or "").strip()
+            negative = (parsed.get("negative_prompt") or "").strip() if want_negative else ""
+            return prompt, (negative or None)
+    except json.JSONDecodeError:
+        pass
+    if want_negative:
+        m = _BOOST_TEXT_RE.match(text.strip())
+        if m:
+            return m.group(1).strip(), (m.group(2).strip() or None)
+    return text.strip(), None
 
 
 def vlm_describe(model, image, think=False, ollama_url="http://127.0.0.1:11434"):
@@ -480,10 +527,11 @@ def vlm_boost(model, prompt, family="flux2", model_desc="", level=3,
     same draft: the model is told to commit to a direction the other rewrites
     are unlikely to take, and sampling runs hot enough to actually diverge.
     `negative_prompt`, when set (SDXL), is what the user is already excluding
-    via CFG — the rewrite must not add positive-prompt detail that fights or
-    duplicates it (e.g. don't add "vibrant colors" when the negative prompt
-    says "oversaturated"). Text-only chat — no images. Returns the improved
-    prompt string, or None on any failure."""
+    via CFG — it gets rewritten alongside the positive prompt in the same
+    call, so the pair stays consistent: the positive rewrite must not add
+    detail that fights or duplicates the (possibly also-tightened) negative
+    exclusions. Text-only chat — no images. Returns {"prompt": str,
+    "negative_prompt": str or None} on success, or None on any failure."""
     guidance = BOOST_GUIDANCE.get(family, BOOST_GUIDANCE["flux2"])
     degree, temperature = BOOST_LEVELS.get(level, BOOST_LEVELS[3])
     variant_line = ""
@@ -505,10 +553,14 @@ def vlm_boost(model, prompt, family="flux2", model_desc="", level=3,
     if negative_prompt:
         negative_line = (
             f"The user is separately excluding this via a negative prompt: "
-            f"\"{negative_prompt}\". Do not add positive-prompt detail that "
-            "fights or duplicates it — nothing that describes, however "
-            "positively framed, what the negative prompt is already ruling "
-            "out.\n"
+            f"\"{negative_prompt}\". Rewrite it too, in the same reply: tighten "
+            "wording and add standard quality-exclusion terms where they fit "
+            "(e.g. low quality, blurry, deformed, watermark) without dropping "
+            "any of the user's specific exclusions. The positive prompt must "
+            "not add detail that fights or duplicates the negative prompt "
+            "(don't describe, however positively framed, what the negative "
+            "prompt rules out), and the negative prompt must not exclude "
+            "anything the positive prompt now explicitly asks for.\n"
         )
     ask = (
         "You improve prompts for a local text-to-image system"
@@ -523,22 +575,23 @@ def vlm_boost(model, prompt, family="flux2", model_desc="", level=3,
         f"Degree of rewrite: {degree} "
         "Where the degree conflicts with the style guidance above (e.g. on "
         "length or how much to add), the degree wins. "
-        "Reply with the improved prompt only."
+        + ("Reply with the improved prompt and negative_prompt."
+           if negative_prompt else "Reply with the improved prompt only.")
     )
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": ask}],
         "stream": False,
         "think": bool(think),
-        "format": DESCRIBE_SCHEMA,
+        "format": BOOST_SCHEMA if negative_prompt else DESCRIBE_SCHEMA,
         "keep_alive": "15m",
         "options": {"temperature": temperature, "num_ctx": 8192},
     }
     try:
         text = _chat_text(ollama_url, payload)
-        boosted = _prompt_from_reply(text)
+        boosted, boosted_negative = _boost_from_reply(text, bool(negative_prompt))
         if boosted:
-            return boosted
+            return {"prompt": boosted, "negative_prompt": boosted_negative}
         print(f"  (VLM boost reply missing prompt: {text[:200]})")
     except Exception as e:
         print(f"  (VLM boost unavailable: {e})")
