@@ -339,36 +339,62 @@ def _prompt_from_reply(text):
         return text.strip()
 
 
-# Matches the plain-text shape think-disabled models fall back to instead of
-# BOOST_SCHEMA's JSON: a "prompt"-ish label, then a "negative_prompt"-ish
-# label, each followed by its text, on separate lines.
-_BOOST_TEXT_RE = re.compile(
-    r"(?is)^\**(?:positive[_ ]?prompt|prompt)\**\s*:\s*(.*?)\s*\n+\s*"
-    r"\**negative[_ ]?prompt\**\s*:\s*(.*)$"
-)
+# Match a "negative_prompt"/"positive_prompt" label ONLY as a line of its own
+# (optionally indented/bolded, with or without a colon) — think-disabled
+# models fall back to labeling both fields in plain text instead of
+# BOOST_SCHEMA's JSON, in shapes ranging from inline ("negative_prompt: ...")
+# to a markdown header ("**Negative Prompt**" alone on its own line).
+# Anchoring to the start of a line (not just "the words 'negative prompt'
+# appear somewhere") matters: a think-disabled model occasionally leaks its
+# reasoning as plain prose before the actual answer, and prose sentences that
+# merely discuss "the negative prompt" mid-sentence must NOT be mistaken for
+# the label.
+_NEGATIVE_LABEL_RE = re.compile(r"(?im)^[ \t]*\**\s*negative[_ ]?prompts?\**\s*:?\s*\**\s*[ \t]*\n*")
+_POSITIVE_LABEL_LINE_RE = re.compile(r"(?im)^[ \t]*\**\s*(?:positive[_ ]?prompts?|prompt)\**\s*:?\s*\**\s*[ \t]*\n*")
+
+
+def _strip_last_label(region, label_re):
+    """Drop everything up through the LAST line-anchored label match in
+    `region` (reasoning-leak replies can restate "Revised negative prompt:"
+    scratch work before the real final label, so the last match — closest to
+    the end — is the answer, not the first)."""
+    matches = list(label_re.finditer(region))
+    if matches:
+        return region[matches[-1].end():].strip()
+    return region.strip()
 
 
 def _boost_from_reply(text, want_negative):
     """Extract prompt (+ negative_prompt when `want_negative`) from a
     BOOST_SCHEMA/DESCRIBE_SCHEMA-formatted reply. With think disabled,
-    qwen3.6 ignores the format schema and returns plain text instead of
-    JSON — for the single-field case that plain text IS the prompt, but
+    qwen3.6 ignores the format schema and returns labeled plain text instead
+    of JSON — for the single-field case that plain text IS the prompt, but
     once a negative_prompt is also requested the model instead labels both
-    fields inline (e.g. "prompt: ...\\nnegative_prompt: ..."), so that shape
-    needs its own split rather than being swallowed whole as the prompt."""
+    fields, in a shape that varies enough that matching the whole reply
+    rigidly misses cases and silently dumps the negative-prompt text (or
+    stray reasoning) into the prompt field instead. Splitting on the last
+    negative-prompt label line is more robust: anything before it is the
+    prompt (itself trimmed back to its own last positive-prompt label, if
+    any), anything after is the negative prompt."""
     try:
         parsed = json.loads(text)
         if isinstance(parsed, dict):
             prompt = (parsed.get("prompt") or "").strip()
             negative = (parsed.get("negative_prompt") or "").strip() if want_negative else ""
-            return prompt, (negative or None)
+            if prompt:
+                return prompt, (negative or None)
     except json.JSONDecodeError:
         pass
+    text = text.strip()
     if want_negative:
-        m = _BOOST_TEXT_RE.match(text.strip())
-        if m:
-            return m.group(1).strip(), (m.group(2).strip() or None)
-    return text.strip(), None
+        neg_matches = list(_NEGATIVE_LABEL_RE.finditer(text))
+        if neg_matches:
+            m = neg_matches[-1]
+            prompt_part = _strip_last_label(text[:m.start()], _POSITIVE_LABEL_LINE_RE)
+            negative_part = text[m.end():].strip()
+            if prompt_part:
+                return prompt_part, (negative_part or None)
+    return _strip_last_label(text, _POSITIVE_LABEL_LINE_RE), None
 
 
 def vlm_describe(model, image, think=False, ollama_url="http://127.0.0.1:11434"):
@@ -591,11 +617,33 @@ def vlm_boost(model, prompt, family="flux2", model_desc="", level=3,
         text = _chat_text(ollama_url, payload)
         boosted, boosted_negative = _boost_from_reply(text, bool(negative_prompt))
         if boosted:
+            if negative_prompt:
+                boosted = _drop_negative_terms(boosted, negative_prompt)
             return {"prompt": boosted, "negative_prompt": boosted_negative}
         print(f"  (VLM boost reply missing prompt: {text[:200]})")
     except Exception as e:
         print(f"  (VLM boost unavailable: {e})")
     return None
+
+
+def _drop_negative_terms(prompt, negative_prompt):
+    """Backstop for when the rewriting VLM ignores the instruction not to
+    restate what the negative prompt excludes: drop any comma-separated
+    segment of `prompt` that contains one of the user's own excluded terms
+    as a substring (case-insensitive, so it also catches compounds like
+    "longsword" against the excluded term "sword"). Matches against the
+    user's original negative_prompt, not the VLM's expanded rewrite of it —
+    the generic quality terms the VLM tends to add there (blurry, deformed)
+    aren't worth risking a false-positive match against unrelated positive
+    detail. Falls back to the unfiltered prompt if every segment matched
+    (near-certainly a bad match, not a genuinely empty result)."""
+    terms = [t.strip().lower() for t in negative_prompt.split(",") if t.strip()]
+    if not terms:
+        return prompt
+    kept = [seg for seg in prompt.split(",")
+            if not any(term in seg.lower() for term in terms)]
+    filtered = ", ".join(seg.strip() for seg in kept if seg.strip())
+    return filtered if filtered else prompt
 
 
 def _label_font(size):
