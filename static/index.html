@@ -26,6 +26,7 @@
         <span class="hostname" id="hostname"></span>
         <span class="vlm-badge" id="vlmBadge" style="display: none;"></span>
         <span class="version" id="version"></span>
+        <a href="/alternate" style="font-size: 12px; color: #888; text-decoration: none; border: 1px solid #333; border-radius: 4px; padding: 4px 10px;" title="Denser sidebar + main dashboard layout">&#9776; Dense view</a>
     </div>
     <h1>FLUX Image Generator</h1>
     <!-- Model name intentionally not displayed; /model-info still drives
@@ -191,6 +192,8 @@
             <div class="form-group">
                 <label for="size">Size</label>
                 <select id="size" name="size">
+                    <option value="0.25mp">0.25 MP</option>
+                    <option value="0.5mp">0.5 MP</option>
                     <option value="0.75mp">0.75 MP</option>
                     <option value="1mp" selected>1 MP</option>
                     <option value="2mp">2 MP</option>

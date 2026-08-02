@@ -84,7 +84,7 @@ def require_auth():
     # Allow the main page, images, and the readiness probe to load without auth.
     # Images are served with random filenames which provides basic security;
     # /ready must be reachable before the user can enter their API key.
-    if request.endpoint in ['index', 'static', 'serve_image', 'ready']:
+    if request.endpoint in ['index', 'alternate', 'static', 'serve_image', 'ready']:
         return
 
     if not check_auth():
@@ -310,6 +310,8 @@ ORIENTATIONS_1K = {
 }
 
 SIZES = {
+    '0.25mp': 0.25,
+    '0.5mp': 0.5,
     '0.75mp': 0.75,
     '1mp': 1.0,
     '2mp': 2.0,
@@ -814,6 +816,14 @@ def _multi_run_advance():
 @app.route('/')
 def index():
     return app.send_static_file('index.html')
+
+
+@app.route('/alternate')
+def alternate():
+    # Same functionality as '/', a denser sidebar+main dashboard layout
+    # instead of one long scrolling form. Shares app.js/app.css unchanged;
+    # see static/alternate.css for the layout-only overrides.
+    return app.send_static_file('alternate.html')
 
 
 @app.route('/ready')
