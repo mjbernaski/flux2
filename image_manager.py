@@ -521,7 +521,9 @@ HTML_PAGE = r"""<!doctype html>
 <script>
 const $ = sel => document.querySelector(sel);
 const state = {
-  folders: [],       // flat folder list
+  folders: [],       // flat folder list (visible subset, filtered by altHeld)
+  allFolders: [],    // flat folder list, unfiltered (includes .hide)
+  altHeld: false,    // Option/Alt key currently held — reveals the .hide folder
   items: [],         // current folder images
   current: null,     // selected image item
   naturalSize: null, // {w,h} of current image
@@ -581,14 +583,24 @@ function imgUrl(rel, thumb=false) {
 
 async function loadFolders() {
   const data = await api('/api/folders');
-  state.folders = data.flat;
+  state.allFolders = data.flat;
+  renderFolderOptions();
+}
+
+function visibleFolders() {
+  return state.altHeld ? state.allFolders : state.allFolders.filter(f => !f.hidden);
+}
+
+function renderFolderOptions() {
+  const visible = visibleFolders();
+  state.folders = visible;
   const sel = $('#folderSel');
   const move = $('#moveSel');
   const prevSel = sel.value;
   const prevMove = move.value;
   sel.innerHTML = '';
   move.innerHTML = '';
-  for (const f of data.flat) {
+  for (const f of visible) {
     const opt = document.createElement('option');
     opt.value = f.rel;
     opt.textContent = f.label + (f.hidden ? '  [hidden]' : '');
@@ -596,8 +608,33 @@ async function loadFolders() {
     const opt2 = opt.cloneNode(true);
     move.appendChild(opt2);
   }
-  if (prevSel && data.flat.some(f => f.rel === prevSel)) sel.value = prevSel;
-  if (prevMove && data.flat.some(f => f.rel === prevMove)) move.value = prevMove;
+  if (prevSel && visible.some(f => f.rel === prevSel)) sel.value = prevSel;
+  if (prevMove && visible.some(f => f.rel === prevMove)) move.value = prevMove;
+}
+
+// Hold Option (Alt) to reveal the .hide folder in the folder dropdowns.
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Alt' || state.altHeld) return;
+  state.altHeld = true;
+  renderFolderOptions();
+});
+document.addEventListener('keyup', e => {
+  if (e.key !== 'Alt' || !state.altHeld) return;
+  releaseAltHeld();
+});
+window.addEventListener('blur', () => {
+  if (state.altHeld) releaseAltHeld();
+});
+
+function releaseAltHeld() {
+  state.altHeld = false;
+  const sel = $('#folderSel');
+  const wasHidden = sel.value.split('/').includes('.hide');
+  renderFolderOptions();
+  if (wasHidden) {
+    sel.value = '';
+    loadList('').catch(e => toast(e.message, true));
+  }
 }
 
 async function loadList(folder) {
