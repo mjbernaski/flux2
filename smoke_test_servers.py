@@ -12,7 +12,7 @@ elapsed time) / pass / fail. When the sweep finishes the page becomes a static
 report.
 
 Usage:
-    python smoke_test_servers.py                # test all 12 menu options
+    python smoke_test_servers.py                # test all 13 menu options
     python smoke_test_servers.py 1 3 9          # test only options 1, 3, 9
 
 Results merge into prior runs, so re-running a single option updates just its
@@ -52,6 +52,7 @@ MENU = [
     (10, "FLUX.1 Kontext (editor)",       ["--kontext"],                             "edit"),
     (11, "FLUX.1 Kontext Full (bf16)",    ["--kontext", "--full-model"],             "edit"),
     (12, "Kontext Full + Uncensored",     ["--kontext", "--full-model", "--uncensored"], "edit"),
+    (14, "FLUX.2-klein-4B",               ["--klein-4b"],                            "txt2img"),
 ]
 
 
@@ -62,6 +63,7 @@ def derive_flags(raw_args):
     schnell = "--schnell" in raw_args
     uncensored = "--uncensored" in raw_args
     klein = "--klein" in raw_args
+    klein_4b = "--klein-4b" in raw_args
     kontext = "--kontext" in raw_args
     local_encoder_flag = "--local-encoder" in raw_args
     turbo_flag = "--turbo" in raw_args
@@ -71,7 +73,9 @@ def derive_flags(raw_args):
     if "--gguf" in raw_args:
         gguf = raw_args[raw_args.index("--gguf") + 1]
 
-    # klein implies flux2 + full
+    # klein_4b implies klein; klein implies flux2 + full
+    if klein_4b:
+        klein = True
     if klein:
         flux2 = True
         full_model = True
@@ -89,6 +93,7 @@ def derive_flags(raw_args):
         "schnell": schnell,
         "uncensored": uncensored,
         "klein": klein,
+        "klein_4b": klein_4b,
         "kontext": kontext,
         "local_encoder": local_encoder,
         "turbo": turbo,
@@ -145,7 +150,7 @@ def run_config_inprocess(num, name, raw_args, kind):
             local_encoder=flags["local_encoder"], full_model=flags["full_model"],
             gguf_quant=flags["gguf_quant"], flux2=flags["flux2"],
             schnell=flags["schnell"], for_lora=flags["uncensored"],
-            klein=flags["klein"], kontext=flags["kontext"],
+            klein=flags["klein"], klein_4b=flags["klein_4b"], kontext=flags["kontext"],
         )
         if flags["turbo"]:
             _report_progress(num, "loading turbo LoRA")

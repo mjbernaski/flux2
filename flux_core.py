@@ -105,10 +105,12 @@ FLUX1_GGUF_MODELS = {
 FLUX2_REPO_4BIT = "diffusers/FLUX.2-dev-bnb-4bit"
 FLUX2_REPO_FULL = "black-forest-labs/FLUX.2-dev"
 
-# FLUX.2 klein (smaller 9B model, uses Flux2KleinPipeline). Full bf16 only — NVFP4
-# variants are blocked by a diffusers upstream bug in the Flux2 single-file converter
-# (qkv-chunking assumes unquantized fused weights; NVFP4 scale tensors break it).
+# FLUX.2 klein (smaller 9B/4B models, both use Flux2KleinPipeline). Full bf16 only —
+# NVFP4 variants are blocked by a diffusers upstream bug in the Flux2 single-file
+# converter (qkv-chunking assumes unquantized fused weights; NVFP4 scale tensors
+# break it).
 FLUX2_KLEIN_REPO_FULL = "black-forest-labs/FLUX.2-klein-9B"
+FLUX2_KLEIN_REPO_4B = "black-forest-labs/FLUX.2-klein-4B"
 device = "cuda:0"
 torch_dtype = torch.bfloat16
 
@@ -223,7 +225,7 @@ def _is_degenerate_image(image):
         return False
 
 
-def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=False, schnell=False, for_lora=False, klein=False, kontext=False):
+def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=False, schnell=False, for_lora=False, klein=False, klein_4b=False, kontext=False):
     """Load the FLUX model components. Call this before generating images.
 
     Args:
@@ -236,6 +238,7 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
         klein: Use FLUX.2-klein (9B) variant instead of FLUX.2-dev (32B). Implies flux2.
             Klein always loads as full bf16 (no quantized variant wired up — NVFP4 blocked by
             diffusers upstream qkv-chunking bug in the Flux2 single-file converter).
+        klein_4b: Use the smaller FLUX.2-klein-4B variant instead of the 9B. Implies klein.
         kontext: Use FLUX.1 Kontext, an instruction-based image editor. FLUX.1 only;
             loaded 4-bit (quantized on the fly) with local T5+CLIP encoders. Implies a
             local encoder; ignores flux2/full_model/gguf/schnell.
@@ -258,7 +261,10 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
 
     _local_encoder_active = local_encoder
 
-    # klein implies flux2 + full (bf16). Klein has no working 4-bit/NVFP4 path in current diffusers.
+    # klein_4b implies klein; klein implies flux2 + full (bf16). Klein has no working
+    # 4-bit/NVFP4 path in current diffusers.
+    if klein_4b:
+        klein = True
     if klein:
         flux2 = True
         full_model = True
@@ -280,7 +286,8 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
     # Select repos based on version
     if flux2:
         repo_4bit = FLUX2_REPO_4BIT
-        repo_full = FLUX2_KLEIN_REPO_FULL if klein else FLUX2_REPO_FULL
+        repo_full = (FLUX2_KLEIN_REPO_4B if klein_4b else
+                     FLUX2_KLEIN_REPO_FULL if klein else FLUX2_REPO_FULL)
         if gguf_quant:
             print("Warning: GGUF not available for FLUX.2, using 4-bit instead")
             gguf_quant = None
@@ -294,7 +301,7 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
     total_start = time.perf_counter()
 
     # Determine model type
-    klein_tag = "-klein" if klein else "-dev"
+    klein_tag = "-klein-4b" if klein_4b else "-klein" if klein else "-dev"
     if kontext:
         _model_type = "kontext-full" if full_model else "kontext"
         model_desc = ("full bf16 FLUX.1-Kontext (editor)" if full_model
@@ -456,7 +463,7 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
                 text_encoder_cls = Mistral3ForConditionalGeneration
                 text_encoder_label = "Mistral3"
 
-            param_desc = "9B" if klein else "32B"
+            param_desc = "4B" if klein_4b else "9B" if klein else "32B"
             print(f"  Loading transformer ({param_desc} params)...")
             t_trans = time.perf_counter()
             transformer = Flux2Transformer2DModel.from_pretrained(

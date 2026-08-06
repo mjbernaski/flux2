@@ -45,11 +45,12 @@ show_menu() {
     echo -e "    ${GREEN}4)${NC} schnell          4-step fast (Apache 2.0)"
     echo -e "    ${GREEN}5)${NC} U-LoRA           Full model + LoRA"
     echo ""
-    echo -e "  ${YELLOW}FLUX.2 (32B · klein 9B)${NC}"
+    echo -e "  ${YELLOW}FLUX.2 (32B · klein 9B/4B)${NC}"
     echo -e "    ${GREEN}6)${NC} 4-bit            Low VRAM"
     echo -e "    ${GREEN}7)${NC} Full (Turbo)     8-step fast inference"
     echo -e "    ${GREEN}8)${NC} Full (no Turbo)  Max quality, slower"
     echo -e "    ${GREEN}9)${NC} klein-9B         ${YELLOW}[default]${NC} faster 9B"
+    echo -e "   ${GREEN}14)${NC} klein-4B         Lowest-VRAM FLUX.2, ~13GB bf16"
     echo ""
     echo -e "  ${YELLOW}Editing${NC}"
     echo -e "   ${GREEN}10)${NC} Kontext          Instruction editing (FLUX.1, 4-bit)"
@@ -125,6 +126,10 @@ set_config_args() {
             # checkpoint with SD_MODEL=<repo-or-path> before launching.
             args="--sdxl"
             desc="SDXL (photoreal)"
+            ;;
+        14)
+            args="--klein-4b"
+            desc="FLUX.2-klein-4B"
             ;;
         *)
             echo -e "${RED}Invalid selection${NC}"
@@ -240,7 +245,7 @@ start_server() {
             local new_config
             new_config=$(cat "$SWITCH_CONFIG_FILE")
             rm -f "$SWITCH_CONFIG_FILE"
-            if [[ "$new_config" =~ ^([1-9]|1[0-3])$ ]] && set_config_args "$new_config"; then
+            if [[ "$new_config" =~ ^([1-9]|1[0-4])$ ]] && set_config_args "$new_config"; then
                 config=$new_config
             else
                 echo -e "${RED}Invalid switch request '$new_config' — restarting current model${NC}" | tee -a "$log_file"
@@ -308,7 +313,7 @@ main() {
     if [ "$1" = "last" ]; then
         local last_config
         last_config=$(cat "$LAST_CONFIG_FILE" 2>/dev/null)
-        if ! [[ "$last_config" =~ ^([1-9]|1[0-3])$ ]]; then
+        if ! [[ "$last_config" =~ ^([1-9]|1[0-4])$ ]]; then
             last_config=9
         fi
         shift
@@ -317,7 +322,7 @@ main() {
     fi
 
     # Check if a number was passed as argument
-    if [ -n "$1" ] && [[ "$1" =~ ^([1-9]|1[0-3])$ ]]; then
+    if [ -n "$1" ] && [[ "$1" =~ ^([1-9]|1[0-4])$ ]]; then
         start_server "$@"
         exit $?
     fi
@@ -330,7 +335,7 @@ main() {
 
     while true; do
         show_menu
-        echo -ne "${CYAN}Select configuration [1-13, default=9, q to quit]: ${NC}"
+        echo -ne "${CYAN}Select configuration [1-14, default=9, q to quit]: ${NC}"
         read -r choice
         # Empty input → run default (klein)
         if [ -z "$choice" ]; then
@@ -338,7 +343,7 @@ main() {
         fi
 
         case $choice in
-            [1-9]|1[0-3])
+            [1-9]|1[0-4])
                 start_server "$choice"
                 exit $?
                 ;;

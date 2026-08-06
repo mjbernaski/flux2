@@ -7,6 +7,7 @@ import threading
 import time
 import base64
 import io
+import math
 import socket
 import shutil
 import traceback
@@ -106,6 +107,7 @@ _schnell = False
 _turbo = False
 _uncensored = False
 _klein = False
+_klein_4b = False
 _kontext = False
 
 # Configuration
@@ -138,6 +140,7 @@ SERVER_CONFIGS = {
     11: "FLUX.1 Kontext Full (editor, bf16)",
     12: "FLUX.1 Kontext Full + U-LoRA",
     13: "SDXL (photoreal)",
+    14: "FLUX.2-klein-4B",
 }
 SWITCH_EXIT_CODE = 86
 SWITCH_CONFIG_FILE = ".next_config"
@@ -319,6 +322,65 @@ SIZES = {
 
 # The web UI lives in static/ (index.html + app.css + app.js); it was
 # previously embedded here as one giant string. See static/README note.
+
+
+def _composite_cell_size(width, height, cell_px=256):
+    """Thumbnail size for one composite-grid cell, preserving aspect ratio."""
+    aspect_ratio = width / height
+    if width >= height:
+        cell_width = cell_px
+        cell_height = int(round(cell_width / aspect_ratio))
+    else:
+        cell_height = cell_px
+        cell_width = int(round(cell_height * aspect_ratio))
+    return cell_width, cell_height
+
+
+def _build_composite_grid(grid_cells, cell_width, cell_height):
+    """Paste a 2D list of (image, seq_label)/None cells into one labeled composite image."""
+    n_rows, n_cols = len(grid_cells), len(grid_cells[0])
+    composite = Image.new('RGB', (n_cols * cell_width, n_rows * cell_height), (32, 32, 32))
+    for row_idx, row_images in enumerate(grid_cells):
+        for col_idx, cell in enumerate(row_images):
+            if cell is None:
+                continue
+            img, _seq = cell
+            img_small = img if img.size == (cell_width, cell_height) else \
+                img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
+            composite.paste(img_small, (col_idx * cell_width, row_idx * cell_height))
+
+    draw = ImageDraw.Draw(composite)
+    font_size = max(14, cell_height // 12)
+    font = None
+    for font_path in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    ):
+        if os.path.exists(font_path):
+            try:
+                font = ImageFont.truetype(font_path, font_size)
+                break
+            except Exception:
+                font = None
+    if font is None:
+        font = ImageFont.load_default()
+    for row_idx, row_images in enumerate(grid_cells):
+        for col_idx, cell in enumerate(row_images):
+            if cell is None:
+                continue
+            _img, seq = cell
+            label = str(seq)
+            pad = 4
+            bbox = draw.textbbox((0, 0), label, font=font)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            x0 = col_idx * cell_width + 6
+            y0 = row_idx * cell_height + 6
+            draw.rectangle(
+                [x0 - pad, y0 - pad, x0 + tw + pad, y0 + th + pad],
+                fill=(0, 0, 0),
+            )
+            draw.text((x0 - bbox[0], y0 - bbox[1]), label, fill=(255, 255, 255), font=font)
+    return composite
 
 
 def _run_job(job: Job):
@@ -556,61 +618,22 @@ def _run_job(job: Job):
                 row_images.append((image.copy(), generated_count))
             grid_cells.append(row_images)
 
-        # Create composite
-        # Calculate cell size based on aspect ratio
-        aspect_ratio = width / height
-        if width >= height:
-            cell_width = 256
-            cell_height = int(round(cell_width / aspect_ratio))
-        else:
-            cell_height = 256
-            cell_width = int(round(cell_height * aspect_ratio))
-
-        n_rows, n_cols = len(grid_cells), len(grid_cells[0])
-        composite = Image.new('RGB', (n_cols * cell_width, n_rows * cell_height), (32, 32, 32))
-        for row_idx, row_images in enumerate(grid_cells):
-            for col_idx, cell in enumerate(row_images):
-                if cell is None: continue # Skip empty diagonal cells
-                img, _seq = cell
-                img_small = img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
-                composite.paste(img_small, (col_idx * cell_width, row_idx * cell_height))
-
-        # Overlay the generation-sequence number on each populated cell
-        draw = ImageDraw.Draw(composite)
-        font_size = max(14, cell_height // 12)
-        font = None
-        for font_path in (
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-        ):
-            if os.path.exists(font_path):
-                try:
-                    font = ImageFont.truetype(font_path, font_size)
-                    break
-                except Exception:
-                    font = None
-        if font is None:
-            font = ImageFont.load_default()
-        for row_idx, row_images in enumerate(grid_cells):
-            for col_idx, cell in enumerate(row_images):
-                if cell is None: continue
-                _img, seq = cell
-                label = str(seq)
-                pad = 4
-                bbox = draw.textbbox((0, 0), label, font=font)
-                tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-                x0 = col_idx * cell_width + 6
-                y0 = row_idx * cell_height + 6
-                draw.rectangle(
-                    [x0 - pad, y0 - pad, x0 + tw + pad, y0 + th + pad],
-                    fill=(0, 0, 0),
-                )
-                draw.text((x0 - bbox[0], y0 - bbox[1]), label, fill=(255, 255, 255), font=font)
+        # Create composite (sequence numbers overlaid on each populated cell)
+        cell_width, cell_height = _composite_cell_size(width, height)
+        composite = _build_composite_grid(grid_cells, cell_width, cell_height)
 
         comp_filename = f"{_output_prefix()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_spectrum_grid.png"
         composite.save(os.path.join(OUTPUT_DIR, comp_filename))
         job.composite = comp_filename
     else:
+        # For batch > 1, collect a small thumbnail per image (not the full-res
+        # frame, to avoid holding many full images in memory at once) so a
+        # composite matrix can be built once the batch finishes.
+        cell_width = cell_height = None
+        batch_thumbs = []
+        if batch > 1:
+            cell_width, cell_height = _composite_cell_size(width, height)
+
         for i in range(batch):
             job.current = i + 1
             job.step = 0
@@ -646,6 +669,22 @@ def _run_job(job: Job):
                 }
             }
             job.images.append(img_data)
+
+            if batch > 1:
+                thumb = image.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
+                batch_thumbs.append((thumb, i + 1))
+
+        if batch > 1:
+            n_cols = math.ceil(math.sqrt(batch))
+            n_rows = math.ceil(batch / n_cols)
+            grid_cells = [
+                batch_thumbs[r * n_cols:(r + 1) * n_cols] + [None] * (n_cols - len(batch_thumbs[r * n_cols:(r + 1) * n_cols]))
+                for r in range(n_rows)
+            ]
+            composite = _build_composite_grid(grid_cells, cell_width, cell_height)
+            comp_filename = f"{_output_prefix()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_batch_grid.png"
+            composite.save(os.path.join(OUTPUT_DIR, comp_filename))
+            job.composite = comp_filename
 
     job.generation_time = time.perf_counter() - start_time
 
@@ -1223,7 +1262,7 @@ def multi_run_cancel():
 
 def _model_type_string():
     flux_name = f"FLUX.{flux_core._flux_version}"
-    variant = "-klein" if _klein else "-dev"
+    variant = "-klein-4b" if _klein_4b else "-klein" if _klein else "-dev"
     if _SDXL_ACTIVE:
         # Deliberately not the checkpoint basename — this string shows in the
         # UI's model-name hover, and checkpoint repo ids can be lurid.
@@ -1989,6 +2028,7 @@ if __name__ == '__main__':
     parser.add_argument("--flux2", action="store_true", help="Use FLUX.2 model")
     parser.add_argument("--schnell", action="store_true", help="Use FLUX.1-schnell")
     parser.add_argument("--klein", action="store_true", help="Use FLUX.2-klein (9B) instead of FLUX.2-dev (32B). Implies --flux2 --full-model")
+    parser.add_argument("--klein-4b", action="store_true", help="Use FLUX.2-klein-4B instead of the 9B. Implies --klein --flux2 --full-model")
     parser.add_argument("--turbo", action="store_true", default=None, help="Enable turbo LoRA")
     parser.add_argument("--no-turbo", action="store_true", help="Disable turbo LoRA")
     parser.add_argument("--uncensored", action="store_true", help="Load the uncensored LoRA (FLUX.1 only)")
@@ -2003,10 +2043,12 @@ if __name__ == '__main__':
     parser.add_argument("--port", type=int, default=PORT, help=f"Port (default: {PORT})")
     args = parser.parse_args()
 
+    if args.klein_4b:
+        args.klein = True
     if args.klein:
         args.flux2 = True
         args.full_model = True
-    _full_model, _gguf_quant, _flux2, _schnell, _uncensored, _klein = args.full_model, args.gguf, args.flux2, args.schnell, args.uncensored, args.klein
+    _full_model, _gguf_quant, _flux2, _schnell, _uncensored, _klein, _klein_4b = args.full_model, args.gguf, args.flux2, args.schnell, args.uncensored, args.klein, args.klein_4b
     _kontext = args.kontext
     _local_encoder = args.local_encoder or args.full_model or args.schnell or args.uncensored or args.kontext
     if args.uncensored and not args.full_model: _full_model = True
@@ -2025,7 +2067,7 @@ if __name__ == '__main__':
                 _model_name = "FLUX.1-Kontext" if _kontext else ("FLUX.2" if _flux2 else "FLUX.1")
                 _model_load_status = f"loading {_model_name} model"
                 print(f"Loading {_model_name}...")
-                load_model(local_encoder=_local_encoder, full_model=_full_model, gguf_quant=_gguf_quant, flux2=_flux2, schnell=_schnell, for_lora=_uncensored, klein=_klein, kontext=_kontext)
+                load_model(local_encoder=_local_encoder, full_model=_full_model, gguf_quant=_gguf_quant, flux2=_flux2, schnell=_schnell, for_lora=_uncensored, klein=_klein, klein_4b=_klein_4b, kontext=_kontext)
             if _turbo:
                 _model_load_status = "loading turbo LoRA"
                 load_turbo_lora()
