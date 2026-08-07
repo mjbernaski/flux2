@@ -1,6 +1,7 @@
 import os
 import argparse
 import hmac
+import re
 import json
 import subprocess
 import threading
@@ -156,6 +157,23 @@ if _current_config not in SERVER_CONFIGS:
 # judgments and revised prompts are markedly better.
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 CRITIQUE_MODEL = os.environ.get("CRITIQUE_MODEL", "qwen3.6:latest")
+# The reverse path (/describe) can use a different — typically Ollama Cloud —
+# model, so image→prompt costs no local VRAM next to the resident FLUX
+# pipeline. With OLLAMA_API_KEY set, cloud models (":cloud"/"-cloud" tags)
+# are sent straight to ollama.com's hosted API (suffix stripped — hosted
+# names don't carry it); without a key they go through the local daemon,
+# which then needs a one-time `ollama signin`.
+DESCRIBE_MODEL = os.environ.get("DESCRIBE_MODEL", CRITIQUE_MODEL)
+OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY")
+OLLAMA_CLOUD_URL = os.environ.get("OLLAMA_CLOUD_URL", "https://ollama.com")
+
+
+def _ollama_call_params(model):
+    """(model, url, api_key) for a VLM call: cloud models route to ollama.com
+    when an API key is configured, everything else to the local daemon."""
+    if OLLAMA_API_KEY and re.search(r'[:-]cloud$', model):
+        return re.sub(r'[:-]cloud$', '', model), OLLAMA_CLOUD_URL, OLLAMA_API_KEY
+    return model, OLLAMA_URL, None
 
 PREVIEW_FILENAME = "_preview_current.png"
 PREVIEW_MIN_INTERVAL_S = 0.75  # throttle: skip decode if last preview was this recent
@@ -1425,7 +1443,9 @@ def critique_result(cid):
 def _run_describe(cid, model, images, think):
     from edit_loop import vlm_describe
     try:
-        prompt = vlm_describe(model, images, think=think, ollama_url=OLLAMA_URL)
+        model, url, api_key = _ollama_call_params(model)
+        prompt = vlm_describe(model, images, think=think, ollama_url=url,
+                              api_key=api_key)
         if prompt:
             payload = {'success': True, 'prompt': prompt}
         else:
@@ -1464,7 +1484,7 @@ def describe():
     except Exception:
         return jsonify({'success': False, 'error': 'image is not a decodable base64 image'}), 400
     think = bool(data.get('think', False))
-    model = data.get('model') or CRITIQUE_MODEL
+    model = data.get('model') or DESCRIBE_MODEL
     cid = _vlm_job_start(_run_describe, model, images, think)
     return jsonify({'success': True, 'describe_id': cid})
 
@@ -2029,6 +2049,7 @@ if __name__ == '__main__':
     parser.add_argument("--schnell", action="store_true", help="Use FLUX.1-schnell")
     parser.add_argument("--klein", action="store_true", help="Use FLUX.2-klein (9B) instead of FLUX.2-dev (32B). Implies --flux2 --full-model")
     parser.add_argument("--klein-4b", action="store_true", help="Use FLUX.2-klein-4B instead of the 9B. Implies --klein --flux2 --full-model")
+    parser.add_argument("--quantize-encoder", action="store_true", help="FLUX.2 full/klein: load the text encoder 4-bit NF4 (transformer stays bf16). For discrete-VRAM cards where both won't fit in bf16")
     parser.add_argument("--turbo", action="store_true", default=None, help="Enable turbo LoRA")
     parser.add_argument("--no-turbo", action="store_true", help="Disable turbo LoRA")
     parser.add_argument("--uncensored", action="store_true", help="Load the uncensored LoRA (FLUX.1 only)")
@@ -2067,7 +2088,7 @@ if __name__ == '__main__':
                 _model_name = "FLUX.1-Kontext" if _kontext else ("FLUX.2" if _flux2 else "FLUX.1")
                 _model_load_status = f"loading {_model_name} model"
                 print(f"Loading {_model_name}...")
-                load_model(local_encoder=_local_encoder, full_model=_full_model, gguf_quant=_gguf_quant, flux2=_flux2, schnell=_schnell, for_lora=_uncensored, klein=_klein, klein_4b=_klein_4b, kontext=_kontext)
+                load_model(local_encoder=_local_encoder, full_model=_full_model, gguf_quant=_gguf_quant, flux2=_flux2, schnell=_schnell, for_lora=_uncensored, klein=_klein, klein_4b=_klein_4b, kontext=_kontext, quantize_encoder=args.quantize_encoder)
             if _turbo:
                 _model_load_status = "loading turbo LoRA"
                 load_turbo_lora()

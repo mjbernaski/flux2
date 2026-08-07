@@ -190,17 +190,22 @@ CRITIQUE_SCHEMA = {
 }
 
 
-def _ollama_chat(ollama_url, payload):
+def _ollama_chat(ollama_url, payload, api_key=None):
+    # api_key: Bearer auth for ollama.com's hosted API (cloud models hit
+    # directly, without the local daemon proxy). The local daemon needs none.
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = "Bearer " + api_key
     req = urllib.request.Request(
         ollama_url.rstrip("/") + "/api/chat",
         data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
+        headers=headers,
     )
     with urllib.request.urlopen(req, timeout=300) as r:
         return json.loads(r.read().decode())
 
 
-def _chat_text(ollama_url, payload):
+def _chat_text(ollama_url, payload, api_key=None):
     """Chat with retries for two ollama quirks: models that reject the
     "think" flag (HTTP error → retry without it), and 200 replies with empty
     content — a request racing a model load/unload returns done_reason
@@ -210,10 +215,10 @@ def _chat_text(ollama_url, payload):
     without emitting the schema-constrained reply (retry, dropping "think"
     in that case to force the JSON out directly)."""
     try:
-        resp = _ollama_chat(ollama_url, payload)
+        resp = _ollama_chat(ollama_url, payload, api_key)
     except urllib.error.HTTPError:
         payload.pop("think", None)
-        resp = _ollama_chat(ollama_url, payload)
+        resp = _ollama_chat(ollama_url, payload, api_key)
     text = resp["message"]["content"]
     for _ in range(5):
         if text.strip():
@@ -222,7 +227,7 @@ def _chat_text(ollama_url, payload):
             time.sleep(3)
         else:
             payload.pop("think", None)
-        resp = _ollama_chat(ollama_url, payload)
+        resp = _ollama_chat(ollama_url, payload, api_key)
         text = resp["message"]["content"]
     return text
 
@@ -397,13 +402,16 @@ def _boost_from_reply(text, want_negative):
     return _strip_last_label(text, _POSITIVE_LABEL_LINE_RE), None
 
 
-def vlm_describe(model, image, think=False, ollama_url="http://127.0.0.1:11434"):
-    """The reverse path: ask the local vision model to write a detailed
+def vlm_describe(model, image, think=False, ollama_url="http://127.0.0.1:11434",
+                 api_key=None):
+    """The reverse path: ask the vision model to write a detailed
     text-to-image prompt that would recreate `image` from scratch. `image`
     may also be a list of images — then the prompt is a composite describing
     one coherent scene that merges the images' subjects and elements.
     `think=True` (default off) enables the deliberation phase — deeper but
-    much slower. Returns the prompt string, or None on any failure."""
+    much slower. `api_key` switches auth on for ollama.com's hosted API
+    (pair it with ollama_url="https://ollama.com" and a cloud model name).
+    Returns the prompt string, or None on any failure."""
     images = image if isinstance(image, (list, tuple)) else [image]
     if len(images) > 1:
         ask = (
@@ -445,7 +453,7 @@ def vlm_describe(model, image, think=False, ollama_url="http://127.0.0.1:11434")
         "options": {"temperature": 0.4, "num_ctx": 8192},
     }
     try:
-        text = _chat_text(ollama_url, payload)
+        text = _chat_text(ollama_url, payload, api_key)
         prompt = _prompt_from_reply(text)
         if prompt:
             return prompt

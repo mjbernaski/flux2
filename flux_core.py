@@ -225,7 +225,7 @@ def _is_degenerate_image(image):
         return False
 
 
-def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=False, schnell=False, for_lora=False, klein=False, klein_4b=False, kontext=False):
+def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=False, schnell=False, for_lora=False, klein=False, klein_4b=False, kontext=False, quantize_encoder=False):
     """Load the FLUX model components. Call this before generating images.
 
     Args:
@@ -239,6 +239,12 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
             Klein always loads as full bf16 (no quantized variant wired up — NVFP4 blocked by
             diffusers upstream qkv-chunking bug in the Flux2 single-file converter).
         klein_4b: Use the smaller FLUX.2-klein-4B variant instead of the 9B. Implies klein.
+        quantize_encoder: FLUX.2 full/klein only. Quantize the text encoder (Qwen3/
+            Mistral3) to 4-bit NF4 on load, bitsandbytes-style, like the Kontext 4-bit
+            path — the transformer stays bf16 so image quality is unaffected. Needed on
+            discrete-VRAM cards where bf16 transformer + bf16 encoder exceed VRAM and
+            the driver's sysmem fallback makes generation ~10x slower (klein-9B is
+            17GB + 16GB on a 32GB RTX 5090). Not the single-file NVFP4 path above.
         kontext: Use FLUX.1 Kontext, an instruction-based image editor. FLUX.1 only;
             loaded 4-bit (quantized on the fly) with local T5+CLIP encoders. Implies a
             local encoder; ignores flux2/full_model/gguf/schnell.
@@ -474,14 +480,28 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
             load_timings['transformer'] = time.perf_counter() - t_trans
             print(f"    Transformer loaded in {load_timings['transformer']:.2f}s")
 
-            print(f"  Loading text encoder ({text_encoder_label})...")
             t_enc = time.perf_counter()
-            # Don't use device_map="auto" - it can place embedding layer on CPU causing
-            # index_select device mismatch errors. Load to CPU then move to GPU.
-            text_encoder = text_encoder_cls.from_pretrained(
-                repo_id, subfolder="text_encoder", torch_dtype=torch_dtype,
-                use_safetensors=True
-            ).to(device)
+            if quantize_encoder:
+                from transformers import BitsAndBytesConfig as TransformersBnbConfig
+                print(f"  Loading text encoder ({text_encoder_label}, 4-bit NF4)...")
+                # bnb models can't be .to(device)-moved after load; pin everything
+                # to GPU 0 via device_map instead (avoids the "auto" CPU-embedding
+                # placement problem below by construction).
+                text_encoder = text_encoder_cls.from_pretrained(
+                    repo_id, subfolder="text_encoder", torch_dtype=torch_dtype,
+                    quantization_config=TransformersBnbConfig(
+                        load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                        bnb_4bit_compute_dtype=torch_dtype),
+                    device_map={"": 0}, use_safetensors=True
+                )
+            else:
+                print(f"  Loading text encoder ({text_encoder_label})...")
+                # Don't use device_map="auto" - it can place embedding layer on CPU causing
+                # index_select device mismatch errors. Load to CPU then move to GPU.
+                text_encoder = text_encoder_cls.from_pretrained(
+                    repo_id, subfolder="text_encoder", torch_dtype=torch_dtype,
+                    use_safetensors=True
+                ).to(device)
             load_timings['text_encoder'] = time.perf_counter() - t_enc
             print(f"    Text encoder loaded in {load_timings['text_encoder']:.2f}s")
 

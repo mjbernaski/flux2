@@ -65,4 +65,5 @@ server_smoke_test/
 debug-gallery/
 edit-loop-sessions/
 ollama.log
+ollama.err.log
 .last_config

@@ -2049,12 +2049,13 @@ function recordPromptHistory(text) {
     });
     syncPromptNav();
 })();
-// Cmd/Ctrl+Return: start the generation that's available in context — when
-// the edit loop is paused between iterations, that's "Continue" (with the
-// possibly-edited next instruction); otherwise queue a normal generation
-// (works during a running job too — it just queues behind it).
+// Cmd/Ctrl+Return or Shift+Return: start the generation that's available in
+// context — when the edit loop is paused between iterations, that's "Continue"
+// (with the possibly-edited next instruction); otherwise queue a normal
+// generation (works during a running job too — it just queues behind it).
+// Shift+Return therefore no longer inserts a newline in the prompt textarea.
 document.addEventListener('keydown', function(e) {
-    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+    if ((e.metaKey || e.ctrlKey || e.shiftKey) && e.key === 'Enter') {
         e.preventDefault();
         if (loopRun && loopRun.decision) loopRun.decision('continue');
         else doGenerate();
