@@ -163,6 +163,18 @@ ensure_ollama() {
     echo -e "${YELLOW}ollama did not come up within 10s — VLM features may be unavailable (see ollama.log)${NC}"
 }
 
+# The gallery/crop tool (image_manager.py, port 2223) should be up whenever
+# the generation server is. Skip if something is already listening there.
+# No -f on the probe: any HTTP response (401 included) means it's running.
+ensure_image_manager() {
+    local im_port="${IMAGE_MANAGER_PORT:-2223}"
+    if curl -s --max-time 2 -o /dev/null "http://127.0.0.1:${im_port}/" 2>/dev/null; then
+        return 0
+    fi
+    echo -e "${CYAN}Starting image manager on port ${im_port} (logging to image_manager.log)...${NC}"
+    setsid nohup .venv/bin/python -u image_manager.py --port "$im_port" >> image_manager.log 2>&1 < /dev/null &
+}
+
 # web_server.py exits with this code (after writing .next_config) when the
 # user picks a different model in the UI; the restart loop below relaunches
 # with the new config instead of treating it as a crash.
@@ -195,6 +207,7 @@ start_server() {
 
     kill_existing_server
     ensure_ollama
+    ensure_image_manager
 
     if [ ! -f .venv/bin/activate ]; then
         echo -e "${RED}No .venv found — create it first: python -m venv .venv && uv pip install -r requirements.txt${NC}"

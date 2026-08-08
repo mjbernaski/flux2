@@ -135,6 +135,20 @@ function Confirm-Ollama {
     Write-Host "ollama did not come up within 10s - VLM features may be unavailable" -ForegroundColor Yellow
 }
 
+# The gallery/crop tool (image_manager.py, port 2223) should be up whenever
+# the generation server is. Skip if something is already listening there.
+# Must run after Stop-ExistingServer: its venv-python sweep would kill a
+# manager started earlier.
+function Confirm-ImageManager {
+    $imPort = if ($env:IMAGE_MANAGER_PORT) { [int]$env:IMAGE_MANAGER_PORT } else { 2223 }
+    $listening = netstat -ano | Select-String ":$imPort\s.*LISTENING"
+    if ($listening) { return }
+    Write-Host "Starting image manager on port $imPort (logging to image_manager.log)..." -ForegroundColor Cyan
+    Start-Process -FilePath $PythonExe -ArgumentList "-u", "image_manager.py", "--port", "$imPort" `
+        -WorkingDirectory $PSScriptRoot -WindowStyle Hidden `
+        -RedirectStandardOutput "image_manager.log" -RedirectStandardError "image_manager.err.log"
+}
+
 function Write-Log([string]$Message, [string]$Color = "White") {
     Write-Host $Message -ForegroundColor $Color
     Add-Content -Path $LogFile -Value $Message
@@ -161,6 +175,7 @@ function Start-FluxServer([int]$Config, [string[]]$ExtraArgs = @()) {
 
     Stop-ExistingServer
     Confirm-Ollama
+    Confirm-ImageManager
 
     $PID | Out-File "server.pid" -Encoding ascii
     try {
