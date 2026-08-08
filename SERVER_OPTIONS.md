@@ -24,7 +24,7 @@ Run with `./run_server.sh` for an interactive menu, or `./run_server.sh <number>
 | **7** | FLUX.2 Full + Turbo | `--flux2 --full-model --turbo` | Full-precision FLUX.2 with turbo LoRA enabled (`fal/FLUX.2-dev-Turbo`). Uses custom 8-step noise schedule for ~3x faster inference with minimal quality loss. Guidance scale defaults to 2.5 (vs 4.0 standard). |
 | **8** | FLUX.2 Full (no Turbo) | `--flux2 --full-model --no-turbo` | Full-precision FLUX.2-dev (`black-forest-labs/FLUX.2-dev`) without the turbo LoRA. Maximum quality at the cost of slower generation (25 steps default vs 8). Very high VRAM requirement; slowest to load. |
 | **9** | FLUX.2-klein-9B | `--klein` | FLUX.2-klein, a faster 9B variant. Default menu selection. Lower VRAM and faster than the full 32B FLUX.2 models. |
-| **14** | FLUX.2-klein-4B | `--klein-4b` | FLUX.2-klein-4B (`black-forest-labs/FLUX.2-klein-4B`), the smallest FLUX.2 variant. Same `Flux2KleinPipeline` + Qwen3 text encoder as the 9B, fewer transformer params. ~13GB VRAM full bf16 (lowest of any FLUX.2 config; still local-encoder only, no remote API). |
+| **14** | FLUX.2-klein-4B | `--klein-4b` | FLUX.2-klein-4B (`black-forest-labs/FLUX.2-klein-4B`), the smallest FLUX.2 variant. Same `Flux2KleinPipeline` + Qwen3 text encoder as the 9B, fewer transformer params. ~13GB VRAM full bf16 for the transformer — but the Qwen3 text encoder is a further ~16GB in bf16, the same as the 9B's, so total residency is ~30GB and the transformer size is misleading on a discrete card. Add `--quantize-encoder` (NF4 encoder, ~5GB) when VRAM is tight; `run_server.ps1` does this by default, `run_server.sh` does not (unified memory). Still local-encoder only, no remote API. |
 
 ## Editing
 

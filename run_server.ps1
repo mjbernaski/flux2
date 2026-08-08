@@ -43,7 +43,13 @@ function Get-ConfigArgs([int]$Config) {
         11 { @{ Args = @("--kontext", "--full-model");             Desc = "FLUX.1 Kontext Full (editor, bf16)" } }
         12 { @{ Args = @("--kontext", "--full-model", "--uncensored"); Desc = "FLUX.1 Kontext Full + U-LoRA" } }
         13 { @{ Args = @("--sdxl");                                Desc = "SDXL (photoreal)" } }
-        14 { @{ Args = @("--klein-4b");                            Desc = "FLUX.2-klein-4B" } }
+        # Same reasoning as config 9, and it bites harder here than the small
+        # transformer suggests: klein-4B's Qwen3 encoder is the same ~16GB in
+        # bf16 as the 9B's, so a 4B config was still filling a 32GB card and
+        # leaving nothing for the full-resolution VAE decode. Measured with the
+        # bf16 encoder: 31.8/32.6GB resident at 1.25MP, and generations at
+        # 1.75MP+ stalled on the last step paging to system RAM.
+        14 { @{ Args = @("--klein-4b", "--quantize-encoder");      Desc = "FLUX.2-klein-4B (NF4 encoder)" } }
         default { $null }
     }
 }
