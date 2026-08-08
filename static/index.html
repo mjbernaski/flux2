@@ -6,7 +6,7 @@
     <meta name="theme-color" content="#1a1a2e">
     <title>flux</title>
     <script>document.title = window.location.hostname + ' flux';</script>
-    <link rel="stylesheet" href="/static/app.css?v=3">
+    <link rel="stylesheet" href="/static/app.css?v=5">
 </head>
 <body>
     <div class="loading-overlay" id="loadingOverlay">
@@ -196,6 +196,7 @@
                     <option value="0.5mp">0.5 MP</option>
                     <option value="0.75mp">0.75 MP</option>
                     <option value="1mp" selected>1 MP</option>
+                    <option value="1.5mp">1.5 MP</option>
                     <option value="2mp">2 MP</option>
                 </select>
             </div>
@@ -455,12 +456,15 @@
     </div>
 
     <div class="result" id="result">
-        <div class="image-grid" id="imageGrid"></div>
-        <p class="generation-info" id="generationInfo"></p>
-        <div class="step-frames" id="stepFrames" style="display: none;"></div>
-        <div class="clear-recent-row">
-            <button type="button" class="clear-recent-btn" id="clearRecentBtn">Clear recent</button>
-        </div>
+        <details class="result-details" id="resultDetails">
+            <summary>Generated images <span class="result-count" id="resultCount"></span></summary>
+            <div class="image-grid" id="imageGrid"></div>
+            <p class="generation-info" id="generationInfo"></p>
+            <div class="step-frames" id="stepFrames" style="display: none;"></div>
+            <div class="clear-recent-row">
+                <button type="button" class="clear-recent-btn" id="clearRecentBtn">Clear recent</button>
+            </div>
+        </details>
     </div>
 
     <!-- GPU power draw, refreshed with the /status poll. -->
@@ -472,16 +476,18 @@
     </button>
 
     <div class="history-section" id="historySection">
-        <div class="history-header">
-            <h2>Today's Generations</h2>
-            <div class="history-actions">
-                <button type="button" class="archive-btn" id="archiveBtn" style="display: none;">Archive Today</button>
-                <button type="button" class="delete-btn" id="deleteAllBtn" style="display: none;">Delete Today</button>
+        <details class="history-details" id="historyDetails">
+            <summary><h2>Today's Generations <span class="result-count" id="historyCount"></span></h2></summary>
+            <div class="history-header">
+                <div class="history-actions">
+                    <button type="button" class="archive-btn" id="archiveBtn" style="display: none;">Archive Today</button>
+                    <button type="button" class="delete-btn" id="deleteAllBtn" style="display: none;">Delete Today</button>
+                </div>
             </div>
-        </div>
-        <div class="history-grid" id="historyGrid"></div>
+            <div class="history-grid" id="historyGrid"></div>
+        </details>
     </div>
 
-    <script src="/static/app.js?v=3"></script>
+    <script src="/static/app.js?v=5"></script>
 </body>
 </html>

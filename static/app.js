@@ -246,6 +246,14 @@ const statusText = document.getElementById('statusText');
 const result = document.getElementById('result');
 const imageGrid = document.getElementById('imageGrid');
 const generationInfo = document.getElementById('generationInfo');
+const resultCount = document.getElementById('resultCount');
+
+// The result grid sits in a collapsed-by-default <details>; the summary's
+// count is the only signal of what's inside, so refresh it on every change.
+function updateResultCount() {
+    if (resultCount) resultCount.textContent = imageGrid && imageGrid.children.length
+        ? `(${imageGrid.children.length})` : '';
+}
 
 const uploadArea = document.getElementById('uploadArea');
 const inputImage = document.getElementById('inputImage');
@@ -1357,6 +1365,7 @@ if (resetBtn) resetBtn.addEventListener('click', async function() {
     }
     // Clear results and status
     if (imageGrid) imageGrid.innerHTML = '';
+    updateResultCount();
     resultLbItems.length = 0;
     if (generationInfo) generationInfo.textContent = '';
     if (stepFrames) { stepFrames.style.display = 'none'; stepFrames.innerHTML = ''; }
@@ -1378,6 +1387,7 @@ if (clearRecentBtn) clearRecentBtn.addEventListener('click', async function() {
         await fetch('/reset', { method: 'POST', headers: getAuthHeaders() });
     } catch (e) { console.warn('Clear recent request failed:', e); }
     if (imageGrid) imageGrid.innerHTML = '';
+    updateResultCount();
     resultLbItems.length = 0;
     if (generationInfo) generationInfo.textContent = '';
     if (stepFrames) { stepFrames.style.display = 'none'; stepFrames.innerHTML = ''; }
@@ -1761,6 +1771,7 @@ function addImageToGrid(img, index) {
     card.querySelector('.ref-btn').addEventListener('click', (e) => { e.preventDefault(); useAsReference(img.filename); });
     card.querySelector('.save-hidden-btn').addEventListener('click', function(e) { e.preventDefault(); saveHidden(this, img.filename); });
     imageGrid.appendChild(card);
+    updateResultCount();
 }
 
 function addCompositeToGrid(filename) {
@@ -1777,6 +1788,7 @@ function addCompositeToGrid(filename) {
     compositeCard.querySelector('img').addEventListener('click', () =>
         openLightbox([{ src: `/images/${filename}`, caption: 'Spectrum composite' }], 0));
     imageGrid.insertBefore(compositeCard, imageGrid.firstChild);
+    updateResultCount();
 }
 
 // Snapshot the whole generation form (including inpaint state) into the JSON
@@ -2062,6 +2074,118 @@ document.addEventListener('keydown', function(e) {
     }
 });
 
+// ---- Pixel compare: pick two same-resolution images (⧉ on history cards)
+// and render only the pixels they share — per-channel RGB diff within the
+// tolerance keeps image A's pixel, anything else goes transparent over the
+// stage's checkerboard. The overlay is built here (not in the HTML) so the
+// alternate layout, which shares this file, gets it for free. ----
+const cmpOverlay = document.createElement('div');
+cmpOverlay.className = 'cmp-overlay';
+cmpOverlay.innerHTML = `
+    <button type="button" class="cmp-close" title="Close (Esc)">✕</button>
+    <div class="cmp-stage"><canvas></canvas></div>
+    <div class="cmp-hud">
+        <span class="cmp-stat"></span>
+        <label>Tolerance <input type="range" min="0" max="48" step="1" value="8"></label>
+        <span class="cmp-tol-val">8</span>
+    </div>`;
+document.body.appendChild(cmpOverlay);
+const cmpCanvas = cmpOverlay.querySelector('canvas');
+const cmpStat = cmpOverlay.querySelector('.cmp-stat');
+const cmpTol = cmpOverlay.querySelector('input[type="range"]');
+const cmpTolVal = cmpOverlay.querySelector('.cmp-tol-val');
+let cmpArmed = null;   // {filename, btn} — the first of the two picks
+let cmpData = null;    // {a, b: ImageData, w, h} while the overlay is open
+
+function cmpReset() {
+    if (cmpArmed) cmpArmed.btn.classList.remove('cmp-armed');
+    cmpArmed = null;
+}
+
+function cmpClose() {
+    cmpOverlay.classList.remove('visible');
+    cmpData = null;
+    cmpCanvas.width = cmpCanvas.height = 0;  // frees the decoded bitmap
+    cmpReset();
+}
+cmpOverlay.querySelector('.cmp-close').addEventListener('click', cmpClose);
+cmpOverlay.addEventListener('click', (e) => { if (e.target === cmpOverlay) cmpClose(); });
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && cmpOverlay.classList.contains('visible')) cmpClose();
+});
+
+function cmpRender() {
+    if (!cmpData) return;
+    const tol = parseInt(cmpTol.value, 10);
+    cmpTolVal.textContent = tol;
+    const { a, b, w, h } = cmpData;
+    const out = new ImageData(w, h);
+    const pa = a.data, pb = b.data, po = out.data;
+    let same = 0;
+    for (let i = 0; i < pa.length; i += 4) {
+        if (Math.abs(pa[i] - pb[i]) <= tol &&
+            Math.abs(pa[i + 1] - pb[i + 1]) <= tol &&
+            Math.abs(pa[i + 2] - pb[i + 2]) <= tol) {
+            po[i] = pa[i]; po[i + 1] = pa[i + 1]; po[i + 2] = pa[i + 2]; po[i + 3] = 255;
+            same++;
+        }
+    }
+    cmpCanvas.getContext('2d').putImageData(out, 0, 0);
+    const pct = (100 * same / (w * h)).toFixed(1);
+    cmpStat.textContent = `${w}×${h} — ${pct}% of pixels match`;
+}
+cmpTol.addEventListener('input', () => {
+    if (cmpRender._raf) cancelAnimationFrame(cmpRender._raf);
+    cmpRender._raf = requestAnimationFrame(cmpRender);
+});
+
+function cmpLoadPixels(filename) {
+    return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => {
+            const c = document.createElement('canvas');
+            c.width = img.naturalWidth;
+            c.height = img.naturalHeight;
+            const ctx = c.getContext('2d', { willReadFrequently: true });
+            ctx.drawImage(img, 0, 0);
+            resolve(ctx.getImageData(0, 0, c.width, c.height));
+        };
+        img.onerror = () => reject(new Error('failed to load ' + filename));
+        img.src = `/images/${encodeURIComponent(filename)}`;
+    });
+}
+
+async function cmpOpen(fileA, fileB) {
+    let a, b;
+    try {
+        [a, b] = await Promise.all([cmpLoadPixels(fileA), cmpLoadPixels(fileB)]);
+    } catch (err) {
+        alert('Compare failed: ' + err.message);
+        return;
+    }
+    if (a.width !== b.width || a.height !== b.height) {
+        alert(`Compare needs two images of the same resolution — got ${a.width}×${a.height} and ${b.width}×${b.height}.`);
+        return;
+    }
+    cmpData = { a, b, w: a.width, h: a.height };
+    cmpCanvas.width = a.width;
+    cmpCanvas.height = a.height;
+    cmpOverlay.classList.add('visible');
+    cmpRender();
+}
+
+function cmpPick(filename, btn) {
+    if (cmpArmed && cmpArmed.btn === btn) { cmpReset(); return; }  // tap again to cancel
+    if (!cmpArmed) {
+        cmpArmed = { filename, btn };
+        btn.classList.add('cmp-armed');
+        return;
+    }
+    const first = cmpArmed.filename;
+    cmpReset();
+    cmpOpen(first, filename);
+}
+
 const historyGrid = document.getElementById('historyGrid');
 const deleteAllBtn = document.getElementById('deleteAllBtn');
 const latestThumb = document.getElementById('latestThumb');
@@ -2094,6 +2218,7 @@ async function loadHistory() {
             item.className = 'history-item';
             item.innerHTML = `
                 <img loading="lazy">
+                <button type="button" class="item-cmp" title="Compare: pick this and one more image">⧉</button>
                 <button type="button" class="item-ref" title="Use as reference">↪</button>
                 <button type="button" class="item-save" title="Save (survives housekeeping)">★</button>
                 <button type="button" class="item-delete" title="Delete">X</button>
@@ -2112,6 +2237,7 @@ async function loadHistory() {
                 if (e.target.classList.contains('item-delete')) return;
                 if (e.target.classList.contains('item-save')) return;
                 if (e.target.classList.contains('item-ref')) return;
+                if (e.target.classList.contains('item-cmp')) return;
                 openLightbox(lbList, idx);
             });
             const refBtn = item.querySelector('.item-ref');
@@ -2120,6 +2246,19 @@ async function loadHistory() {
                     e.stopPropagation();
                     useAsReference(img.filename);
                 });
+            }
+            const cmpBtn = item.querySelector('.item-cmp');
+            if (cmpBtn) {
+                cmpBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    cmpPick(img.filename, cmpBtn);
+                });
+                // The grid rebuilds on every /history poll; carry an armed
+                // pick over to the freshly created button.
+                if (cmpArmed && cmpArmed.filename === img.filename) {
+                    cmpArmed.btn = cmpBtn;
+                    cmpBtn.classList.add('cmp-armed');
+                }
             }
             const saveBtn = item.querySelector('.item-save');
             if (saveBtn) {
