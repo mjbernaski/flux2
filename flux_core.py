@@ -200,37 +200,71 @@ def _stabilize_vae_fp32(pipeline):
     vae._fp32_stabilized = True
 
 
-# Set by load_model(vae_tiling=True). Module-level so pipelines built lazily
-# after load (img2img) pick the setting up too.
-_vae_tiling_enabled = False
+# --- Tiled VAE decoding -----------------------------------------------------
+#
+# The final decode is the peak-memory moment of a generation: it runs at full
+# output resolution, and _stabilize_vae_fp32 puts it in fp32, which doubles the
+# activations relative to bf16. Once that allocation exceeds what the
+# transformer and text encoder left behind, the Windows driver pages to system
+# RAM instead of raising OOM, and the job appears to stall on its last step with
+# no error at all.
+#
+# Tiling bounds that peak, but it is not free: redundant work on the tile
+# overlaps, and in principle faint seams on very smooth gradients. Measured on
+# an RTX 5090 with klein-4B and an NF4 encoder, 20 steps:
+#
+#   size      untiled   tiled
+#   1mp         15.6s   20.2s
+#   1.5mp       24.7s   38.5s
+#   1.75mp      33.9s   50.1s
+#   2mp        231.4s   45.3s     <- untiled decode alone took 197s of that
+#
+# So neither setting is right everywhere, and the correct choice depends on the
+# resolution of each individual job rather than on how the process started.
+# 'auto' (the default) tiles only above the threshold; 'always'/'off' force it.
+VAE_TILING_MODES = ('auto', 'always', 'off')
+# Between the largest size that is fine untiled (1.75MP) and the smallest that
+# is not (2MP). Tune with VAE_TILING_THRESHOLD_MP for a card with more or less
+# headroom than this one.
+VAE_TILING_DEFAULT_THRESHOLD_MP = 1.9
+
+_vae_tiling_mode = 'auto'
+try:
+    _vae_tiling_threshold_mp = float(
+        os.environ.get('VAE_TILING_THRESHOLD_MP', VAE_TILING_DEFAULT_THRESHOLD_MP))
+except (TypeError, ValueError):
+    _vae_tiling_threshold_mp = VAE_TILING_DEFAULT_THRESHOLD_MP
 
 
-def _apply_vae_tiling(pipeline):
-    """Decode the VAE in overlapping tiles rather than one allocation.
+def _vae_tiling_wanted(width, height):
+    """Whether this output size should be decoded in tiles."""
+    if _vae_tiling_mode == 'always':
+        return True
+    if _vae_tiling_mode == 'off':
+        return False
+    return (width * height) > (_vae_tiling_threshold_mp * 1_000_000)
 
-    The final decode is the peak-memory moment of a generation: it runs at full
-    output resolution, and _stabilize_vae_fp32 puts it in fp32, which doubles
-    the activations relative to bf16. Past roughly 1MP that allocation can
-    exceed whatever the transformer and text encoder left behind. On Windows the
-    driver then pages to system RAM instead of raising OOM, so the job appears to
-    stall on its last step with no error at all (the same silent sysmem fallback
-    that makes an oversized transformer ~10x slower per step).
 
-    Tiling bounds that peak. The costs are real but modest: redundant work on the
-    tile overlaps, and on very smooth gradients the seams can in principle show.
-    That is why this is opt-in (--vae-tiling) rather than always on — correctness
-    of the default output matters more than the memory headroom.
+def _set_vae_tiling(width, height):
+    """Match the VAE's tiling state to the resolution about to be generated.
 
-    Idempotent, and safe on a VAE shared between pipelines.
+    Called per generation rather than once at load, because that is the level
+    the decision actually lives at. Both pipelines share one VAE object, so
+    setting it here covers the lazily-built img2img pipeline too; the calls are
+    idempotent, so doing this every time costs nothing.
     """
-    if not _vae_tiling_enabled:
-        return
-    vae = getattr(pipeline, 'vae', None)
-    # Not every backend's autoencoder implements tiling; skip rather than fail
-    # the whole load over an optimization.
-    if vae is None or not hasattr(vae, 'enable_tiling'):
-        return
-    vae.enable_tiling()
+    want = _vae_tiling_wanted(width, height)
+    for pipeline in (pipe, pipe_img2img):
+        vae = getattr(pipeline, 'vae', None) if pipeline is not None else None
+        # Not every backend's autoencoder implements tiling; skip rather than
+        # fail a generation over an optimization.
+        if vae is None or not hasattr(vae, 'enable_tiling'):
+            continue
+        if want:
+            vae.enable_tiling()
+        elif hasattr(vae, 'disable_tiling'):
+            vae.disable_tiling()
+    return want
 
 
 # Generation can intermittently diverge (bf16 VAE/transformer NaN or saturation)
@@ -258,7 +292,7 @@ def _is_degenerate_image(image):
         return False
 
 
-def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=False, schnell=False, for_lora=False, klein=False, klein_4b=False, kontext=False, quantize_encoder=False, vae_tiling=False):
+def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=False, schnell=False, for_lora=False, klein=False, klein_4b=False, kontext=False, quantize_encoder=False, vae_tiling='auto'):
     """Load the FLUX model components. Call this before generating images.
 
     Args:
@@ -281,13 +315,19 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
         kontext: Use FLUX.1 Kontext, an instruction-based image editor. FLUX.1 only;
             loaded 4-bit (quantized on the fly) with local T5+CLIP encoders. Implies a
             local encoder; ignores flux2/full_model/gguf/schnell.
-        vae_tiling: Decode the VAE in overlapping tiles, bounding the peak memory of
-            the full-resolution final decode. Off by default; see _apply_vae_tiling
-            for when it helps and what it costs.
+        vae_tiling: Tiled VAE decoding policy — 'auto' (default; tile only above
+            VAE_TILING_THRESHOLD_MP), 'always', or 'off'. Bounds the peak memory of
+            the full-resolution final decode; see the VAE_TILING_MODES block above
+            for the measurements behind the default.
     """
     global transformer, pipe, _model_type, _flux_version, _schnell_enabled, _kontext_enabled, _local_encoder_active
-    global _vae_tiling_enabled
-    _vae_tiling_enabled = bool(vae_tiling)
+    global _vae_tiling_mode
+    # Accept the old boolean for callers that predate the three modes.
+    if isinstance(vae_tiling, bool):
+        vae_tiling = 'always' if vae_tiling else 'off'
+    if vae_tiling not in VAE_TILING_MODES:
+        raise ValueError(f"vae_tiling must be one of {VAE_TILING_MODES}, got {vae_tiling!r}")
+    _vae_tiling_mode = vae_tiling
     if pipe is not None:
         print(f"Warning: model already loaded ({_model_type}); ignoring load_model() "
               f"request. Restart the process to switch models.")
@@ -702,9 +742,10 @@ def load_model(local_encoder=False, full_model=False, gguf_quant=None, flux2=Fal
     # Run the VAE in fp32 to avoid intermittent NaN/black decodes (bf16 VAE
     # overflow). Applies to every config; the transformer stays in bf16.
     _stabilize_vae_fp32(pipe)
-    _apply_vae_tiling(pipe)
-    if _vae_tiling_enabled:
-        print("  VAE tiling enabled (bounds peak memory of the final decode)")
+    if _vae_tiling_mode == 'auto':
+        print(f"  VAE tiling: auto (tiles above {_vae_tiling_threshold_mp}MP)")
+    else:
+        print(f"  VAE tiling: {_vae_tiling_mode}")
 
     load_timings['total'] = time.perf_counter() - total_start
     print(f"[{hostname}] Model ready in {load_timings['total']:.2f}s (transformer={load_timings['transformer']:.2f}s, pipeline={load_timings['pipeline']:.2f}s)")
@@ -1161,6 +1202,11 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
             "Start the server/CLI with --flux2."
         )
 
+    # Decide tiling from this job's output size, before anything touches the
+    # VAE. Under the default 'auto' mode this is what keeps large generations
+    # from stalling in the decode while leaving smaller ones on the fast path.
+    _set_vae_tiling(width, height)
+
     # Normalize the reference input to a list. The first image is the primary
     # reference; extra images are only meaningful for FLUX.2 (native
     # multi-reference) and Kontext (stitched into one conditioning canvas).
@@ -1369,7 +1415,6 @@ def generate_image(prompt, seed=None, steps=6, width=1024, height=1024, local_en
                     # Keep the img2img VAE in fp32 too (shares the txt2img VAE,
                     # so this is a no-op when already stabilized).
                     _stabilize_vae_fp32(pipe_img2img)
-                    _apply_vae_tiling(pipe_img2img)
 
                 input_image = input_image.resize((width, height), Image.Resampling.LANCZOS)
 

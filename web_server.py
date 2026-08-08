@@ -1519,7 +1519,8 @@ def _api_model_info():
         'sd': _SDXL_ACTIVE,
         'negative_prompt': getattr(flux_core, 'SUPPORTS_NEGATIVE_PROMPT', False),
         'inpaint': flux_core._flux_version == 2 or getattr(flux_core, 'SUPPORTS_INPAINT', False),
-        'vae_tiling': getattr(flux_core, '_vae_tiling_enabled', False),
+        'vae_tiling': getattr(flux_core, '_vae_tiling_mode', 'auto'),
+        'vae_tiling_threshold_mp': getattr(flux_core, '_vae_tiling_threshold_mp', None),
         'hostname': socket.gethostname(),
         'version': VERSION,
         'description': f"{model_type}{turbo_str}{uncensored_str} with {encoder_type}"
@@ -2419,7 +2420,9 @@ if __name__ == '__main__':
     parser.add_argument("--klein", action="store_true", help="Use FLUX.2-klein (9B) instead of FLUX.2-dev (32B). Implies --flux2 --full-model")
     parser.add_argument("--klein-4b", action="store_true", help="Use FLUX.2-klein-4B instead of the 9B. Implies --klein --flux2 --full-model")
     parser.add_argument("--quantize-encoder", action="store_true", help="FLUX.2 full/klein: load the text encoder 4-bit NF4 (transformer stays bf16). For discrete-VRAM cards where both won't fit in bf16")
-    parser.add_argument("--vae-tiling", action="store_true", help="Decode the VAE in overlapping tiles, bounding the peak memory of the full-resolution final decode. Use when generations above ~1MP stall on the last step (the fp32 decode's allocation spilling to system RAM)")
+    parser.add_argument("--vae-tiling", nargs='?', const='always', default='auto',
+                        choices=['auto', 'always', 'off'],
+                        help="Tiled VAE decoding, which bounds the peak memory of the full-resolution final decode. 'auto' (default) tiles only above VAE_TILING_THRESHOLD_MP (1.9MP), since tiling costs ~50%% below that and rescues generations that would otherwise stall on the last step. Bare --vae-tiling means 'always'")
     parser.add_argument("--turbo", action="store_true", default=None, help="Enable turbo LoRA")
     parser.add_argument("--no-turbo", action="store_true", help="Disable turbo LoRA")
     parser.add_argument("--uncensored", action="store_true", help="Load the uncensored LoRA (FLUX.1 only)")

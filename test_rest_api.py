@@ -89,6 +89,40 @@ def main():
     r = client.get(f'{PREFIX}/models/current', headers=AUTH)
     check('models/current responds', r.status_code == 200)
 
+    print("\nvae tiling policy")
+    import flux_core
+    body = client.get(f'{PREFIX}/model', headers=AUTH).get_json()
+    check('model reports the tiling mode and threshold',
+          body.get('vae_tiling') in flux_core.VAE_TILING_MODES
+          and isinstance(body.get('vae_tiling_threshold_mp'), (int, float)),
+          f"{body.get('vae_tiling')!r} / {body.get('vae_tiling_threshold_mp')!r}")
+
+    # The decision is per output size — that is the whole point of 'auto'.
+    original = flux_core._vae_tiling_mode
+    try:
+        flux_core._vae_tiling_mode = 'auto'
+        below = flux_core._vae_tiling_wanted(1216, 832)     # ~1.0MP
+        at_175 = flux_core._vae_tiling_wanted(1600, 1088)   # ~1.74MP
+        above = flux_core._vae_tiling_wanted(1728, 1152)    # ~1.99MP
+        way_above = flux_core._vae_tiling_wanted(2048, 2048)
+        check('auto leaves 1MP untiled', below is False)
+        check('auto leaves 1.75MP untiled (measured fine there)', at_175 is False)
+        check('auto tiles just under 2MP', above is True)
+        check('auto tiles well above the threshold', way_above is True)
+
+        flux_core._vae_tiling_mode = 'always'
+        check('always tiles even a small image',
+              flux_core._vae_tiling_wanted(512, 512) is True)
+
+        flux_core._vae_tiling_mode = 'off'
+        check('off never tiles, however large',
+              flux_core._vae_tiling_wanted(4096, 4096) is False)
+    finally:
+        flux_core._vae_tiling_mode = original
+
+    check('an unknown mode is rejected at load',
+          _rejects_bad_tiling_mode(flux_core))
+
     r = client.put(f'{PREFIX}/models/current', headers=AUTH, json={'config': 'nope'})
     check('switching without a supervisor is refused',
           r.status_code == 400 and err_code(r) == 'no_supervisor',
@@ -377,6 +411,23 @@ def main():
             print(f"  - {f}")
         return 1
     return 0
+
+
+def _rejects_bad_tiling_mode(flux_core):
+    """load_model should refuse a typo'd mode rather than silently defaulting.
+
+    The model is already 'loaded' as far as load_model is concerned in most
+    runs, so this checks the validation directly — it happens before the
+    already-loaded early return only for a genuinely bad value.
+    """
+    try:
+        flux_core.load_model(vae_tiling='sometimes')
+    except ValueError:
+        return True
+    except Exception:
+        # Any other failure means validation did not run first.
+        return False
+    return False
 
 
 def _spec_covers_routes(spec):

@@ -57,7 +57,33 @@ pipe_img2img = None
 pipe_inpaint = None
 _model_id = None
 # Mirrors flux_core so web_server can report the setting uniformly.
-_vae_tiling_enabled = False
+_vae_tiling_mode = 'auto'
+VAE_TILING_DEFAULT_THRESHOLD_MP = 1.9
+try:
+    _vae_tiling_threshold_mp = float(
+        os.environ.get('VAE_TILING_THRESHOLD_MP', VAE_TILING_DEFAULT_THRESHOLD_MP))
+except (TypeError, ValueError):
+    _vae_tiling_threshold_mp = VAE_TILING_DEFAULT_THRESHOLD_MP
+
+
+def _set_vae_tiling(width, height):
+    """Match the VAE's tiling state to the resolution about to be generated —
+    same policy as flux_core._set_vae_tiling."""
+    if _vae_tiling_mode == 'always':
+        want = True
+    elif _vae_tiling_mode == 'off':
+        want = False
+    else:
+        want = (width * height) > (_vae_tiling_threshold_mp * 1_000_000)
+    for pipeline in (pipe, pipe_img2img, pipe_inpaint):
+        vae = getattr(pipeline, 'vae', None) if pipeline is not None else None
+        if vae is None or not hasattr(vae, 'enable_tiling'):
+            continue
+        if want:
+            vae.enable_tiling()
+        elif hasattr(vae, 'disable_tiling'):
+            vae.disable_tiling()
+    return want
 
 # flux_core-compatible state flags (web_server reads these directly).
 # _flux_version = 1 gives SDXL the same web-API constraints as FLUX.1:
@@ -78,15 +104,14 @@ def model_name():
     return os.path.basename(_model_id or DEFAULT_SDXL_MODEL)
 
 
-def load_model(model_id=None, vae_tiling=False, **_flux_kwargs):
+def load_model(model_id=None, vae_tiling='auto', **_flux_kwargs):
     """Load an SDXL checkpoint (HF repo id, local diffusers dir, or single
     .safetensors file). Extra flux_core-style kwargs are accepted and ignored
     so the server's generic load call works unchanged.
 
-    vae_tiling mirrors flux_core: decode in overlapping tiles so the
-    full-resolution final decode does not need one large allocation. SDXL's VAE
-    stays in bf16 here, so the pressure is lower than on the FLUX cores, but the
-    flag is honored for consistency at high megapixel counts.
+    vae_tiling mirrors flux_core: 'auto' (tile only above the threshold),
+    'always', or 'off'. SDXL's VAE stays in bf16 here, so the memory pressure is
+    lower than on the FLUX cores, but the policy is honored for consistency.
     """
     global pipe, pipe_img2img, _model_id
 
@@ -110,14 +135,13 @@ def load_model(model_id=None, vae_tiling=False, **_flux_kwargs):
     # img2img shares every component with the txt2img pipeline — no extra VRAM.
     pipe_img2img = StableDiffusionXLImg2ImgPipeline.from_pipe(pipe)
 
-    # One shared VAE, so enabling here covers both pipelines.
-    global _vae_tiling_enabled
-    _vae_tiling_enabled = bool(vae_tiling) and hasattr(pipe.vae, 'enable_tiling')
-    if _vae_tiling_enabled:
-        pipe.vae.enable_tiling()
+    global _vae_tiling_mode
+    if isinstance(vae_tiling, bool):        # accept the old boolean
+        vae_tiling = 'always' if vae_tiling else 'off'
+    _vae_tiling_mode = vae_tiling
 
     print(f"SDXL ready in {time.perf_counter() - t0:.1f}s "
-          f"({model_name()}, bf16{', VAE tiling' if vae_tiling else ''})")
+          f"({model_name()}, bf16, VAE tiling: {_vae_tiling_mode})")
     return {"pipeline": time.perf_counter() - t0}
 
 
@@ -223,6 +247,8 @@ def generate_image(prompt, seed=None, steps=25, width=1024, height=1024,
     """
     if pipe is None:
         raise RuntimeError("Model must be loaded before generating")
+    # Tiling decided per job from the output size (see _set_vae_tiling).
+    _set_vae_tiling(width, height)
     if mask_image is not None and input_image is None:
         raise ValueError("Inpainting (mask_image) needs an input image.")
 
