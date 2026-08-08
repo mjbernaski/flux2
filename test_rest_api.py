@@ -181,8 +181,22 @@ def main():
           r.headers['Content-Type'].startswith('text/html'))
     check('queue.html polls its own JSON resource', b'/api/v1/queue?api_key=' in r.data)
 
+    # The shell must load without a key or the browser never runs the code that
+    # supplies one — this is what a plain <a href> from the UI does.
     r = client.get(f'{PREFIX}/queue.html')
-    check('queue.html still requires a key', r.status_code == 401)
+    check('queue.html loads without a key (plain navigation)',
+          r.status_code == 200, f"got {r.status_code}")
+    check('the unauthenticated shell carries no queue data',
+          b'"running"' not in r.data and b'job_id' not in r.data)
+
+    r = client.get(f'{PREFIX}/jobs/abc123/previews.html')
+    check('previews.html loads without a key', r.status_code == 200,
+          f"got {r.status_code}")
+
+    # The data behind them stays gated.
+    r = client.get(f'{PREFIX}/queue')
+    check('the queue JSON still requires a key',
+          r.status_code == 401 and err_code(r) == 'unauthorized')
 
     r = client.get(f'{PREFIX}/jobs/abc123/previews.html', headers=AUTH)
     check('previews.html renders for a job id',

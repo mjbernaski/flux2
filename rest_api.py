@@ -45,7 +45,16 @@ URL_PREFIX = '/api/' + API_VERSION
 # without an API key. Everything else on the blueprint is gated. /health is
 # public for the same reason /ready is — a client has to be able to see whether
 # the server is up before it can be told a key is wrong.
-PUBLIC_ENDPOINTS = ['rest.index', 'rest.health', 'rest.openapi', 'rest.docs']
+PUBLIC_ENDPOINTS = [
+    'rest.index', 'rest.health', 'rest.openapi', 'rest.docs',
+    # The two live views are static shells: no data is rendered server-side,
+    # they fetch it themselves with the key from localStorage. They have to be
+    # public for the same reason index.html is — a browser navigating to a URL
+    # cannot send an X-API-Key header, so gating the shell means the page never
+    # loads and the code that would supply the key never runs. The JSON they
+    # call stays protected, so an unauthenticated visitor sees an empty frame.
+    'rest.queue_page', 'rest.job_previews_page',
+]
 
 rest = Blueprint('rest', __name__, url_prefix=URL_PREFIX)
 
