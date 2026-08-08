@@ -6,7 +6,7 @@
     <meta name="theme-color" content="#1a1a2e">
     <title>flux</title>
     <script>document.title = window.location.hostname + ' flux';</script>
-    <link rel="stylesheet" href="/static/app.css?v=5">
+    <link rel="stylesheet" href="/static/app.css?v=8">
     <!-- Layout-only overrides: same components/IDs/behavior as the classic
          page, arranged as a sticky sidebar + main dashboard instead of one
          long scrolling column. Loaded after app.css so its rules win. -->
@@ -110,6 +110,7 @@
                             <button type="button" id="promptPrevBtn" title="Previous prompt">&#9664;</button>
                             <span id="promptHistoryPos"></span>
                             <button type="button" id="promptNextBtn" title="Next prompt (forward to your draft)">&#9654;</button>
+                            <button type="button" id="promptCopyBtn" class="prompt-copy-btn" title="Copy the prompt to the clipboard">Copy</button>
                             <button type="button" id="promptClearBtn" class="prompt-clear-btn" title="Clear the prompt">Clear</button>
                         </div>
                     </div>
@@ -243,6 +244,7 @@
                             <option value="0.75mp">0.75 MP</option>
                             <option value="1mp" selected>1 MP</option>
                             <option value="1.5mp">1.5 MP</option>
+                            <option value="1.75mp">1.75 MP</option>
                             <option value="2mp">2 MP</option>
                         </select>
                     </div>
@@ -490,6 +492,6 @@
         <img id="latestThumbImg" alt="Latest generation">
     </button>
 
-    <script src="/static/app.js?v=5"></script>
+    <script src="/static/app.js?v=8"></script>
 </body>
 </html>

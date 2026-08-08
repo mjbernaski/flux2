@@ -63,6 +63,8 @@ label { display: block; margin-bottom: 5px; color: #aaa; }
     cursor: default;
 }
 .prompt-history-nav button:not(:disabled):hover { border-color: #00d4ff; }
+.prompt-history-nav button.prompt-copy-btn { color: #888; margin-left: 4px; }
+.prompt-history-nav button.prompt-copy-btn:not(:disabled):hover { color: #00d4ff; }
 .prompt-history-nav button.prompt-clear-btn { color: #888; margin-left: 4px; }
 .prompt-history-nav button.prompt-clear-btn:not(:disabled):hover { color: #ff6b6b; border-color: #ff6b6b; }
 #promptHistoryPos {
@@ -871,6 +873,23 @@ button:disabled {
     font-size: 18px;
     margin: 0;
 }
+/* The history gallery collapses like the results section; the title lives in
+   the summary (inline so the disclosure marker stays on the same line) and
+   the Archive/Delete actions only render inside the open content. */
+.history-details summary {
+    cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
+    padding: 4px 0;
+}
+.history-details summary h2 { display: inline; }
+.history-details summary .result-count {
+    color: #666;
+    font-weight: normal;
+    font-size: 13px;
+}
+.history-details[open] > summary { margin-bottom: 14px; }
+.history-details .history-header { justify-content: flex-end; margin-bottom: 14px; }
 .history-actions { display: flex; gap: 8px; }
 .archive-btn {
     flex: 0 0 auto;
@@ -1382,6 +1401,11 @@ button:disabled {
         backdrop-filter: blur(6px);
         -webkit-backdrop-filter: blur(6px);
     }
+
+    /* The sticky Generate/Reset row owns the viewport bottom on touch
+       devices; lift the wattage badge and latest-image thumb clear of it. */
+    .power-badge { bottom: calc(80px + env(safe-area-inset-bottom, 0px)); }
+    .latest-thumb { bottom: calc(118px + env(safe-area-inset-bottom, 0px)); }
 }
 
 /* ==== Responsive layout ==== */

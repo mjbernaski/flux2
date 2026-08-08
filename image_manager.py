@@ -432,6 +432,23 @@ HTML_PAGE = r"""<!doctype html>
                         font-size: 12px; white-space: pre-wrap; word-break: break-word; max-height: 120px; overflow: auto; }
   .close-btn { background: transparent; border: none; color: var(--fg); font-size: 20px; cursor: pointer; }
 
+  /* Pixel compare overlay (header "Compare" button, two images selected) */
+  #cmpOverlay { position: fixed; inset: 0; background: rgba(0,0,0,0.92); display: none;
+                flex-direction: column; align-items: center; justify-content: center;
+                gap: 12px; padding: 20px; z-index: 80; }
+  #cmpOverlay.open { display: flex; }
+  .cmp-stage { max-width: 95vw; max-height: 80vh; overflow: auto; }
+  .cmp-stage canvas { display: block; max-width: 100%; height: auto;
+                      /* checkerboard shows through wherever the two images disagree */
+                      background: repeating-conic-gradient(#2a2a2a 0% 25%, #454545 0% 50%) 0 0 / 20px 20px; }
+  .cmp-hud { display: flex; align-items: center; justify-content: center; flex-wrap: wrap;
+             gap: 14px; font-size: 14px; }
+  .cmp-hud label { display: flex; align-items: center; gap: 8px; }
+  #cmpClose { position: absolute; top: 14px; right: 14px; width: 36px; height: 36px;
+              background: rgba(255,255,255,0.12); color: #fff; border: none; border-radius: 50%;
+              font-size: 16px; cursor: pointer; }
+  #cmpClose:hover { background: rgba(255,255,255,0.25); }
+
   #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
            background: var(--panel); border: 1px solid var(--border); border-radius: 4px;
            padding: 8px 16px; z-index: 100; display: none; }
@@ -455,6 +472,7 @@ HTML_PAGE = r"""<!doctype html>
   <span id="count" class="muted"></span>
   <button id="selectAllBtn" title="Select all images in this folder">Select all</button>
   <span id="selCount" class="muted" style="display:none"></span>
+  <button id="cmpBtn" style="display:none" title="Show only the pixels the two selected images share">Compare &#x29C9;</button>
   <button id="bulkHideBtn" style="display:none">Hide selected</button>
   <button id="bulkDeleteBtn" class="danger" style="display:none">Delete selected</button>
   <button id="clearSelBtn" style="display:none">Clear</button>
@@ -513,6 +531,16 @@ HTML_PAGE = r"""<!doctype html>
         <button id="deleteBtn" class="danger">Delete permanently</button>
       </div>
     </div>
+  </div>
+</div>
+
+<div id="cmpOverlay">
+  <button id="cmpClose" title="Close (Esc)">&times;</button>
+  <div class="cmp-stage"><canvas id="cmpCanvas"></canvas></div>
+  <div class="cmp-hud">
+    <span id="cmpStat"></span>
+    <label>Tolerance <input type="range" id="cmpTol" min="0" max="48" step="1" value="8"></label>
+    <span id="cmpTolVal">8</span>
   </div>
 </div>
 
@@ -658,6 +686,7 @@ function updateSelectionUI() {
   $('#bulkHideBtn').style.display = n ? 'inline-block' : 'none';
   $('#bulkHideBtn').textContent =
     $('#folderSel').value.split('/').includes('.hide') ? 'Unhide selected' : 'Hide selected';
+  $('#cmpBtn').style.display = n === 2 ? 'inline-block' : 'none';
   $('#clearSelBtn').style.display = n ? 'inline-block' : 'none';
   $('#selectAllBtn').style.display = state.items.length ? 'inline-block' : 'none';
   $('#selectAllBtn').textContent =
@@ -994,7 +1023,11 @@ $('#deleteBtn').addEventListener('click', async () => {
 $('#closeBtn').addEventListener('click', closeModal);
 $('#modal').addEventListener('click', e => { if (e.target.id === 'modal') closeModal(); });
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') { closeModal(); return; }
+  if (e.key === 'Escape') {
+    if ($('#cmpOverlay').classList.contains('open')) cmpClose();
+    else closeModal();
+    return;
+  }
   if ((e.key === 'ArrowLeft' || e.key === 'ArrowRight') && state.current) {
     const tag = (e.target.tagName || '').toLowerCase();
     if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
@@ -1079,6 +1112,84 @@ $('#bulkDeleteBtn').addEventListener('click', async () => {
   toast(failed ? `Deleted ${ok}, ${failed} failed: ${lastErr}` : `Deleted ${ok}`, failed > 0);
   refresh();
 });
+// ---- Pixel compare: with exactly two images selected, render only the
+// pixels they share — per-channel RGB diff within the tolerance keeps the
+// first image's pixel, anything else goes transparent over the stage's
+// checkerboard. Same tool as the generator UI's history-card ⧉ button. ----
+let cmpData = null;  // {a, b: ImageData, w, h} while the overlay is open
+
+function cmpClose() {
+  $('#cmpOverlay').classList.remove('open');
+  cmpData = null;
+  const c = $('#cmpCanvas');
+  c.width = c.height = 0;  // frees the decoded bitmap
+}
+$('#cmpClose').addEventListener('click', cmpClose);
+$('#cmpOverlay').addEventListener('click', e => { if (e.target.id === 'cmpOverlay') cmpClose(); });
+
+function cmpRender() {
+  if (!cmpData) return;
+  const tol = parseInt($('#cmpTol').value, 10);
+  $('#cmpTolVal').textContent = tol;
+  const { a, b, w, h } = cmpData;
+  const out = new ImageData(w, h);
+  const pa = a.data, pb = b.data, po = out.data;
+  let same = 0;
+  for (let i = 0; i < pa.length; i += 4) {
+    if (Math.abs(pa[i] - pb[i]) <= tol &&
+        Math.abs(pa[i+1] - pb[i+1]) <= tol &&
+        Math.abs(pa[i+2] - pb[i+2]) <= tol) {
+      po[i] = pa[i]; po[i+1] = pa[i+1]; po[i+2] = pa[i+2]; po[i+3] = 255;
+      same++;
+    }
+  }
+  $('#cmpCanvas').getContext('2d').putImageData(out, 0, 0);
+  $('#cmpStat').textContent = `${w}×${h} — ${(100*same/(w*h)).toFixed(1)}% of pixels match`;
+}
+$('#cmpTol').addEventListener('input', () => {
+  if (cmpRender._raf) cancelAnimationFrame(cmpRender._raf);
+  cmpRender._raf = requestAnimationFrame(cmpRender);
+});
+
+function cmpLoadPixels(rel) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const c = document.createElement('canvas');
+      c.width = img.naturalWidth;
+      c.height = img.naturalHeight;
+      const ctx = c.getContext('2d', { willReadFrequently: true });
+      ctx.drawImage(img, 0, 0);
+      resolve(ctx.getImageData(0, 0, c.width, c.height));
+    };
+    img.onerror = () => reject(new Error('failed to load ' + rel));
+    img.src = imgUrl(rel);
+  });
+}
+
+$('#cmpBtn').addEventListener('click', async () => {
+  // Grid order, so "first image" is deterministic regardless of click order.
+  const rels = state.items.filter(it => state.selected.has(it.rel)).map(it => it.rel);
+  if (rels.length !== 2) return;
+  const btn = $('#cmpBtn');
+  btn.disabled = true;
+  let a, b;
+  try {
+    [a, b] = await Promise.all([cmpLoadPixels(rels[0]), cmpLoadPixels(rels[1])]);
+  } catch (e) { btn.disabled = false; toast(e.message, true); return; }
+  btn.disabled = false;
+  if (a.width !== b.width || a.height !== b.height) {
+    toast(`Compare needs the same resolution — got ${a.width}×${a.height} and ${b.width}×${b.height}`, true);
+    return;
+  }
+  cmpData = { a, b, w: a.width, h: a.height };
+  const c = $('#cmpCanvas');
+  c.width = a.width;
+  c.height = a.height;
+  $('#cmpOverlay').classList.add('open');
+  cmpRender();
+});
+
 $('#apiKey').addEventListener('change', () => {
   localStorage.setItem('im_api_key', apiKey());
   refresh();

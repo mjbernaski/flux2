@@ -1377,6 +1377,9 @@ if (resetBtn) resetBtn.addEventListener('click', async function() {
     if (knownImageFilenames) knownImageFilenames.clear();
     seenDoneJobIds.clear();
     lastCompletedJobId = null;
+    // Hide the floating latest-image thumb; loadHistory re-shows it when the
+    // next generation finishes.
+    var lt = document.getElementById('latestThumb'); if (lt) lt.style.display = 'none';
     const pt = document.getElementById('progressTracker'); if (pt) pt.style.display = 'none';
     const pb = document.getElementById('progressBar'); if (pb) pb.style.width = '0%';
 });
@@ -2000,8 +2003,10 @@ function syncPromptNav() {
     if (pos) pos.textContent = promptHistoryIdx < promptHistory.length
         ? (promptHistoryIdx + 1) + '/' + promptHistory.length : '';
     const clear = document.getElementById('promptClearBtn');
+    const copy = document.getElementById('promptCopyBtn');
     const ta = document.getElementById('prompt');
     if (clear) clear.disabled = !ta || ta.value.length === 0;
+    if (copy) copy.disabled = !ta || ta.value.length === 0;
 }
 
 function promptHistoryGo(delta) {
@@ -2033,8 +2038,31 @@ function recordPromptHistory(text) {
     const next = document.getElementById('promptNextBtn');
     const ta = document.getElementById('prompt');
     const clear = document.getElementById('promptClearBtn');
+    const copy = document.getElementById('promptCopyBtn');
     if (prev) prev.addEventListener('click', function() { promptHistoryGo(-1); });
     if (next) next.addEventListener('click', function() { promptHistoryGo(1); });
+    // Copy the prompt to the clipboard. navigator.clipboard needs a secure
+    // context, which plain-http LAN access isn't, so fall back to selecting
+    // the textarea and execCommand('copy').
+    if (copy) copy.addEventListener('click', function() {
+        if (!ta || !ta.value) return;
+        function copied() {
+            copy.textContent = 'Copied ✓';
+            setTimeout(function() { copy.textContent = 'Copy'; }, 1200);
+        }
+        function fallbackCopy() {
+            const start = ta.selectionStart, end = ta.selectionEnd;
+            ta.select();
+            try { if (document.execCommand('copy')) copied(); } catch (e) {}
+            ta.setSelectionRange(start, end);
+            ta.blur();
+        }
+        if (navigator.clipboard && window.isSecureContext) {
+            navigator.clipboard.writeText(ta.value).then(copied, fallbackCopy);
+        } else {
+            fallbackCopy();
+        }
+    });
     // Clear just the prompt (not the whole form like Reset): empty the box,
     // drop back to an empty draft, and let the 'input' event refresh autogrow.
     if (clear) clear.addEventListener('click', function() {
@@ -2196,6 +2224,8 @@ async function loadHistory() {
         const data = await response.json();
         historyGrid.innerHTML = '';
         const hasImages = data.images.length > 0;
+        const historyCount = document.getElementById('historyCount');
+        if (historyCount) historyCount.textContent = hasImages ? `(${data.images.length})` : '';
         if (archiveBtn) archiveBtn.style.display = hasImages ? 'block' : 'none';
         if (deleteAllBtn) deleteAllBtn.style.display = hasImages ? 'block' : 'none';
         if (!hasImages) {
