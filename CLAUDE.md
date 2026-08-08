@@ -69,7 +69,12 @@ diffusers, transformers, flask, python-dotenv, huggingface_hub, requests.
   API (Mistral3/Qwen3 encoders).
 - **Stability**: the VAE always runs in fp32 (`_stabilize_vae_fp32`) to prevent
   bf16 NaN → black-image decodes; generation retries once on a degenerate
-  (all-black) result.
+  (all-black) result. That fp32 upcast doubles the activations of the
+  full-resolution final decode, which is the peak-memory moment of a
+  generation — `--vae-tiling` (`_apply_vae_tiling`) decodes in overlapping
+  tiles to bound it, opt-in because tiling can leave faint seams on smooth
+  gradients. Symptom it addresses: above ~1MP the job stalls on its last step
+  with no error, the driver having silently paged the decode to system RAM.
 - **Reference images**: `generate_image` accepts one PIL image or a list of up
   to `MAX_REFERENCE_IMAGES` (3). FLUX.2 pipelines take the list natively;
   Kontext stitches multiple refs side-by-side (`_stitch_references`) since its

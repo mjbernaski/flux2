@@ -248,6 +248,7 @@ SECTIONS = [
                     ['inpaint', 'mask_image is accepted'],
                     ['kontext', 'Instruction-editing backend'],
                     ['turbo, schnell', 'Few-step variants — expect fewer steps than requested'],
+                    ['vae_tiling', 'Server started with --vae-tiling (tiled final decode)'],
                 ],
                 caption='GET /model'),
         ],

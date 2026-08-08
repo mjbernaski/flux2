@@ -1519,6 +1519,7 @@ def _api_model_info():
         'sd': _SDXL_ACTIVE,
         'negative_prompt': getattr(flux_core, 'SUPPORTS_NEGATIVE_PROMPT', False),
         'inpaint': flux_core._flux_version == 2 or getattr(flux_core, 'SUPPORTS_INPAINT', False),
+        'vae_tiling': getattr(flux_core, '_vae_tiling_enabled', False),
         'hostname': socket.gethostname(),
         'version': VERSION,
         'description': f"{model_type}{turbo_str}{uncensored_str} with {encoder_type}"
@@ -2407,6 +2408,7 @@ if __name__ == '__main__':
     parser.add_argument("--klein", action="store_true", help="Use FLUX.2-klein (9B) instead of FLUX.2-dev (32B). Implies --flux2 --full-model")
     parser.add_argument("--klein-4b", action="store_true", help="Use FLUX.2-klein-4B instead of the 9B. Implies --klein --flux2 --full-model")
     parser.add_argument("--quantize-encoder", action="store_true", help="FLUX.2 full/klein: load the text encoder 4-bit NF4 (transformer stays bf16). For discrete-VRAM cards where both won't fit in bf16")
+    parser.add_argument("--vae-tiling", action="store_true", help="Decode the VAE in overlapping tiles, bounding the peak memory of the full-resolution final decode. Use when generations above ~1MP stall on the last step (the fp32 decode's allocation spilling to system RAM)")
     parser.add_argument("--turbo", action="store_true", default=None, help="Enable turbo LoRA")
     parser.add_argument("--no-turbo", action="store_true", help="Disable turbo LoRA")
     parser.add_argument("--uncensored", action="store_true", help="Load the uncensored LoRA (FLUX.1 only)")
@@ -2440,12 +2442,12 @@ if __name__ == '__main__':
             if _SDXL_ACTIVE:
                 _model_load_status = "loading SDXL model"
                 print("Loading SDXL...")
-                load_model(model_id=args.sdxl or None)
+                load_model(model_id=args.sdxl or None, vae_tiling=args.vae_tiling)
             else:
                 _model_name = "FLUX.1-Kontext" if _kontext else ("FLUX.2" if _flux2 else "FLUX.1")
                 _model_load_status = f"loading {_model_name} model"
                 print(f"Loading {_model_name}...")
-                load_model(local_encoder=_local_encoder, full_model=_full_model, gguf_quant=_gguf_quant, flux2=_flux2, schnell=_schnell, for_lora=_uncensored, klein=_klein, klein_4b=_klein_4b, kontext=_kontext, quantize_encoder=args.quantize_encoder)
+                load_model(local_encoder=_local_encoder, full_model=_full_model, gguf_quant=_gguf_quant, flux2=_flux2, schnell=_schnell, for_lora=_uncensored, klein=_klein, klein_4b=_klein_4b, kontext=_kontext, quantize_encoder=args.quantize_encoder, vae_tiling=args.vae_tiling)
             if _turbo:
                 _model_load_status = "loading turbo LoRA"
                 load_turbo_lora()

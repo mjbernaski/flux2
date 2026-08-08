@@ -77,6 +77,11 @@ Check `GET /model` before sending optional fields: `negative_prompt` needs the
 SDXL backend, `mask_image` needs FLUX.2 or SDXL, and more than one reference
 image needs Kontext or FLUX.2. Sending an unsupported field is a `400`.
 
+`GET /model` also reports `vae_tiling`, which says whether the server was
+started with `--vae-tiling`. That decodes the final image in overlapping tiles
+instead of one allocation — worth turning on if generations above roughly 1 MP
+stall on their last step, which is the fp32 VAE decode spilling out of VRAM.
+
 `PUT /models/current` answers `202`, not `200`: the models are far too large to
 hot-swap, so switching writes the target config to a file and exits with a code
 the supervisor interprets as "relaunch me". The response means the restart was

@@ -36,6 +36,7 @@ def main():
     parser.add_argument("--flux2", action="store_true", help="Use FLUX.2 model instead of FLUX.1 (requires more VRAM)")
     parser.add_argument("--schnell", action="store_true", help="Use FLUX.1-schnell (fast 4-step model, Apache 2.0 license)")
     parser.add_argument("--kontext", action="store_true", help="Use FLUX.1 Kontext, an instruction-based image editor (4-bit; add --full-model for full bf16). Pass --image and a prompt describing the edit.")
+    parser.add_argument("--vae-tiling", action="store_true", help="Decode the VAE in overlapping tiles, bounding the peak memory of the full-resolution final decode. Use when generations above ~1MP stall at the end")
     parser.add_argument("--image", type=str, nargs='+', default=None, metavar="PATH",
                         help=f"Reference image path(s) for img2img/editing, up to {MAX_REFERENCE_IMAGES}. "
                              "Multiple references need --kontext (stitched side-by-side) or --flux2 (native)")
@@ -46,7 +47,7 @@ def main():
     use_local_encoder = args.local_encoder or args.full_model or args.schnell or args.kontext
 
     # Load the model
-    load_model(local_encoder=use_local_encoder, full_model=args.full_model, gguf_quant=args.gguf, flux2=args.flux2, schnell=args.schnell, kontext=args.kontext)
+    load_model(local_encoder=use_local_encoder, full_model=args.full_model, gguf_quant=args.gguf, flux2=args.flux2, schnell=args.schnell, kontext=args.kontext, vae_tiling=args.vae_tiling)
 
     if args.compile:
         compile_pipeline()

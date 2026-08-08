@@ -56,6 +56,8 @@ pipe = None
 pipe_img2img = None
 pipe_inpaint = None
 _model_id = None
+# Mirrors flux_core so web_server can report the setting uniformly.
+_vae_tiling_enabled = False
 
 # flux_core-compatible state flags (web_server reads these directly).
 # _flux_version = 1 gives SDXL the same web-API constraints as FLUX.1:
@@ -76,10 +78,16 @@ def model_name():
     return os.path.basename(_model_id or DEFAULT_SDXL_MODEL)
 
 
-def load_model(model_id=None, **_flux_kwargs):
+def load_model(model_id=None, vae_tiling=False, **_flux_kwargs):
     """Load an SDXL checkpoint (HF repo id, local diffusers dir, or single
     .safetensors file). Extra flux_core-style kwargs are accepted and ignored
-    so the server's generic load call works unchanged."""
+    so the server's generic load call works unchanged.
+
+    vae_tiling mirrors flux_core: decode in overlapping tiles so the
+    full-resolution final decode does not need one large allocation. SDXL's VAE
+    stays in bf16 here, so the pressure is lower than on the FLUX cores, but the
+    flag is honored for consistency at high megapixel counts.
+    """
     global pipe, pipe_img2img, _model_id
 
     _model_id = model_id or DEFAULT_SDXL_MODEL
@@ -102,8 +110,14 @@ def load_model(model_id=None, **_flux_kwargs):
     # img2img shares every component with the txt2img pipeline — no extra VRAM.
     pipe_img2img = StableDiffusionXLImg2ImgPipeline.from_pipe(pipe)
 
+    # One shared VAE, so enabling here covers both pipelines.
+    global _vae_tiling_enabled
+    _vae_tiling_enabled = bool(vae_tiling) and hasattr(pipe.vae, 'enable_tiling')
+    if _vae_tiling_enabled:
+        pipe.vae.enable_tiling()
+
     print(f"SDXL ready in {time.perf_counter() - t0:.1f}s "
-          f"({model_name()}, bf16)")
+          f"({model_name()}, bf16{', VAE tiling' if vae_tiling else ''})")
     return {"pipeline": time.perf_counter() - t0}
 
 
