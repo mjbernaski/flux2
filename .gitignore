@@ -67,3 +67,9 @@ edit-loop-sessions/
 ollama.log
 ollama.err.log
 .last_config
+
+# Editor/log artifacts (siblings of the entries above)
+image_manager.err.log
+
+# API guide build intermediates; the PDFs in docs/ are the deliverable
+docs/*.html

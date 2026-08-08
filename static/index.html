@@ -197,6 +197,7 @@
                     <option value="0.5mp">0.5 MP</option>
                     <option value="0.75mp">0.75 MP</option>
                     <option value="1mp" selected>1 MP</option>
+                    <option value="1.25mp">1.25 MP</option>
                     <option value="1.5mp">1.5 MP</option>
                     <option value="1.75mp">1.75 MP</option>
                     <option value="2mp">2 MP</option>
@@ -459,7 +460,10 @@
 
     <div class="result" id="result">
         <details class="result-details" id="resultDetails">
-            <summary>Generated images <span class="result-count" id="resultCount"></span></summary>
+            <summary>Generated images <span class="result-count" id="resultCount"></span>
+                <button type="button" class="clear-inline-btn" id="clearRecentInline"
+                        title="Clear these results (the images themselves are kept)">Clear</button>
+            </summary>
             <div class="image-grid" id="imageGrid"></div>
             <p class="generation-info" id="generationInfo"></p>
             <div class="step-frames" id="stepFrames" style="display: none;"></div>

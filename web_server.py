@@ -21,6 +21,11 @@ from flask import Flask, request, jsonify, send_from_directory, Response, stream
 from PIL import Image, ImageDraw, ImageFont
 from dotenv import load_dotenv
 
+# The /api/v1 REST layer. It holds no logic of its own — it routes to the
+# _api_* core functions below — but it is imported this early because
+# require_auth needs its URL prefix to pick an error dialect.
+import rest_api
+
 # Load .env file if it exists
 load_dotenv()
 
@@ -81,15 +86,27 @@ def check_auth():
     # Constant-time compare to avoid a timing side-channel on the key
     return hmac.compare_digest(provided_key, API_KEY)
 
+# Endpoints reachable without an API key. The main page, images, and the
+# readiness probe: images are served with random filenames which provides basic
+# security; /ready must be reachable before the user can enter their API key.
+# rest_api.PUBLIC_ENDPOINTS adds the REST layer's equivalents (its /health and
+# self-describing documents) for the same reasons.
+PUBLIC_ENDPOINTS = ['index', 'alternate', 'static', 'serve_image', 'ready']
+
+
 @app.before_request
 def require_auth():
-    # Allow the main page, images, and the readiness probe to load without auth.
-    # Images are served with random filenames which provides basic security;
-    # /ready must be reachable before the user can enter their API key.
-    if request.endpoint in ['index', 'alternate', 'static', 'serve_image', 'ready']:
+    if request.endpoint in PUBLIC_ENDPOINTS:
         return
 
     if not check_auth():
+        # The REST layer speaks a different error dialect than the legacy
+        # routes, so 401 has to be rendered in whichever one the caller used.
+        if request.path.startswith(rest_api.URL_PREFIX):
+            return jsonify({"error": {
+                "code": "unauthorized",
+                "message": "Provide a valid X-API-Key header or api_key parameter.",
+            }}), 401
         return jsonify({"success": False, "error": "Unauthorized. Please provide a valid X-API-Key header or api_key parameter."}), 401
 
 
@@ -237,6 +254,25 @@ class JobCanceled(Exception):
     job; unwinds out of the diffusers pipeline back to the queue worker."""
 
 
+class ApiError(Exception):
+    """A request that failed for a reason the caller can act on.
+
+    Raised by the `_api_*` core functions below, which hold the logic shared by
+    the legacy flat routes and the /api/v1 REST layer (rest_api.py). Each layer
+    catches this and renders it in its own envelope — the legacy
+    `{"success": false, "error": ...}` shape, or REST's
+    `{"error": {"code", "message"}}` — so neither dialect leaks into the other.
+    `code` is the stable machine-readable identifier; keep it in sync with the
+    error-code table in REST_API.md.
+    """
+
+    def __init__(self, message, status=400, code='invalid_request'):
+        super().__init__(message)
+        self.message = message
+        self.status = status
+        self.code = code
+
+
 @dataclass
 class Job:
     id: str
@@ -335,6 +371,7 @@ SIZES = {
     '0.5mp': 0.5,
     '0.75mp': 0.75,
     '1mp': 1.0,
+    '1.25mp': 1.25,
     '1.5mp': 1.5,
     '1.75mp': 1.75,
     '2mp': 2.0,
@@ -887,13 +924,7 @@ def alternate():
 
 @app.route('/ready')
 def ready():
-    elapsed = time.perf_counter() - _model_load_start_ts if _model_load_start_ts else 0.0
-    return jsonify({
-        'ready': _model_ready,
-        'error': _model_load_error,
-        'status': _model_load_status,
-        'elapsed_s': round(elapsed, 1),
-    })
+    return jsonify(_api_readiness())
 
 
 def _validate_generate_params(data):
@@ -1003,31 +1034,194 @@ def _validate_generate_params(data):
     return None
 
 
-@app.route('/generate', methods=['POST'])
-def generate():
-    if not _model_ready:
-        return jsonify({'success': False, 'error': 'Model still loading. Please wait.'}), 503
+def _api_enqueue_generation(data):
+    """Validate a generation request and put it on the queue.
 
-    data = request.json or {}
+    `data` is normalized in place by _validate_generate_params. Returns
+    (job, 1-based position in the pending list); raises ApiError otherwise.
+    """
+    if not _model_ready:
+        raise ApiError('Model still loading. Please wait.', 503, 'model_loading')
+
     prompt = (data.get('prompt') or '').strip()
     if not prompt:
-        return jsonify({'success': False, 'error': 'prompt is required'}), 400
+        raise ApiError('prompt is required', 400, 'invalid_request')
 
     error = _validate_generate_params(data)
     if error:
-        return jsonify({'success': False, 'error': error}), 400
+        raise ApiError(error, 400, 'invalid_request')
 
     with _queue_cv:
         if len(_pending) >= QUEUE_MAX_SIZE:
-            return jsonify({
-                'success': False,
-                'error': f'Queue is full ({QUEUE_MAX_SIZE} max). Cancel a queued job or wait.',
-            }), 429
+            raise ApiError(
+                f'Queue is full ({QUEUE_MAX_SIZE} max). Cancel a queued job or wait.',
+                429, 'queue_full')
         job = Job(id=uuid.uuid4().hex[:12], params=data, submitted_at=time.time())
         _pending.append(job)
         position = len(_pending)  # 1-based position of this job in the pending list
         _queue_cv.notify()
+    return job, position
 
+
+def _api_find_job(job_id):
+    """The running, queued, or recently-finished job with this id, or None."""
+    with _queue_cv:
+        if _running_job and _running_job.id == job_id:
+            return _running_job.full()
+        for j in _pending:
+            if j.id == job_id:
+                return j.full()
+        for j in _recent_done:
+            if j.id == job_id:
+                return j.full()
+    return None
+
+
+def _api_cancel_job(job_id):
+    """Cancel a queued job outright, or ask the running one to stop. Returns a
+    human-readable message; raises ApiError(404) if the id is unknown."""
+    with _queue_cv:
+        for i, j in enumerate(_pending):
+            if j.id == job_id:
+                j.state = 'canceled'
+                j.finished_at = time.time()
+                del _pending[i]
+                _recent_done.insert(0, j)
+                del _recent_done[RECENT_DONE_MAX:]
+                return f'Job {job_id} canceled'
+        if _running_job and _running_job.id == job_id:
+            # Interrupt: the generation loop checks this flag at every step and
+            # raises JobCanceled; the worker then marks the job canceled. Any
+            # batch images already finished are kept.
+            _running_job.cancel_requested = True
+            return f'Job {job_id} is stopping'
+    raise ApiError('Job not found', 404, 'not_found')
+
+
+def _api_list_step_frames(job_id):
+    """A job's saved preview frames, in image/step order, as /images/ paths."""
+    if not job_id.isalnum():
+        raise ApiError('invalid job id', 400, 'invalid_request')
+    try:
+        names = sorted(f for f in os.listdir(os.path.join(OUTPUT_DIR, 'steps'))
+                       if f.startswith(job_id + '_') and f.endswith('.png'))
+    except FileNotFoundError:
+        names = []
+    return ['steps/' + n for n in names]
+
+
+def _api_queue_snapshot():
+    """Running job, pending queue, and recently-finished jobs in one lock hold."""
+    with _queue_cv:
+        return {
+            'running': _running_job.full() if _running_job else None,
+            'queued': [j.summary() for j in _pending],
+            'recent_done': [j.full() for j in _recent_done],
+        }
+
+
+def _api_job_previews(job_id):
+    """Intermediate imagery for one job.
+
+    Two different things qualify, and a caller usually wants both:
+
+    * `live` — the latent preview of the image being denoised right now,
+      decoded and overwritten in place as generation proceeds. Present only
+      while the job runs with `show_preview`. `ts` changes on every new frame,
+      so use it as a cache-buster; the path itself is stable.
+    * `frames` — every per-step frame written to disk, which only happens with
+      `save_previews`. These persist after the job ends, so a finished job can
+      still be replayed step by step.
+    """
+    if not job_id.isalnum():
+        raise ApiError('invalid job id', 400, 'invalid_request')
+
+    job = _api_find_job(job_id)
+    frames = []
+    for path in _api_list_step_frames(job_id):
+        # steps/<jobid>_img<NN>_step<NNN>.png — the index and step are worth
+        # parsing out so a client can group by image without re-deriving the
+        # naming convention.
+        match = re.search(r'_img(\d+)_step(\d+)\.png$', path)
+        frames.append({
+            'path': path,
+            'image': int(match.group(1)) if match else None,
+            'step': int(match.group(2)) if match else None,
+        })
+
+    live = None
+    if job and job.get('preview'):
+        live = {
+            'path': job['preview'],
+            'step': job.get('preview_step') or 0,
+            'total_steps': job.get('total_steps') or 0,
+            'image': job.get('current') or 0,
+            # Milliseconds; changes with each decoded frame.
+            'ts': job.get('preview_ts') or 0,
+        }
+
+    return {
+        'id': job_id,
+        'state': job['state'] if job else None,
+        'live': live,
+        'frames': frames,
+        'count': len(frames),
+        # False means no frames were ever written for this job, not that they
+        # were lost — save_previews has to be requested at generation time.
+        'saving': bool(job.get('saved_previews')) if job else bool(frames),
+    }
+
+
+def _api_queue_view():
+    """Queue-centric view: what is generating now, what is waiting and in what
+    order, how much room is left, and how long the backlog is likely to take.
+
+    Distinct from _api_queue_snapshot, which is the raw three-list dump the
+    /status route has always returned. This one answers "where is my job in
+    line and when will it run", so each waiting entry carries its 1-based
+    position and the queue carries a wait estimate.
+    """
+    with _queue_cv:
+        running = _running_job.full() if _running_job else None
+        waiting = []
+        for position, job in enumerate(_pending, start=1):
+            entry = job.summary()
+            entry['position'] = position
+            waiting.append(entry)
+        # Only completed jobs carry a trustworthy duration; canceled ones
+        # stopped early and would bias the estimate downward.
+        samples = [(j.generation_time, len(j.images)) for j in _recent_done
+                   if j.state == 'done' and j.generation_time > 0 and j.images]
+
+    per_image = (sum(t / n for t, n in samples) / len(samples)) if samples else None
+
+    # Images still to produce: everything queued, plus whatever is left of the
+    # running job's batch.
+    images_ahead = sum(int(j.get('batch') or 1) for j in waiting)
+    if running:
+        images_ahead += max(0, int(running.get('batch') or 1) - int(running.get('current') or 0))
+
+    return {
+        'running': running,
+        'waiting': waiting,
+        'depth': len(waiting),
+        'capacity': QUEUE_MAX_SIZE,
+        # The running job does not occupy a pending slot, so a full queue can
+        # still have one job generating.
+        'accepting': len(waiting) < QUEUE_MAX_SIZE,
+        'busy': running is not None or bool(waiting),
+        'images_pending': images_ahead,
+        'seconds_per_image': round(per_image, 2) if per_image else None,
+        'estimated_wait_s': round(per_image * images_ahead, 1) if per_image else None,
+    }
+
+
+@app.route('/generate', methods=['POST'])
+def generate():
+    try:
+        job, position = _api_enqueue_generation(request.json or {})
+    except ApiError as e:
+        return jsonify({'success': False, 'error': e.message}), e.status
     return jsonify({'success': True, 'job_id': job.id, 'position': position})
 
 
@@ -1035,14 +1229,11 @@ def generate():
 def list_step_frames(job_id):
     """List a job's saved preview frames (the save_previews toggle), in
     image/step order, as paths servable via /images/."""
-    if not job_id.isalnum():
-        return jsonify({'success': False, 'error': 'invalid job id'}), 400
     try:
-        names = sorted(f for f in os.listdir(os.path.join(OUTPUT_DIR, 'steps'))
-                       if f.startswith(job_id + '_') and f.endswith('.png'))
-    except FileNotFoundError:
-        names = []
-    return jsonify({'success': True, 'frames': ['steps/' + n for n in names]})
+        frames = _api_list_step_frames(job_id)
+    except ApiError as e:
+        return jsonify({'success': False, 'error': e.message}), e.status
+    return jsonify({'success': True, 'frames': frames})
 
 
 # <path:> so saved preview frames under steps/ are reachable too;
@@ -1054,18 +1245,13 @@ def serve_image(filename):
 
 @app.route('/status')
 def status():
-    with _queue_cv:
-        running = _running_job.full() if _running_job else None
-        queued = [j.summary() for j in _pending]
-        recent = [j.full() for j in _recent_done]
-    return jsonify({
-        'running': running,
-        'queued': queued,
-        'recent_done': recent,
+    snapshot = _api_queue_snapshot()
+    snapshot.update({
         'queue_max_size': QUEUE_MAX_SIZE,
         'power_w': _gpu_power_watts(),
         'vlm': _vlm_status(),
     })
+    return jsonify(snapshot)
 
 
 @app.route('/reset', methods=['POST'])
@@ -1079,22 +1265,11 @@ def reset_recent():
 
 @app.route('/jobs/<job_id>/cancel', methods=['POST'])
 def cancel_job(job_id):
-    with _queue_cv:
-        for i, j in enumerate(_pending):
-            if j.id == job_id:
-                j.state = 'canceled'
-                j.finished_at = time.time()
-                del _pending[i]
-                _recent_done.insert(0, j)
-                del _recent_done[RECENT_DONE_MAX:]
-                return jsonify({'success': True, 'message': f'Job {job_id} canceled'})
-        if _running_job and _running_job.id == job_id:
-            # Interrupt: the generation loop checks this flag at every step and
-            # raises JobCanceled; the worker then marks the job canceled. Any
-            # batch images already finished are kept.
-            _running_job.cancel_requested = True
-            return jsonify({'success': True, 'message': f'Job {job_id} is stopping'})
-    return jsonify({'success': False, 'error': 'Job not found'}), 404
+    try:
+        message = _api_cancel_job(job_id)
+    except ApiError as e:
+        return jsonify({'success': False, 'error': e.message}), e.status
+    return jsonify({'success': True, 'message': message})
 
 
 @app.route('/configs')
@@ -1105,11 +1280,7 @@ def configs():
     run_server.sh supervisor), in which case /switch-model is unavailable
     and the UI hides the control.
     """
-    return jsonify({
-        'configs': [{'id': k, 'label': v} for k, v in SERVER_CONFIGS.items()],
-        'current': _current_config,
-        'switchable': _current_config is not None,
-    })
+    return jsonify(_api_configs())
 
 
 @app.route('/switch-model', methods=['POST'])
@@ -1123,42 +1294,48 @@ def switch_model():
     relaunches with the new config's flags; clients poll /ready until the new
     model is up.
     """
-    if _current_config is None:
-        return jsonify({
-            'success': False,
-            'error': 'Model switching requires launching via run_server.sh (no supervisor detected).',
-        }), 400
-
-    data = request.json or {}
     try:
-        target = int(data.get('config'))
+        label = _api_switch_model((request.json or {}).get('config'))
+    except ApiError as e:
+        return jsonify({'success': False, 'error': e.message}), e.status
+    return jsonify({'success': True, 'switching_to': label})
+
+
+def _api_switch_model(raw_config):
+    """Schedule the supervised restart into another config. Returns the target
+    config's label; the process exits 0.5s later. Raises ApiError when there is
+    no supervisor, the id is bad, or work is in flight."""
+    if _current_config is None:
+        raise ApiError(
+            'Model switching requires launching via run_server.sh (no supervisor detected).',
+            400, 'no_supervisor')
+    try:
+        target = int(raw_config)
     except (TypeError, ValueError):
-        return jsonify({'success': False, 'error': 'config must be an integer'}), 400
+        raise ApiError('config must be an integer', 400, 'invalid_request')
     if target not in SERVER_CONFIGS:
-        return jsonify({'success': False, 'error': f'config must be one of {sorted(SERVER_CONFIGS)}'}), 400
+        raise ApiError(f'config must be one of {sorted(SERVER_CONFIGS)}', 400, 'invalid_request')
     if target == _current_config:
-        return jsonify({'success': False, 'error': 'Already running this configuration'}), 400
+        raise ApiError('Already running this configuration', 400, 'invalid_request')
 
     with _queue_cv:
         if _running_job is not None or _pending:
-            return jsonify({
-                'success': False,
-                'error': 'Jobs are running or queued. Interrupt/cancel them before switching models.',
-            }), 409
+            raise ApiError(
+                'Jobs are running or queued. Interrupt/cancel them before switching models.',
+                409, 'busy')
 
     state = _multi_run_load()
     if state and not state.get('finished'):
-        return jsonify({
-            'success': False,
-            'error': 'A multi-model run is active. Cancel it before switching models manually.',
-        }), 409
+        raise ApiError(
+            'A multi-model run is active. Cancel it before switching models manually.',
+            409, 'busy')
 
     with open(SWITCH_CONFIG_FILE, 'w') as f:
         f.write(str(target))
     print(f"[switch] restarting into config {target} ({SERVER_CONFIGS[target]})", flush=True)
     # Give Flask a moment to flush this response before the process exits.
     threading.Timer(0.5, lambda: os._exit(SWITCH_EXIT_CODE)).start()
-    return jsonify({'success': True, 'switching_to': SERVER_CONFIGS[target]})
+    return SERVER_CONFIGS[target]
 
 
 @app.route('/multi-run', methods=['POST'])
@@ -1171,36 +1348,45 @@ def multi_run_start():
     are text-to-image only. Unless a seed is given, one is drawn here and
     shared by every model so the outputs are comparable.
     """
-    if _current_config is None:
-        return jsonify({
-            'success': False,
-            'error': 'Multi-model runs require launching via run_server.sh (no supervisor detected).',
-        }), 400
-    if not _model_ready:
-        return jsonify({'success': False, 'error': 'Model still loading. Please wait.'}), 503
+    try:
+        state = _api_start_multi_run(request.json or {})
+    except ApiError as e:
+        return jsonify({'success': False, 'error': e.message}), e.status
+    return jsonify({'success': True, 'id': state['id'], 'configs': state['configs'],
+                    'seed': state['params']['seed']})
 
-    data = request.json or {}
+
+def _api_start_multi_run(data):
+    """Validate and start a multi-model run. Returns the persisted run state
+    document; raises ApiError on any rejection."""
+    if _current_config is None:
+        raise ApiError(
+            'Multi-model runs require launching via run_server.sh (no supervisor detected).',
+            400, 'no_supervisor')
+    if not _model_ready:
+        raise ApiError('Model still loading. Please wait.', 503, 'model_loading')
+
     prompt = (data.get('prompt') or '').strip()
     if not prompt:
-        return jsonify({'success': False, 'error': 'prompt is required'}), 400
+        raise ApiError('prompt is required', 400, 'invalid_request')
 
     configs = data.get('configs')
     if not isinstance(configs, list) or not configs:
-        return jsonify({'success': False, 'error': 'configs must be a non-empty list'}), 400
+        raise ApiError('configs must be a non-empty list', 400, 'invalid_request')
     try:
         configs = list(dict.fromkeys(int(c) for c in configs))
     except (TypeError, ValueError):
-        return jsonify({'success': False, 'error': 'configs must be a list of integers'}), 400
+        raise ApiError('configs must be a list of integers', 400, 'invalid_request')
     bad = [c for c in configs if c not in SERVER_CONFIGS]
     if bad:
-        return jsonify({'success': False, 'error': f'unknown configs: {bad}'}), 400
+        raise ApiError(f'unknown configs: {bad}', 400, 'invalid_request')
 
     if data.get('input_images') or data.get('input_image') or data.get('input_paths') or data.get('mask_image'):
-        return jsonify({'success': False,
-                        'error': 'multi-model runs are text-to-image only (remove reference images)'}), 400
+        raise ApiError('multi-model runs are text-to-image only (remove reference images)',
+                       400, 'invalid_request')
     if data.get('negative_prompt'):
-        return jsonify({'success': False,
-                        'error': 'negative_prompt is SDXL-only and not supported in multi-model runs'}), 400
+        raise ApiError('negative_prompt is SDXL-only and not supported in multi-model runs',
+                       400, 'invalid_request')
 
     params = {'prompt': prompt}
     for k in ('orientation', 'size', 'steps', 'seed', 'guidance', 'batch', 'show_preview'):
@@ -1208,7 +1394,7 @@ def multi_run_start():
             params[k] = data[k]
     error = _validate_generate_params(params)
     if error:
-        return jsonify({'success': False, 'error': error}), 400
+        raise ApiError(error, 400, 'invalid_request')
     # One shared seed (unless given) so the models' outputs are comparable.
     if params.get('seed') is None:
         params['seed'] = random.randint(0, 2**32 - 1)
@@ -1216,14 +1402,12 @@ def multi_run_start():
     with _multi_run_lock:
         state = _multi_run_load()
         if state and not state.get('finished'):
-            return jsonify({'success': False,
-                            'error': 'A multi-model run is already active. Cancel it first.'}), 409
+            raise ApiError('A multi-model run is already active. Cancel it first.', 409, 'busy')
         with _queue_cv:
             if _running_job is not None or _pending:
-                return jsonify({
-                    'success': False,
-                    'error': 'Jobs are running or queued. Wait for or cancel them before a multi-model run.',
-                }), 409
+                raise ApiError(
+                    'Jobs are running or queued. Wait for or cancel them before a multi-model run.',
+                    409, 'busy')
         # Run the current model first when it's selected — saves one restart.
         if _current_config in configs:
             configs.remove(_current_config)
@@ -1238,33 +1422,31 @@ def multi_run_start():
         }
         _multi_run_save(state)
         _multi_run_advance()
-    return jsonify({'success': True, 'id': state['id'], 'configs': configs, 'seed': params['seed']})
+    return state
 
 
-@app.route('/multi-run', methods=['GET'])
-def multi_run_status():
+def _api_multi_run_state():
     """State of the active (or last finished, un-dismissed) multi-model run."""
     state = _multi_run_load()
     if not state:
-        return jsonify({'active': False, 'run': None})
-    return jsonify({
+        return {'active': False, 'run': None}
+    return {
         'active': not state.get('finished'),
         'run': state,
         'labels': {str(k): v for k, v in SERVER_CONFIGS.items()},
         'current_config': _current_config,
         'next_config': _multi_run_next_config(state),
-    })
+    }
 
 
-@app.route('/multi-run/cancel', methods=['POST'])
-def multi_run_cancel():
-    """Cancel the active multi-model run (interrupting its job if one is
-    queued or generating), or dismiss a finished run's results."""
+def _api_cancel_multi_run():
+    """Cancel the active run (interrupting its in-flight job) or dismiss a
+    finished one. Returns True if a run was actually cleared."""
     with _multi_run_lock:
         state = _multi_run_load()
         _multi_run_clear()
     if not state:
-        return jsonify({'success': True})
+        return False
     rid = state['id']
     with _queue_cv:
         for i, j in enumerate(_pending):
@@ -1277,6 +1459,20 @@ def multi_run_cancel():
                 break
         if _running_job is not None and _running_job.multi_run == rid:
             _running_job.cancel_requested = True
+    return True
+
+
+@app.route('/multi-run', methods=['GET'])
+def multi_run_status():
+    """State of the active (or last finished, un-dismissed) multi-model run."""
+    return jsonify(_api_multi_run_state())
+
+
+@app.route('/multi-run/cancel', methods=['POST'])
+def multi_run_cancel():
+    """Cancel the active multi-model run (interrupting its job if one is
+    queued or generating), or dismiss a finished run's results."""
+    _api_cancel_multi_run()
     return jsonify({'success': True})
 
 
@@ -1301,12 +1497,18 @@ def _model_type_string():
 
 @app.route('/model-info')
 def model_info():
+    return jsonify(_api_model_info())
+
+
+def _api_model_info():
+    """Capabilities of the loaded backend: which optional features (negative
+    prompts, inpainting, Kontext editing) this process can actually serve."""
     model_type = _model_type_string()
     encoder_type = ("local CLIP encoders" if _SDXL_ACTIVE
                     else "local encoder" if _local_encoder else "remote encoder")
     turbo_str = " + Turbo" if flux_core._turbo_enabled else ""
     uncensored_str = " + U-LoRA" if flux_core._uncensored_enabled and not _SDXL_ACTIVE else ""
-    return jsonify({
+    return {
         'model': model_type,
         'encoder': encoder_type,
         'turbo': flux_core._turbo_enabled,
@@ -1320,7 +1522,27 @@ def model_info():
         'hostname': socket.gethostname(),
         'version': VERSION,
         'description': f"{model_type}{turbo_str}{uncensored_str} with {encoder_type}"
-    })
+    }
+
+
+def _api_readiness():
+    """Model-load progress, for readiness probes."""
+    elapsed = time.perf_counter() - _model_load_start_ts if _model_load_start_ts else 0.0
+    return {
+        'ready': _model_ready,
+        'error': _model_load_error,
+        'status': _model_load_status,
+        'elapsed_s': round(elapsed, 1),
+    }
+
+
+def _api_configs():
+    """The launcher's model-config menu plus which one is live."""
+    return {
+        'configs': [{'id': k, 'label': v} for k, v in SERVER_CONFIGS.items()],
+        'current': _current_config,
+        'switchable': _current_config is not None,
+    }
 
 
 # Async VLM job bookkeeping (critique, describe, boost). A qwen3.6 vision call
@@ -1356,15 +1578,26 @@ def _vlm_job_finish(cid, payload):
             entry['done'] = True
 
 
-def _vlm_job_status(cid):
-    """Shared poll response for GET /critique|describe|boost/<id>."""
+def _api_vlm_result(cid):
+    """(payload, done) for an async VLM job. `payload` is None while the job is
+    still running. Raises ApiError(404) if the id is unknown or expired."""
     with _vlm_jobs_lock:
         entry = _vlm_jobs.get(cid)
         if entry is None:
-            return jsonify({'success': False, 'error': f'unknown job id {cid}'}), 404
+            raise ApiError(f'unknown job id {cid}', 404, 'not_found')
         if not entry['done']:
-            return jsonify({'success': True, 'done': False})
-        result = dict(entry['result'])
+            return None, False
+        return dict(entry['result']), True
+
+
+def _vlm_job_status(cid):
+    """Shared poll response for GET /critique|describe|boost/<id>."""
+    try:
+        result, done = _api_vlm_result(cid)
+    except ApiError as e:
+        return jsonify({'success': False, 'error': e.message}), e.status
+    if not done:
+        return jsonify({'success': True, 'done': False})
     result['done'] = True
     status = 200 if result.get('success') else 500
     return jsonify(result), status
@@ -1404,24 +1637,33 @@ def critique():
     (OLLAMA_URL / CRITIQUE_MODEL env vars); when it's unavailable the
     result falls back to pixel-metric heuristics. Returns a critique_id
     immediately; poll GET /critique/<id> for the result."""
-    data = request.json or {}
+    try:
+        cid = _api_start_critique(request.json or {})
+    except ApiError as e:
+        return jsonify({'success': False, 'error': e.message}), e.status
+    return jsonify({'success': True, 'critique_id': cid})
+
+
+def _api_start_critique(data):
+    """Validate a critique request and start it on a worker thread. Returns the
+    job id to poll; raises ApiError on bad input."""
     direction = (data.get('direction') or '').strip()
     prompt = (data.get('prompt') or direction).strip()
     out_filename = os.path.basename(data.get('output_filename') or '')
     ref_b64 = data.get('ref_image') or ''
     if not direction or not out_filename or not ref_b64:
-        return jsonify({'success': False,
-                        'error': 'direction, ref_image, and output_filename are required'}), 400
+        raise ApiError('direction, ref_image, and output_filename are required',
+                       400, 'invalid_request')
 
     out_path = os.path.join(OUTPUT_DIR, out_filename)
     if not os.path.exists(out_path):
-        return jsonify({'success': False, 'error': f'unknown output image {out_filename}'}), 404
+        raise ApiError(f'unknown output image {out_filename}', 404, 'not_found')
     try:
         if ref_b64.startswith('data:'):
             ref_b64 = ref_b64.split(',', 1)[1]
         reference = Image.open(io.BytesIO(base64.b64decode(ref_b64))).convert('RGB')
     except Exception:
-        return jsonify({'success': False, 'error': 'ref_image is not a decodable base64 image'}), 400
+        raise ApiError('ref_image is not a decodable base64 image', 400, 'invalid_request')
 
     output = Image.open(out_path).convert('RGB')
     model = data.get('model') or CRITIQUE_MODEL
@@ -1431,9 +1673,8 @@ def critique():
     # critique} dicts) so the critic doesn't re-propose failed phrasings.
     history = data.get('history') if isinstance(data.get('history'), list) else []
 
-    cid = _vlm_job_start(_run_critique, model, direction, prompt, reference,
-                         output, history, style)
-    return jsonify({'success': True, 'critique_id': cid})
+    return _vlm_job_start(_run_critique, model, direction, prompt, reference,
+                          output, history, style)
 
 
 @app.route('/critique/<cid>')
@@ -1468,15 +1709,23 @@ def describe():
     them. `think` (default false) enables the VLM's deliberation phase —
     deeper but much slower. Returns a describe_id immediately; poll
     GET /describe/<id> for the prompt."""
-    data = request.json or {}
+    try:
+        cid = _api_start_describe(request.json or {})
+    except ApiError as e:
+        return jsonify({'success': False, 'error': e.message}), e.status
+    return jsonify({'success': True, 'describe_id': cid})
+
+
+def _api_start_describe(data):
+    """Validate a describe request and start it. Returns the job id to poll."""
     imgs_b64 = data.get('images') if isinstance(data.get('images'), list) else []
     if not imgs_b64 and data.get('image'):
         imgs_b64 = [data['image']]
     if not imgs_b64:
-        return jsonify({'success': False, 'error': 'image is required'}), 400
+        raise ApiError('image is required', 400, 'invalid_request')
     if len(imgs_b64) > MAX_REFERENCE_IMAGES:
-        return jsonify({'success': False,
-                        'error': f'at most {MAX_REFERENCE_IMAGES} images are supported'}), 400
+        raise ApiError(f'at most {MAX_REFERENCE_IMAGES} images are supported',
+                       400, 'invalid_request')
     images = []
     try:
         for img_b64 in imgs_b64:
@@ -1484,11 +1733,10 @@ def describe():
                 img_b64 = img_b64.split(',', 1)[1]
             images.append(Image.open(io.BytesIO(base64.b64decode(img_b64))).convert('RGB'))
     except Exception:
-        return jsonify({'success': False, 'error': 'image is not a decodable base64 image'}), 400
+        raise ApiError('image is not a decodable base64 image', 400, 'invalid_request')
     think = bool(data.get('think', False))
     model = data.get('model') or DESCRIBE_MODEL
-    cid = _vlm_job_start(_run_describe, model, images, think)
-    return jsonify({'success': True, 'describe_id': cid})
+    return _vlm_job_start(_run_describe, model, images, think)
 
 
 @app.route('/describe/<cid>')
@@ -1561,26 +1809,38 @@ def convert_raw():
     if f is None:
         return jsonify({'success': False, 'error': 'multipart form field "file" is required'}), 400
     try:
+        image = _api_convert_raw(f.read(), f.filename)
+    except ApiError as e:
+        return jsonify({'success': False, 'error': e.message}), e.status
+    return jsonify(dict(_api_reference_payload(image), success=True))
+
+
+def _api_reference_payload(image):
+    """The {image, width, height} body every reference-import path returns:
+    a JPEG data URL bounded to MAX_RAW_EDGE, plus its final dimensions.
+    _image_to_data_url resizes in place, so read the size after encoding."""
+    data_url = _image_to_data_url(image)
+    return {'image': data_url, 'width': image.width, 'height': image.height}
+
+
+def _api_convert_raw(data, filename=''):
+    """Decode camera RAW bytes to a PIL image. Raises ApiError with a message
+    that identifies the file when the decode fails."""
+    try:
         import rawpy  # noqa: F401 — fail fast with a clear error if absent
     except ImportError:
-        return jsonify({'success': False, 'error': 'RAW conversion requires the rawpy package on the server (uv pip install rawpy)'}), 501
-    data = f.read()
+        raise ApiError('RAW conversion requires the rawpy package on the server '
+                       '(uv pip install rawpy)', 501, 'not_implemented')
     if not data:
-        return jsonify({'success': False, 'error': 'uploaded file is empty'}), 400
+        raise ApiError('uploaded file is empty', 400, 'invalid_request')
     try:
-        image = _raw_to_pil(data)
+        return _raw_to_pil(data)
     except Exception as e:
         # Size + header bytes make "what was this file actually?" answerable
         # from the client-side error alone.
-        print(f"convert-raw failed: {f.filename!r}, {len(data)} bytes, header {data[:12].hex()}: {e}")
-        return jsonify({'success': False, 'error': f'could not decode RAW file ({len(data)} bytes, header {data[:12].hex()}): {e}'}), 400
-    image.thumbnail((MAX_RAW_EDGE, MAX_RAW_EDGE), Image.LANCZOS)
-    buf = io.BytesIO()
-    image.save(buf, format='JPEG', quality=92)
-    b64 = base64.b64encode(buf.getvalue()).decode('ascii')
-    return jsonify({'success': True,
-                    'image': 'data:image/jpeg;base64,' + b64,
-                    'width': image.width, 'height': image.height})
+        print(f"convert-raw failed: {filename!r}, {len(data)} bytes, header {data[:12].hex()}: {e}")
+        raise ApiError(f'could not decode RAW file ({len(data)} bytes, '
+                       f'header {data[:12].hex()}): {e}', 400, 'undecodable_image')
 
 
 # Cap on a fetched remote image, mirroring the request body cap so a URL
@@ -1594,11 +1854,21 @@ def fetch_image_url():
     restrictions) and return it as a JPEG data URL for use as a reference
     image. JSON body: {"url": "https://..."}. Response shape matches
     /convert-raw."""
+    try:
+        image = _api_fetch_url_image((request.get_json(silent=True) or {}).get('url'))
+    except ApiError as e:
+        return jsonify({'success': False, 'error': e.message}), e.status
+    return jsonify(dict(_api_reference_payload(image), success=True))
+
+
+def _api_fetch_url_image(raw_url):
+    """Fetch a remote image server-side and return it as a PIL image, bounded
+    by MAX_URL_FETCH_BYTES. Raises ApiError on a bad URL, transport failure, or
+    a body that is neither a normal image nor camera RAW."""
     import requests
-    payload = request.get_json(silent=True) or {}
-    url = (payload.get('url') or '').strip()
+    url = (raw_url or '').strip()
     if not url.lower().startswith(('http://', 'https://')):
-        return jsonify({'success': False, 'error': 'url must start with http:// or https://'}), 400
+        raise ApiError('url must start with http:// or https://', 400, 'invalid_request')
     # Browser-like header set: Wikimedia (and similar CDNs) 429 requests that
     # carry a browser User-Agent without the matching Accept/Accept-Language
     # headers, so the UA alone is not enough.
@@ -1618,29 +1888,24 @@ def fetch_image_url():
         for chunk in resp.iter_content(1024 * 1024):
             total += len(chunk)
             if total > MAX_URL_FETCH_BYTES:
-                return jsonify({'success': False, 'error': f'image exceeds the {MAX_URL_FETCH_BYTES // (1024 * 1024)}MB fetch limit'}), 400
+                raise ApiError(f'image exceeds the {MAX_URL_FETCH_BYTES // (1024 * 1024)}MB '
+                               'fetch limit', 400, 'too_large')
             chunks.append(chunk)
         data = b''.join(chunks)
     except requests.RequestException as e:
-        return jsonify({'success': False, 'error': f'could not fetch URL: {e}'}), 400
+        raise ApiError(f'could not fetch URL: {e}', 400, 'fetch_failed')
     if not data:
-        return jsonify({'success': False, 'error': 'URL returned an empty response'}), 400
+        raise ApiError('URL returned an empty response', 400, 'fetch_failed')
     try:
-        image = Image.open(io.BytesIO(data)).convert('RGB')
+        return Image.open(io.BytesIO(data)).convert('RGB')
     except Exception:
         try:
             # A URL can point at a camera RAW file too; reuse the RAW pipeline.
-            image = _raw_to_pil(data).convert('RGB')
+            return _raw_to_pil(data).convert('RGB')
         except Exception:
             print(f"fetch-image-url failed: {url!r}, {len(data)} bytes, header {data[:12].hex()}")
-            return jsonify({'success': False, 'error': f'URL did not return a decodable image ({len(data)} bytes, header {data[:12].hex()})'}), 400
-    image.thumbnail((MAX_RAW_EDGE, MAX_RAW_EDGE), Image.LANCZOS)
-    buf = io.BytesIO()
-    image.save(buf, format='JPEG', quality=92)
-    b64 = base64.b64encode(buf.getvalue()).decode('ascii')
-    return jsonify({'success': True,
-                    'image': 'data:image/jpeg;base64,' + b64,
-                    'width': image.width, 'height': image.height})
+            raise ApiError(f'URL did not return a decodable image ({len(data)} bytes, '
+                           f'header {data[:12].hex()})', 400, 'undecodable_image')
 
 
 def _load_server_image(raw_path):
@@ -1684,16 +1949,22 @@ def fetch_image_path():
     data URL for use as a reference image. JSON body: {"path": "..."} —
     absolute, ~-prefixed, or relative to web-generated/. Response shape
     matches /convert-raw and /fetch-image-url."""
-    payload = request.get_json(silent=True) or {}
-    raw_path = (payload.get('path') or '').strip()
+    try:
+        image = _api_load_path_image((request.get_json(silent=True) or {}).get('path'))
+    except ApiError as e:
+        return jsonify({'success': False, 'error': e.message}), e.status
+    return jsonify(dict(_api_reference_payload(image), success=True))
+
+
+def _api_load_path_image(raw_path):
+    """Load a reference image from this machine's filesystem as a PIL image."""
+    raw_path = (raw_path or '').strip()
     if not raw_path:
-        return jsonify({'success': False, 'error': 'path is required'}), 400
+        raise ApiError('path is required', 400, 'invalid_request')
     image, err = _load_server_image(raw_path)
     if err:
-        return jsonify({'success': False, 'error': err}), 400
-    data_url = _image_to_data_url(image)
-    return jsonify({'success': True, 'image': data_url,
-                    'width': image.width, 'height': image.height})
+        raise ApiError(err, 400, 'undecodable_image')
+    return image
 
 
 @app.route('/browse-files')
@@ -1706,7 +1977,17 @@ def browse_files():
     own disk). Defaults to the archive folder. Returns the resolved absolute
     `dir` plus its `parent` (null at filesystem root) so the client can
     navigate up/down without doing its own path arithmetic."""
-    raw_dir = (request.args.get('dir') or 'archive').strip() or 'archive'
+    try:
+        listing = _api_browse_dir(request.args.get('dir'))
+    except ApiError as e:
+        return jsonify({'success': False, 'error': e.message}), e.status
+    return jsonify(dict(listing, success=True))
+
+
+def _api_browse_dir(raw_dir):
+    """{dir, parent, dirs, files} for a directory on this machine, with
+    subfolders name-sorted and images newest-first."""
+    raw_dir = (raw_dir or 'archive').strip() or 'archive'
     path = os.path.expanduser(raw_dir)
     if not os.path.isabs(path):
         path = os.path.join(OUTPUT_DIR, path)
@@ -1715,7 +1996,7 @@ def browse_files():
     # get OUTPUT_DIR joined onto it a second time on the next request.
     path = os.path.abspath(path)
     if not os.path.isdir(path):
-        return jsonify({'success': False, 'error': f'no such directory on the server: {path}'}), 400
+        raise ApiError(f'no such directory on the server: {path}', 400, 'not_found')
     exts = ('.png', '.jpg', '.jpeg', '.webp')
     dirs, files = [], []
     try:
@@ -1727,13 +2008,28 @@ def browse_files():
             elif entry.is_file() and entry.name.lower().endswith(exts):
                 files.append({'filename': entry.name, 'mtime': entry.stat().st_mtime})
     except PermissionError:
-        return jsonify({'success': False, 'error': f'permission denied: {path}'}), 400
+        raise ApiError(f'permission denied: {path}', 400, 'forbidden')
     dirs.sort(key=str.lower)
     files.sort(key=lambda f: f['mtime'], reverse=True)
     for f in files:
         del f['mtime']
     parent = os.path.dirname(path) if os.path.dirname(path) != path else None
-    return jsonify({'success': True, 'dir': path, 'parent': parent, 'dirs': dirs, 'files': files})
+    return {'dir': path, 'parent': parent, 'dirs': dirs, 'files': files}
+
+
+def _api_thumbnail_bytes(raw_path, edge=240):
+    """JPEG bytes of a small thumbnail for any image _load_server_image can
+    reach. Raises ApiError(404) when the path can't be read."""
+    raw_path = (raw_path or '').strip()
+    if not raw_path:
+        raise ApiError('path is required', 400, 'invalid_request')
+    image, err = _load_server_image(raw_path)
+    if err:
+        raise ApiError(err, 404, 'not_found')
+    image.thumbnail((edge, edge), Image.LANCZOS)
+    buf = io.BytesIO()
+    image.save(buf, format='JPEG', quality=80)
+    return buf.getvalue()
 
 
 @app.route('/browse-thumb')
@@ -1743,16 +2039,13 @@ def browse_thumb():
     (exempt from auth, restricted to OUTPUT_DIR by send_from_directory),
     this can read any path _load_server_image can reach, so — unlike
     /images/ — it stays behind the normal API-key check."""
-    raw_path = (request.args.get('path') or '').strip()
-    if not raw_path:
-        return '', 400
-    image, err = _load_server_image(raw_path)
-    if err:
-        return '', 404
-    image.thumbnail((240, 240), Image.LANCZOS)
-    buf = io.BytesIO()
-    image.save(buf, format='JPEG', quality=80)
-    return Response(buf.getvalue(), mimetype='image/jpeg')
+    try:
+        data = _api_thumbnail_bytes(request.args.get('path'))
+    except ApiError as e:
+        # Legacy contract: an empty body, since the caller renders this
+        # straight into an <img> and never reads an error payload.
+        return '', 400 if e.status == 400 else 404
+    return Response(data, mimetype='image/jpeg')
 
 
 def _boost_family(has_image=False):
@@ -1805,35 +2098,41 @@ def boost():
     feature): the VLM is pushed toward a direction the other rewrites are
     unlikely to take. Returns a boost_id immediately;
     poll GET /boost/<id> for the improved prompt (+ negative_prompt)."""
-    data = request.json or {}
+    try:
+        cid = _api_start_boost(request.json or {})
+    except ApiError as e:
+        return jsonify({'success': False, 'error': e.message}), e.status
+    return jsonify({'success': True, 'boost_id': cid})
+
+
+def _api_start_boost(data):
+    """Validate a boost request and start it. Returns the job id to poll."""
     prompt = (data.get('prompt') or '').strip()
     if not prompt:
-        return jsonify({'success': False, 'error': 'prompt is required'}), 400
+        raise ApiError('prompt is required', 400, 'invalid_request')
     try:
         level = int(data.get('level', 3))
     except (TypeError, ValueError):
-        return jsonify({'success': False, 'error': 'level must be an integer 1-5'}), 400
+        raise ApiError('level must be an integer 1-5', 400, 'invalid_request')
     if not 1 <= level <= 5:
-        return jsonify({'success': False, 'error': 'level must be an integer 1-5'}), 400
+        raise ApiError('level must be an integer 1-5', 400, 'invalid_request')
     variant = None
     if data.get('variant_count') is not None:
         try:
             v_idx = int(data.get('variant_index', 0))
             v_cnt = int(data['variant_count'])
         except (TypeError, ValueError):
-            return jsonify({'success': False,
-                            'error': 'variant_index/variant_count must be integers'}), 400
+            raise ApiError('variant_index/variant_count must be integers', 400, 'invalid_request')
         if not 1 <= v_idx <= v_cnt:
-            return jsonify({'success': False,
-                            'error': 'variant_index must be between 1 and variant_count'}), 400
+            raise ApiError('variant_index must be between 1 and variant_count',
+                           400, 'invalid_request')
         variant = (v_idx, v_cnt)
     has_image = bool(data.get('has_image'))
     think = bool(data.get('think', False))
     model = data.get('model') or CRITIQUE_MODEL
     negative_prompt = (data.get('negative_prompt') or '').strip() or None
-    cid = _vlm_job_start(_run_boost, model, prompt, _boost_family(has_image),
-                         _model_type_string(), level, think, variant, negative_prompt)
-    return jsonify({'success': True, 'boost_id': cid})
+    return _vlm_job_start(_run_boost, model, prompt, _boost_family(has_image),
+                          _model_type_string(), level, think, variant, negative_prompt)
 
 
 @app.route('/boost/<cid>')
@@ -1871,13 +2170,22 @@ def loop_strip():
     (so Archive/Delete Today don't remove them) and compose a film strip of
     the reference plus each edit in sequence, saved as a regular output so it
     appears in history."""
+    try:
+        result = _api_build_loop_strip(request.get_json(silent=True) or {})
+    except ApiError as e:
+        return jsonify({'success': False, 'error': e.message}), e.status
+    return jsonify(dict(result, success=True))
+
+
+def _api_build_loop_strip(data):
+    """Preserve an edit loop's iterations in .saved and compose the film strip.
+    Returns {filename, kept}."""
     from edit_loop import build_film_strip
 
-    data = request.get_json(silent=True) or {}
     filenames = [os.path.basename(f or '') for f in (data.get('filenames') or [])]
     filenames = [f for f in filenames if f.endswith('.png')]
     if not filenames:
-        return jsonify({'success': False, 'error': 'filenames is required'}), 400
+        raise ApiError('filenames is required', 400, 'invalid_request')
     direction = (data.get('direction') or '').strip()
     prompts = data.get('prompts') or []
 
@@ -1889,14 +2197,14 @@ def loop_strip():
                 ref_b64 = ref_b64.split(',', 1)[1]
             frames.append(('input', Image.open(io.BytesIO(base64.b64decode(ref_b64))).convert('RGB')))
         except Exception:
-            return jsonify({'success': False, 'error': 'ref_image is not a decodable base64 image'}), 400
+            raise ApiError('ref_image is not a decodable base64 image', 400, 'invalid_request')
 
     saved_dir = os.path.join(OUTPUT_DIR, '.saved')
     os.makedirs(saved_dir, exist_ok=True)
     for i, fn in enumerate(filenames, start=1):
         path = os.path.join(OUTPUT_DIR, fn)
         if not os.path.isfile(path):
-            return jsonify({'success': False, 'error': f'unknown image {fn}'}), 404
+            raise ApiError(f'unknown image {fn}', 404, 'not_found')
         frames.append((str(i), Image.open(path).convert('RGB')))
         shutil.copy2(path, os.path.join(saved_dir, fn))
         sidecar = fn.rsplit('.', 1)[0] + '.prompt'
@@ -1916,12 +2224,19 @@ def loop_strip():
     shutil.copy2(os.path.join(OUTPUT_DIR, strip_name), os.path.join(saved_dir, strip_name))
     shutil.copy2(sidecar_path, os.path.join(saved_dir, os.path.basename(sidecar_path)))
 
-    return jsonify({'success': True, 'filename': strip_name, 'kept': filenames})
+    return {'filename': strip_name, 'kept': filenames}
 
 
 @app.route('/history')
 def history():
     """Return today's generated images, newest first."""
+    return jsonify({'images': _api_history()})
+
+
+def _api_history():
+    """Today's top-level generated PNGs, newest first, each with the prompt
+    read from its .prompt sidecar. Read errors are logged, not raised — a
+    listing is best-effort."""
     today = datetime.now().strftime("%Y%m%d")
     images = []
     try:
@@ -1946,11 +2261,23 @@ def history():
         for img in images: del img['sort_key']
     except Exception as e:
         print(f"Error reading history: {e}")
-    return jsonify({'images': images})
+    return images
 
 
 @app.route('/archive', methods=['POST'])
 def archive_today():
+    try:
+        moved = _api_archive_today()
+    except ApiError as e:
+        # Legacy quirk preserved: this route has always answered 200 with
+        # success:false on an I/O failure. The REST layer returns a real 500.
+        return jsonify({'success': False, 'error': e.message})
+    return jsonify({'success': True, 'moved': moved})
+
+
+def _api_archive_today():
+    """Move today's top-level files into web-generated/archive/. Returns the
+    number moved."""
     today = datetime.now().strftime("%Y%m%d")
     archive_dir = os.path.join(OUTPUT_DIR, "archive")
     os.makedirs(archive_dir, exist_ok=True)
@@ -1964,8 +2291,8 @@ def archive_today():
                 shutil.move(filepath, os.path.join(archive_dir, filename))
                 moved += 1
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
-    return jsonify({'success': True, 'moved': moved})
+        raise ApiError(str(e), 500, 'io_error')
+    return moved
 
 
 @app.route('/delete', methods=['POST'])
@@ -1975,9 +2302,20 @@ def delete_today():
     If a single filename is provided in the JSON body, only that image (and its
     sidecar .prompt) is deleted. Otherwise all of today's files are removed.
     """
+    try:
+        deleted = _api_delete_today((request.get_json(silent=True) or {}).get('filename'))
+    except ApiError as e:
+        if e.status == 500:
+            # Legacy quirk preserved: I/O failures answered 200 here.
+            return jsonify({'success': False, 'error': e.message})
+        return jsonify({'success': False, 'error': e.message}), e.status
+    return jsonify({'success': True, 'deleted': deleted})
+
+
+def _api_delete_today(target=None):
+    """Permanently delete one of today's images (plus its sidecar), or all of
+    today's files when `target` is None. Returns the count of files removed."""
     today = datetime.now().strftime("%Y%m%d")
-    body = request.get_json(silent=True) or {}
-    target = body.get('filename')
     deleted = 0
 
     def _remove_pair(png_name):
@@ -1990,14 +2328,15 @@ def delete_today():
         if os.path.isfile(prompt_path):
             os.remove(prompt_path)
 
+    if target:
+        # Guard against path traversal and ensure it's a today image
+        if '/' in target or '\\' in target or not target.endswith('.png'):
+            raise ApiError('Invalid filename', 400, 'invalid_request')
+        parts = target.split('_')
+        if len(parts) < 3 or parts[1] != today:
+            raise ApiError('Not a today image', 400, 'invalid_request')
     try:
         if target:
-            # Guard against path traversal and ensure it's a today image
-            if '/' in target or '\\' in target or not target.endswith('.png'):
-                return jsonify({'success': False, 'error': 'Invalid filename'}), 400
-            parts = target.split('_')
-            if len(parts) < 3 or parts[1] != today:
-                return jsonify({'success': False, 'error': 'Not a today image'}), 400
             _remove_pair(target)
         else:
             for filename in os.listdir(OUTPUT_DIR):
@@ -2008,8 +2347,8 @@ def delete_today():
                     os.remove(filepath)
                     deleted += 1
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
-    return jsonify({'success': True, 'deleted': deleted})
+        raise ApiError(str(e), 500, 'io_error')
+    return deleted
 
 
 @app.route('/save-hidden', methods=['POST'])
@@ -2020,14 +2359,22 @@ def save_hidden():
     archiving, and delete-today (those only iterate top-level files), so saving
     an image here preserves it independently of the day's housekeeping.
     """
-    body = request.get_json(silent=True) or {}
-    target = body.get('filename')
+    try:
+        saved = _api_save_hidden((request.get_json(silent=True) or {}).get('filename'))
+    except ApiError as e:
+        return jsonify({'success': False, 'error': e.message}), e.status
+    return jsonify({'success': True, 'saved': saved})
+
+
+def _api_save_hidden(target):
+    """Copy an output image and its sidecar into .saved/, out of reach of
+    archive and delete-today. Returns the filename."""
     if not target or '/' in target or '\\' in target or not target.endswith('.png'):
-        return jsonify({'success': False, 'error': 'Invalid filename'}), 400
+        raise ApiError('Invalid filename', 400, 'invalid_request')
 
     src = os.path.join(OUTPUT_DIR, target)
     if not os.path.isfile(src):
-        return jsonify({'success': False, 'error': 'File not found'}), 404
+        raise ApiError('File not found', 404, 'not_found')
 
     saved_dir = os.path.join(OUTPUT_DIR, '.saved')
     os.makedirs(saved_dir, exist_ok=True)
@@ -2038,8 +2385,16 @@ def save_hidden():
         if os.path.isfile(src_sidecar):
             shutil.copy2(src_sidecar, os.path.join(saved_dir, sidecar))
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-    return jsonify({'success': True, 'saved': target})
+        raise ApiError(str(e), 500, 'io_error')
+    return target
+
+
+# Mount /api/v1 once every _api_* core function above exists. The live module
+# object is handed over rather than imported on the far side: this file runs as
+# __main__, so `import web_server` there would execute it a second time and give
+# the REST layer its own queue, its own model, and a second API-key check.
+rest_api.init_app(app, sys.modules[__name__])
+PUBLIC_ENDPOINTS.extend(rest_api.PUBLIC_ENDPOINTS)
 
 
 if __name__ == '__main__':

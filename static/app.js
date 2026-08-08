@@ -251,8 +251,12 @@ const resultCount = document.getElementById('resultCount');
 // The result grid sits in a collapsed-by-default <details>; the summary's
 // count is the only signal of what's inside, so refresh it on every change.
 function updateResultCount() {
-    if (resultCount) resultCount.textContent = imageGrid && imageGrid.children.length
-        ? `(${imageGrid.children.length})` : '';
+    const count = imageGrid ? imageGrid.children.length : 0;
+    if (resultCount) resultCount.textContent = count ? `(${count})` : '';
+    // Looked up here rather than closed over: this runs before the button's
+    // own const is initialized later in the file.
+    const inlineClear = document.getElementById('clearRecentInline');
+    if (inlineClear) inlineClear.style.display = count ? '' : 'none';
 }
 
 const uploadArea = document.getElementById('uploadArea');
@@ -1384,8 +1388,10 @@ if (resetBtn) resetBtn.addEventListener('click', async function() {
     const pb = document.getElementById('progressBar'); if (pb) pb.style.width = '0%';
 });
 
-const clearRecentBtn = document.getElementById('clearRecentBtn');
-if (clearRecentBtn) clearRecentBtn.addEventListener('click', async function() {
+// Clearing empties the results view and tells the server to forget its
+// recently-finished list; the generated files themselves are untouched and
+// stay in Today's Generations.
+async function clearRecentResults() {
     try {
         await fetch('/reset', { method: 'POST', headers: getAuthHeaders() });
     } catch (e) { console.warn('Clear recent request failed:', e); }
@@ -1398,6 +1404,20 @@ if (clearRecentBtn) clearRecentBtn.addEventListener('click', async function() {
     if (knownImageFilenames) knownImageFilenames.clear();
     seenDoneJobIds.clear();
     lastCompletedJobId = null;
+}
+
+const clearRecentBtn = document.getElementById('clearRecentBtn');
+if (clearRecentBtn) clearRecentBtn.addEventListener('click', clearRecentResults);
+
+// The same action on the expander's own summary row, so clearing doesn't mean
+// opening the panel and scrolling past every image to reach the button at the
+// bottom. Inside a <summary>, a click would also toggle the panel — hence the
+// stopPropagation/preventDefault pair.
+const clearRecentInline = document.getElementById('clearRecentInline');
+if (clearRecentInline) clearRecentInline.addEventListener('click', function(e) {
+    e.stopPropagation();
+    e.preventDefault();
+    clearRecentResults();
 });
 
 let lastCompletedJobId = null;
@@ -1881,8 +1901,18 @@ async function doGenerate() {
         ? ['square', 'landscape', 'portrait', 'widescreen', 'extra-tall']
         : [baseFormData.orientation];
 
-    // Briefly disable to prevent double-submit during the fetch; re-enable on response.
+    // Acknowledge the click before the POST round-trips. Without this the
+    // button sits there looking dead until the server answers, and a job that
+    // lands behind others in the queue never produces a visible "it worked"
+    // moment at all — the two cases people read as "the button did nothing".
+    const submitLabel = submitBtn.textContent;
     submitBtn.disabled = true;
+    submitBtn.textContent = 'Queuing…';
+    status.className = 'status generating';
+    statusText.textContent = orientationsToQueue.length > 1
+        ? `Submitting ${orientationsToQueue.length} jobs…`
+        : 'Submitting…';
+    noteActivity();
 
     let firstPosition = null;
     let submitted = 0;
@@ -1906,9 +1936,15 @@ async function doGenerate() {
         }
 
         if (submitted > 0 && !errorMsg) {
+            // Name the outcome explicitly. "Queued" with a position is the case
+            // that most needs saying out loud: the job was accepted, it just
+            // isn't the one generating yet.
+            const ahead = firstPosition > 1 ? firstPosition - 1 : 0;
             const posMsg = orientationsToQueue.length > 1
                 ? `Queued ${submitted} jobs (one per orientation)`
-                : (firstPosition > 1 ? `Queued at position ${firstPosition}` : 'Starting generation...');
+                : (ahead
+                    ? `Queued — ${ahead} job${ahead > 1 ? 's' : ''} ahead of it`
+                    : 'Queued — starting generation...');
             status.className = 'status generating';
             statusText.textContent = posMsg;
             noteActivity();
@@ -1927,6 +1963,7 @@ async function doGenerate() {
         statusText.textContent = 'Error submitting generation: ' + err.message;
     } finally {
         submitBtn.disabled = false;
+        submitBtn.textContent = submitLabel;
     }
 }
 
@@ -2116,12 +2153,24 @@ cmpOverlay.innerHTML = `
         <span class="cmp-stat"></span>
         <label>Tolerance <input type="range" min="0" max="48" step="1" value="8"></label>
         <span class="cmp-tol-val">8</span>
-    </div>`;
+    </div>
+    <p class="cmp-help">
+        Only the pixels the two images agree on are drawn, taken from the
+        first-picked image. A pixel is kept when its red, green and blue all
+        differ by <b>&le; <span class="cmp-tol-echo">8</span> of 255</b> from
+        the other image's — each channel is judged on its own, so one channel
+        drifting too far drops the pixel. Everything else is transparent and
+        shows the checkerboard. <b>0</b> keeps only exact matches; raising it
+        forgives the sub-level drift between two runs of the same seed, and past
+        ~24 it starts merging genuinely different content. Alpha is ignored, and
+        the match percentage above moves with this slider.
+    </p>`;
 document.body.appendChild(cmpOverlay);
 const cmpCanvas = cmpOverlay.querySelector('canvas');
 const cmpStat = cmpOverlay.querySelector('.cmp-stat');
 const cmpTol = cmpOverlay.querySelector('input[type="range"]');
 const cmpTolVal = cmpOverlay.querySelector('.cmp-tol-val');
+const cmpTolEcho = cmpOverlay.querySelector('.cmp-tol-echo');
 let cmpArmed = null;   // {filename, btn} — the first of the two picks
 let cmpData = null;    // {a, b: ImageData, w, h} while the overlay is open
 
@@ -2146,6 +2195,7 @@ function cmpRender() {
     if (!cmpData) return;
     const tol = parseInt(cmpTol.value, 10);
     cmpTolVal.textContent = tol;
+    cmpTolEcho.textContent = tol;
     const { a, b, w, h } = cmpData;
     const out = new ImageData(w, h);
     const pa = a.data, pb = b.data, po = out.data;

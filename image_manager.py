@@ -435,15 +435,19 @@ HTML_PAGE = r"""<!doctype html>
   /* Pixel compare overlay (header "Compare" button, two images selected) */
   #cmpOverlay { position: fixed; inset: 0; background: rgba(0,0,0,0.92); display: none;
                 flex-direction: column; align-items: center; justify-content: center;
-                gap: 12px; padding: 20px; z-index: 80; }
+                gap: 12px; padding: 20px; z-index: 80; overflow-y: auto; }
   #cmpOverlay.open { display: flex; }
-  .cmp-stage { max-width: 95vw; max-height: 80vh; overflow: auto; }
+  /* 62vh, not 80: leaves room for the HUD and the explanation below it. */
+  .cmp-stage { max-width: 95vw; max-height: 62vh; overflow: auto; }
   .cmp-stage canvas { display: block; max-width: 100%; height: auto;
                       /* checkerboard shows through wherever the two images disagree */
                       background: repeating-conic-gradient(#2a2a2a 0% 25%, #454545 0% 50%) 0 0 / 20px 20px; }
   .cmp-hud { display: flex; align-items: center; justify-content: center; flex-wrap: wrap;
              gap: 14px; font-size: 14px; }
   .cmp-hud label { display: flex; align-items: center; gap: 8px; }
+  .cmp-help { max-width: 70ch; margin: 0; text-align: center; font-size: 12px;
+              line-height: 1.5; color: #9a9a9a; }
+  .cmp-help b { color: #cfcfcf; font-weight: 600; }
   #cmpClose { position: absolute; top: 14px; right: 14px; width: 36px; height: 36px;
               background: rgba(255,255,255,0.12); color: #fff; border: none; border-radius: 50%;
               font-size: 16px; cursor: pointer; }
@@ -542,6 +546,17 @@ HTML_PAGE = r"""<!doctype html>
     <label>Tolerance <input type="range" id="cmpTol" min="0" max="48" step="1" value="8"></label>
     <span id="cmpTolVal">8</span>
   </div>
+  <p class="cmp-help">
+    Only the pixels the two images agree on are drawn, taken from the
+    first-selected image. A pixel is kept when its red, green and blue all
+    differ by <b>&le; <span id="cmpTolEcho">8</span> of 255</b> from the other
+    image's — each channel is judged on its own, so one channel drifting too far
+    drops the pixel. Everything else is transparent and shows the checkerboard.
+    <b>0</b> keeps only exact matches; raising it forgives the sub-level drift
+    between two runs of the same seed, and past ~24 it starts merging genuinely
+    different content. Alpha is ignored, and the match percentage above moves
+    with this slider.
+  </p>
 </div>
 
 <div id="toast"></div>
@@ -1131,6 +1146,7 @@ function cmpRender() {
   if (!cmpData) return;
   const tol = parseInt($('#cmpTol').value, 10);
   $('#cmpTolVal').textContent = tol;
+  $('#cmpTolEcho').textContent = tol;
   const { a, b, w, h } = cmpData;
   const out = new ImageData(w, h);
   const pa = a.data, pb = b.data, po = out.data;

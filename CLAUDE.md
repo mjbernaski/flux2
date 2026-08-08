@@ -17,6 +17,11 @@ entry points share one model core:
 - **`web_server.py`** — Flask API + single-worker generation queue on port
   2222. Auth via `FLUX_API_KEY` (X-API-Key header / `api_key` param). The UI is
   static files in `static/` (index.html, app.css, app.js) — no build step.
+- **`rest_api.py`** — the `/api/v1` REST layer (a blueprint registered by
+  `web_server.py`). It holds no logic: both it and the legacy flat routes call
+  the `_api_*` core functions in `web_server.py`, so behavior lives in exactly
+  one place. Adding an endpoint means extracting an `_api_*` function and
+  wiring both dialects to it. See REST_API.md and `examples/`.
 - **`image_manager.py`** — separate Flask gallery/crop tool on port 2223 over
   the same `web-generated/` tree.
 
@@ -38,10 +43,14 @@ must stay in sync with the `case` statement in `run_server.sh`.
 ```bash
 python smoke_test_servers.py        # all 12 configs, isolated subprocesses
 python smoke_test_servers.py 9 10   # subset
+python test_rest_api.py             # /api/v1 contract checks, no GPU needed
 ```
 
-Writes a live-updating HTML tracker to `server_smoke_test/index.html`.
-Requires GPU + model downloads; there are no pure unit tests.
+`smoke_test_servers.py` writes a live-updating HTML tracker to
+`server_smoke_test/index.html` and requires GPU + model downloads.
+`test_rest_api.py` runs against Flask's test client with no model loaded, so it
+covers routing/auth/status codes/error envelopes in seconds but never reaches
+the GPU — it is the one test to run after touching either API dialect.
 
 ## Dependencies
 
