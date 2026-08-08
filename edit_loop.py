@@ -43,6 +43,19 @@ from PIL import Image
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SESSIONS_DIR = os.path.join(SCRIPT_DIR, "edit-loop-sessions")
 
+# How long ollama keeps the vision model resident after a call finishes.
+#
+# The VLM and the diffusion pipeline compete for the same VRAM, and a resident
+# qwen3.6 costs ~5GB. On a 32GB card that is enough to push a high-resolution
+# fp32 VAE decode into system-RAM paging, which shows up as a generation that
+# stalls on its last step with no error. So the default is "0": ollama unloads
+# as soon as each call returns, and image generation gets the whole card.
+#
+# The cost is that a repeated-critique session (edit_loop.py) reloads the model
+# each iteration, which is slow for a large VLM. Set VLM_KEEP_ALIVE="15m" — the
+# previous behavior — when the edit loop, not generation, is the main workload.
+KEEP_ALIVE = os.environ.get("VLM_KEEP_ALIVE", "0")
+
 KONTEXT_PROMPT_TIPS = (
     "Kontext instruction tips: use a direct imperative ('Change X to Y', "
     "'Remove X'), name the subject concretely, describe the desired result "
@@ -293,9 +306,9 @@ def vlm_critique(model, direction, prompt, reference, output, metrics,
         "stream": False,
         "think": True,
         "format": CRITIQUE_SCHEMA,
-        # Keep the critic resident between iterations so each critique doesn't
-        # pay the model-load cost again.
-        "keep_alive": "15m",
+        # See KEEP_ALIVE: "0" by default, so the critic releases its VRAM to
+        # the diffusion pipeline instead of staying resident between iterations.
+        "keep_alive": KEEP_ALIVE,
         "options": {"temperature": 0.3, "num_ctx": 8192},
     }
     try:
@@ -449,7 +462,7 @@ def vlm_describe(model, image, think=False, ollama_url="http://127.0.0.1:11434",
         "stream": False,
         "think": bool(think),
         "format": DESCRIBE_SCHEMA,
-        "keep_alive": "15m",
+        "keep_alive": KEEP_ALIVE,
         "options": {"temperature": 0.4, "num_ctx": 8192},
     }
     try:
@@ -618,7 +631,7 @@ def vlm_boost(model, prompt, family="flux2", model_desc="", level=3,
         "stream": False,
         "think": bool(think),
         "format": BOOST_SCHEMA if negative_prompt else DESCRIBE_SCHEMA,
-        "keep_alive": "15m",
+        "keep_alive": KEEP_ALIVE,
         "options": {"temperature": temperature, "num_ctx": 8192},
     }
     try:

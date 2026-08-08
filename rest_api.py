@@ -905,7 +905,12 @@ _QUEUE_PAGE = """<!doctype html>
 // The key travels in the page URL because a plain navigation cannot set
 // headers; reuse it for polling. Thumbnails use the unauthenticated /images/
 // route, so they need no key at all.
-const KEY = new URLSearchParams(location.search).get('api_key') || '';
+// Served from the same origin as the main UI, so the key it already stored is
+// readable here. That is the preferred path — it keeps the key out of the URL,
+// and therefore out of browser history and any logs. ?api_key=... stays
+// supported for opening this page from somewhere that has no stored key.
+const KEY = new URLSearchParams(location.search).get('api_key')
+    || localStorage.getItem('flux_api_key') || '';
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
     ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
 
@@ -945,7 +950,8 @@ async function tick() {
             const body = await res.json().catch(() => ({}));
             document.getElementById('app').innerHTML =
                 `<div class=card><p class=err>${esc(body.error?.message || res.status)}</p>
-                 <p class=sub>Open this page with ?api_key=YOUR_KEY</p></div>`;
+                 <p class=sub>No usable key. Set one in the main UI, or open this
+                    page with ?api_key=YOUR_KEY</p></div>`;
             return;
         }
         const q = await res.json();
@@ -995,7 +1001,12 @@ _PREVIEWS_PAGE = """<!doctype html>
   <a href="__PREFIX__/queue.html">queue</a></p>
 <div id=app><p class=idle>Loading...</p></div>
 <script>
-const KEY = new URLSearchParams(location.search).get('api_key') || '';
+// Served from the same origin as the main UI, so the key it already stored is
+// readable here. That is the preferred path — it keeps the key out of the URL,
+// and therefore out of browser history and any logs. ?api_key=... stays
+// supported for opening this page from somewhere that has no stored key.
+const KEY = new URLSearchParams(location.search).get('api_key')
+    || localStorage.getItem('flux_api_key') || '';
 const JOB = '__JOB_ID__';
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
     ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
@@ -1045,7 +1056,8 @@ async function tick() {
             const body = await res.json().catch(() => ({}));
             document.getElementById('app').innerHTML =
                 `<div class=card><p class=err>${esc(body.error?.message || res.status)}</p>
-                 <p class=sub>Open this page with ?api_key=YOUR_KEY</p></div>`;
+                 <p class=sub>No usable key. Set one in the main UI, or open this
+                    page with ?api_key=YOUR_KEY</p></div>`;
             return;
         }
         const data = await res.json();

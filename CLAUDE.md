@@ -63,6 +63,12 @@ diffusers, transformers, flask, python-dotenv, huggingface_hub, requests.
   4-bit/full/GGUF/schnell, FLUX.1-Kontext editor (4-bit or full bf16), FLUX.2
   4-bit/full (32B), FLUX.2-klein (9B). Turbo LoRA (FLUX.2-dev only) and
   uncensored LoRA (FLUX.1 only) load on top.
+- **VLM VRAM**: the ollama vision model (critique/describe/boost) competes with
+  the diffusion pipeline for the same card — a resident qwen3.6 is ~5GB.
+  `edit_loop.KEEP_ALIVE` (env `VLM_KEEP_ALIVE`, default `"0"`) is sent as
+  ollama's `keep_alive` on every call, so the model unloads as soon as a call
+  returns and the startup warm-up is skipped. Set `VLM_KEEP_ALIVE=15m` to keep
+  it warm when the edit loop, not generation, is the main workload.
 - **Text encoding**: FLUX.1 4-bit can use HF's remote text-encoder API (with
   bounded LRU embedding cache and automatic fallback to local encoders when the
   endpoint is down); everything else uses local encoders. FLUX.2 has no remote

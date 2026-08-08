@@ -2144,13 +2144,24 @@ def boost_result(cid):
 
 def _warm_critique_model():
     """Pull the critique VLM into ollama's memory at server startup so the
-    edit loop's first critique doesn't pay the multi-minute cold load. An
-    empty /api/generate request loads the model and returns; keep_alive
-    matches the 15m refresh on every real critique call (edit_loop.py)."""
+    edit loop's first critique doesn't pay the multi-minute cold load.
+
+    Skipped entirely under the default VLM_KEEP_ALIVE="0": preloading a model
+    that unloads the moment it is used would hold ~5GB of VRAM away from the
+    diffusion pipeline for no benefit. Warming only makes sense when the model
+    is configured to stay resident.
+    """
     global _vlm_warming
+    # Imported here, matching the other edit_loop uses in this file — it pulls
+    # in PIL/requests and is not needed unless a VLM path actually runs.
+    import edit_loop
+    if edit_loop.KEEP_ALIVE in ('0', 0, '', None):
+        print("Critique model warm-up skipped (VLM_KEEP_ALIVE=0: the vision "
+              "model loads on demand and releases its VRAM after each call).")
+        return
     import urllib.request
     payload = json.dumps({"model": CRITIQUE_MODEL, "stream": False,
-                          "keep_alive": "15m"}).encode()
+                          "keep_alive": edit_loop.KEEP_ALIVE}).encode()
     req = urllib.request.Request(f"{OLLAMA_URL}/api/generate", data=payload,
                                  headers={"Content-Type": "application/json"})
     _vlm_warming = True
