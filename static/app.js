@@ -1754,9 +1754,28 @@ async function pollStatus() {
         renderRecentDone(data.recent_done || []);
         renderPower(data.power_w);
         renderVlm(data.vlm);
+        renderPreviewsLink(data.running, data.recent_done);
     } catch (err) {
         console.error('Polling error:', err);
     }
+}
+
+// The intermediate-images page is per-job, so the header link has to follow
+// whatever job is current: the running one, else the most recent finished one
+// (whose saved frames outlive it). Hidden when there is no job to point at.
+function renderPreviewsLink(running, recentDone) {
+    const link = document.getElementById('previewsLink');
+    if (!link) return;
+    const job = running || (recentDone && recentDone[0]);
+    if (!job) {
+        link.style.display = 'none';
+        return;
+    }
+    link.href = `/api/v1/jobs/${encodeURIComponent(job.id)}/previews.html`;
+    link.style.display = '';
+    link.title = running
+        ? 'Live intermediate images for the running generation'
+        : 'Intermediate images from the last generation';
 }
 
 function addImageToGrid(img, index) {

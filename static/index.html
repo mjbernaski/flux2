@@ -28,6 +28,9 @@
         <span class="version" id="version"></span>
         <a href="/api/v1/queue.html" class="top-link" target="_blank" rel="noopener"
            title="Live view of what is generating and what is waiting">&#9635; Queue</a>
+        <!-- href is set per-job by renderPreviewsLink on each /status poll. -->
+        <a id="previewsLink" class="top-link" target="_blank" rel="noopener"
+           style="display: none;">&#9707; Previews</a>
         <a href="/alternate" class="top-link" title="Denser sidebar + main dashboard layout">&#9776; Dense view</a>
     </div>
     <h1>FLUX Image Generator</h1>
