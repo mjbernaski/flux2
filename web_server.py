@@ -296,6 +296,10 @@ class Job:
     step_times: list = field(default_factory=list)  # per-step durations (s) of the current image
     generation_time: float = 0.0
     multi_run: Optional[str] = None  # id of the multi-model run this job belongs to
+    # Set on every job of a `{a|b}` prompt: {'id', 'index', 'total', 'source'}.
+    expansion: Optional[dict] = None
+    # The group's contact sheet, filled in on all members once the last finishes.
+    expansion_composite: Optional[str] = None
 
     @property
     def prompt(self) -> str:
@@ -319,6 +323,7 @@ class Job:
             # is only meaningful while the job is queued/running.
             'refs': len(self.params.get('input_images') or []),
             'multi_run': self.multi_run,
+            'expansion': self.expansion,
         }
 
     def full(self) -> dict:
@@ -334,6 +339,7 @@ class Job:
             # after /status releases the queue lock.
             'images': list(self.images),
             'composite': self.composite,
+            'expansion_composite': self.expansion_composite,
             'preview': self.preview,
             'preview_step': self.preview_step,
             'preview_ts': self.preview_ts,
@@ -438,6 +444,114 @@ def _build_composite_grid(grid_cells, cell_width, cell_height):
             )
             draw.text((x0 - bbox[0], y0 - bbox[1]), label, fill=(255, 255, 255), font=font)
     return composite
+
+
+# ------------------------------------------------------- expansion composites --
+# A `{a|b}` prompt becomes one job per alternative, and the whole point is to
+# compare them — so once the last member of a group finishes, its images are
+# tiled into a contact sheet alongside the individual PNGs. The members run as
+# separate jobs on the single worker, so the group is tracked here rather than
+# in any one job, and the sheet is built by re-reading the saved files (holding
+# every full-size image in memory until the group ends would be far worse).
+
+_expansion_lock = threading.RLock()
+_expansions = {}  # expansion id -> group state, dropped once the sheet is built
+EXPANSION_GROUP_TTL = 6 * 3600  # abandoned groups (restart mid-run) expire
+
+
+def _expansion_register(exp_id, total, source_prompt):
+    with _expansion_lock:
+        # A supervised restart strands whatever was in flight; don't let those
+        # groups accumulate for the life of the process.
+        cutoff = time.time() - EXPANSION_GROUP_TTL
+        for dead in [k for k, g in _expansions.items() if g['created'] < cutoff]:
+            del _expansions[dead]
+        _expansions[exp_id] = {'total': total, 'done': 0, 'cells': [],
+                               'prompt': source_prompt, 'created': time.time()}
+
+
+def _expansion_record(job):
+    """Note that an expansion member finished; build the sheet on the last one.
+
+    Every member reaches this exactly once — done, failed, or canceled — so the
+    group always completes even when part of the expansion never generated.
+    Must not be called while holding _queue_cv: building the sheet does disk
+    I/O.
+    """
+    if not job or not job.expansion:
+        return
+    with _expansion_lock:
+        group = _expansions.get(job.expansion['id'])
+        if not group:
+            return
+        group['done'] += 1
+        if job.state == 'done' and job.images:
+            # One cell per alternative: a job with batch > 1 already gets its
+            # own batch grid, so take its first image as the representative.
+            group['cells'].append((job.expansion['index'], job.images[0]['filename'],
+                                   job.prompt))
+        if group['done'] < group['total']:
+            return
+        del _expansions[job.expansion['id']]
+
+    filename = _build_expansion_composite(group)
+    if not filename:
+        return
+    # Publish the sheet on every member still in _recent_done, so a client that
+    # polls any job of the group finds it.
+    with _queue_cv:
+        for j in _recent_done:
+            if j.expansion and j.expansion['id'] == job.expansion['id']:
+                j.expansion_composite = filename
+
+
+def _build_expansion_composite(group):
+    """Tile a finished group's images into one labeled sheet. Returns its
+    filename, or None when there is nothing worth comparing."""
+    cells = sorted(group['cells'])
+    # A single surviving image is just that image; a sheet of one says nothing.
+    if len(cells) < 2:
+        return None
+
+    thumbs, cell_width, cell_height = [], None, None
+    for seq, (_index, filename, _text) in enumerate(cells, start=1):
+        try:
+            with Image.open(os.path.join(OUTPUT_DIR, filename)) as im:
+                im = im.convert('RGB')
+                if cell_width is None:
+                    cell_width, cell_height = _composite_cell_size(*im.size)
+                thumbs.append((im.resize((cell_width, cell_height),
+                                         Image.Resampling.LANCZOS), seq))
+        except OSError as e:
+            # A missing or unreadable member costs one cell, not the sheet.
+            print(f"[expansion] skipping {filename}: {e}", flush=True)
+    if len(thumbs) < 2:
+        return None
+
+    n_cols = math.ceil(math.sqrt(len(thumbs)))
+    n_rows = math.ceil(len(thumbs) / n_cols)
+    grid_cells = [
+        thumbs[r * n_cols:(r + 1) * n_cols] +
+        [None] * (n_cols - len(thumbs[r * n_cols:(r + 1) * n_cols]))
+        for r in range(n_rows)
+    ]
+    composite = _build_composite_grid(grid_cells, cell_width, cell_height)
+
+    stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    comp_filename = f"{_output_prefix()}_{stamp}_expansion_grid.png"
+    comp_path = os.path.join(OUTPUT_DIR, comp_filename)
+    composite.save(comp_path)
+
+    # Sidecar: `# Prompt:` stays first-class for image_manager.py, with the
+    # cell numbering spelled out so the sheet can be read on its own.
+    with open(comp_path.rsplit('.', 1)[0] + '.prompt', 'w') as f:
+        f.write(f"# Raw input: {group['prompt']}\n")
+        f.write(f"# Prompt: {group['prompt']}\n")
+        f.write(f"# Expansion: {len(thumbs)} of {group['total']} prompts\n")
+        for seq, (_index, filename, text) in enumerate(cells, start=1):
+            f.write(f"#   {seq}. {text} [{filename}]\n")
+    print(f"[expansion] wrote {comp_filename} ({len(thumbs)} cells)", flush=True)
+    return comp_filename
 
 
 def _run_job(job: Job):
@@ -783,6 +897,8 @@ def _queue_worker():
             # config once the queue is idle, or mark it finished).
             if job.multi_run:
                 _multi_run_record(job)
+            # Tiles the group's images once this is the last member to finish.
+            _expansion_record(job)
             _multi_run_advance()
 
 
@@ -927,6 +1043,118 @@ def ready():
     return jsonify(_api_readiness())
 
 
+# ---------------------------------------------------------- prompt expansion --
+# `a {red|blue} car` queues one job per alternative — the cartesian product
+# across every group, so `{red|blue} car in {rain|snow}` is four jobs. Groups
+# nest, and a backslash escapes a brace or bar that is meant literally
+# (`\{not a group\}`). A braced run with no top-level `|` is ordinary text, so
+# prompts that merely contain braces are untouched.
+
+
+def _split_alternatives(body):
+    """Split a brace body on its top-level `|`, honoring nesting and escapes."""
+    parts, depth, buf, i = [], 0, [], 0
+    while i < len(body):
+        c = body[i]
+        if c == '\\' and i + 1 < len(body):
+            buf.append(c)
+            buf.append(body[i + 1])
+            i += 2
+            continue
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+        elif c == '|' and depth == 0:
+            parts.append(''.join(buf))
+            buf = []
+            i += 1
+            continue
+        buf.append(c)
+        i += 1
+    parts.append(''.join(buf))
+    return parts
+
+
+def _find_alternation(prompt):
+    """(start, end, body) of the first `{...}` holding a top-level `|`.
+
+    `end` is exclusive. Returns None when the prompt has no alternation left.
+    Braced runs without a top-level `|` are descended into rather than skipped,
+    so the inner group of `{keep {a|b}}` still expands.
+    """
+    i = 0
+    while i < len(prompt):
+        if prompt[i] == '\\':
+            i += 2
+            continue
+        if prompt[i] == '{':
+            depth, j = 1, i + 1
+            while j < len(prompt) and depth:
+                if prompt[j] == '\\':
+                    j += 2
+                    continue
+                if prompt[j] == '{':
+                    depth += 1
+                elif prompt[j] == '}':
+                    depth -= 1
+                j += 1
+            # An unbalanced '{' is literal text; nothing after it can be a
+            # group either, so stop looking.
+            if depth:
+                return None
+            body = prompt[i + 1:j - 1]
+            if len(_split_alternatives(body)) > 1:
+                return i, j, body
+        i += 1
+    return None
+
+
+def _finalize_prompt(text):
+    """Drop the escaping backslashes and tidy the seams left by expansion."""
+    out, i = [], 0
+    while i < len(text):
+        if text[i] == '\\' and i + 1 < len(text) and text[i + 1] in '{}|\\':
+            out.append(text[i + 1])
+            i += 2
+            continue
+        out.append(text[i])
+        i += 1
+    # An empty alternative (`a {big |}cat`) leaves a double space behind.
+    # Collapse runs of spaces only — newlines in the prompt are deliberate.
+    return re.sub(r'[ \t]{2,}', ' ', ''.join(out)).strip()
+
+
+def expand_prompt(prompt, limit):
+    """Every prompt `prompt` expands to, in `{a|b}` left-to-right order.
+
+    Returns None if the product exceeds `limit`, so a pathological prompt is
+    refused before its expansion is ever materialized. Duplicate results are
+    dropped: with the queue only QUEUE_MAX_SIZE deep, a repeated alternative
+    is a typo far more often than a request for the same image twice.
+    """
+    out, frontier = [], [prompt]
+    while frontier:
+        # Every unexpanded prompt still yields at least one result, so this
+        # sum only grows — once it passes the limit the product cannot fit.
+        if len(out) + len(frontier) > limit:
+            return None
+        current = frontier.pop(0)
+        found = _find_alternation(current)
+        if not found:
+            out.append(_finalize_prompt(current))
+            continue
+        start, end, body = found
+        head, tail = current[:start], current[end:]
+        # Depth-first, so the leftmost group varies slowest and the queue
+        # order reads the way the prompt does. Alternatives keep their own
+        # spacing — `{big |}cat` needs that trailing space, and the padding in
+        # `{red | blue}` is collapsed with the other seams at the end.
+        frontier[:0] = [head + alt + tail
+                        for alt in _split_alternatives(body)]
+    return list(dict.fromkeys(out))
+
+
 def _validate_generate_params(data):
     """Validate and normalize a /generate request body in place.
 
@@ -1037,8 +1265,10 @@ def _validate_generate_params(data):
 def _api_enqueue_generation(data):
     """Validate a generation request and put it on the queue.
 
-    `data` is normalized in place by _validate_generate_params. Returns
-    (job, 1-based position in the pending list); raises ApiError otherwise.
+    `data` is normalized in place by _validate_generate_params. Returns a list
+    of (job, 1-based position in the pending list) pairs — one per prompt the
+    request expands to, all sharing the validated parameters; raises ApiError
+    otherwise. An unexpanded prompt yields a one-element list.
     """
     if not _model_ready:
         raise ApiError('Model still loading. Please wait.', 503, 'model_loading')
@@ -1051,16 +1281,45 @@ def _api_enqueue_generation(data):
     if error:
         raise ApiError(error, 400, 'invalid_request')
 
+    prompts = expand_prompt(prompt, QUEUE_MAX_SIZE)
+    # More prompts than the queue can ever hold is a bad request, not a busy
+    # server — no amount of waiting makes it fit.
+    if prompts is None:
+        raise ApiError(
+            f'prompt expands to more than {QUEUE_MAX_SIZE} prompts, which is '
+            f'the whole queue; use fewer alternatives in {{...}} groups',
+            400, 'invalid_request')
+
     with _queue_cv:
-        if len(_pending) >= QUEUE_MAX_SIZE:
-            raise ApiError(
-                f'Queue is full ({QUEUE_MAX_SIZE} max). Cancel a queued job or wait.',
-                429, 'queue_full')
-        job = Job(id=uuid.uuid4().hex[:12], params=data, submitted_at=time.time())
-        _pending.append(job)
-        position = len(_pending)  # 1-based position of this job in the pending list
+        free = QUEUE_MAX_SIZE - len(_pending)
+        if free < len(prompts):
+            detail = (f'Queue is full ({QUEUE_MAX_SIZE} max). Cancel a queued '
+                      f'job or wait.') if len(prompts) == 1 else (
+                      f'This prompt expands to {len(prompts)} jobs but only '
+                      f'{free} of the {QUEUE_MAX_SIZE} queue slots are free. '
+                      f'Cancel a queued job or wait.')
+            raise ApiError(detail, 429, 'queue_full')
+        # An expansion is a group: its members are tracked together so the
+        # last one to finish can tile them all into one contact sheet.
+        exp_id = uuid.uuid4().hex[:12] if len(prompts) > 1 else None
+        if exp_id:
+            _expansion_register(exp_id, len(prompts), prompt)
+        queued = []
+        for index, text in enumerate(prompts, start=1):
+            # One params dict per job so each carries its own prompt; the
+            # reference images inside are read-only and safely shared.
+            params = dict(data)
+            params['prompt'] = text
+            job = Job(id=uuid.uuid4().hex[:12], params=params,
+                      submitted_at=time.time())
+            if exp_id:
+                job.expansion = {'id': exp_id, 'index': index,
+                                 'total': len(prompts), 'source': prompt}
+            _pending.append(job)
+            # 1-based position of this job in the pending list
+            queued.append((job, len(_pending)))
         _queue_cv.notify()
-    return job, position
+    return queued
 
 
 def _api_find_job(job_id):
@@ -1080,6 +1339,7 @@ def _api_find_job(job_id):
 def _api_cancel_job(job_id):
     """Cancel a queued job outright, or ask the running one to stop. Returns a
     human-readable message; raises ApiError(404) if the id is unknown."""
+    canceled = None
     with _queue_cv:
         for i, j in enumerate(_pending):
             if j.id == job_id:
@@ -1088,14 +1348,22 @@ def _api_cancel_job(job_id):
                 del _pending[i]
                 _recent_done.insert(0, j)
                 del _recent_done[RECENT_DONE_MAX:]
-                return f'Job {job_id} canceled'
-        if _running_job and _running_job.id == job_id:
-            # Interrupt: the generation loop checks this flag at every step and
-            # raises JobCanceled; the worker then marks the job canceled. Any
-            # batch images already finished are kept.
-            _running_job.cancel_requested = True
-            return f'Job {job_id} is stopping'
-    raise ApiError('Job not found', 404, 'not_found')
+                canceled = j
+                break
+        else:
+            if _running_job and _running_job.id == job_id:
+                # Interrupt: the generation loop checks this flag at every step
+                # and raises JobCanceled; the worker then marks the job
+                # canceled. Any batch images already finished are kept.
+                _running_job.cancel_requested = True
+                return f'Job {job_id} is stopping'
+            raise ApiError('Job not found', 404, 'not_found')
+
+    # A job canceled before it ran never reaches the worker, so close it out
+    # with the group here — otherwise the rest of the expansion waits forever
+    # for a sheet that never gets built. Outside the lock: this does disk I/O.
+    _expansion_record(canceled)
+    return f'Job {job_id} canceled'
 
 
 def _api_list_step_frames(job_id):
@@ -1160,12 +1428,20 @@ def _api_job_previews(job_id):
             'ts': job.get('preview_ts') or 0,
         }
 
+    # The finished outputs, so a caller can show the whole build in one place:
+    # noise -> saved steps -> the image it actually landed on.
+    images = [{'filename': i.get('filename'), 'seed': i.get('seed')}
+              for i in ((job.get('images') if job else None) or [])]
+
     return {
         'id': job_id,
         'state': job['state'] if job else None,
+        'prompt': (job.get('prompt') if job else None) or '',
         'live': live,
         'frames': frames,
         'count': len(frames),
+        'images': images,
+        'generation_time': (job.get('generation_time') if job else 0) or 0,
         # False means no frames were ever written for this job, not that they
         # were lost — save_previews has to be requested at generation time.
         'saving': bool(job.get('saved_previews')) if job else bool(frames),
@@ -1219,10 +1495,18 @@ def _api_queue_view():
 @app.route('/generate', methods=['POST'])
 def generate():
     try:
-        job, position = _api_enqueue_generation(request.json or {})
+        queued = _api_enqueue_generation(request.json or {})
     except ApiError as e:
         return jsonify({'success': False, 'error': e.message}), e.status
-    return jsonify({'success': True, 'job_id': job.id, 'position': position})
+    job, position = queued[0]
+    # job_id/position stay the first job's so existing clients keep working;
+    # a `{a|b}` prompt reports the rest in jobs/expanded.
+    payload = {'success': True, 'job_id': job.id, 'position': position}
+    if len(queued) > 1:
+        payload['expanded'] = len(queued)
+        payload['jobs'] = [{'job_id': j.id, 'position': p, 'prompt': j.params['prompt']}
+                           for j, p in queued]
+    return jsonify(payload)
 
 
 @app.route('/steps/<job_id>')

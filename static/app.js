@@ -1033,6 +1033,9 @@ async function runEvolveGenerate() {
 
     const oldLabel = btn.textContent;
     btn.disabled = true;
+    // Same fresh start as the Generate button: the results section shows this
+    // run's variations, not the previous run's alongside them.
+    await clearRecentResults();
     let evolved = 0, queued = 0, failed = 0;
     const prog = vlmStatusStart(btn, `Evolving ${n} prompt variations`);
     const tick = function() {
@@ -1677,6 +1680,21 @@ function renderRecentDone(recent) {
         }
     }
 
+    // An expansion's contact sheet is written after its last job is already
+    // marked done, so it can land on a job this loop has seen before. Scan for
+    // it separately rather than gating it on seenDoneJobIds, which would drop
+    // the sheet whenever the poll caught the job in that window.
+    for (const job of recent) {
+        const sheet = job.expansion_composite;
+        if (!sheet || knownImageFilenames.has(sheet)) continue;
+        const n = (job.expansion && job.expansion.total) || 0;
+        addCompositeToGrid(sheet,
+            `Expansion contact sheet${n ? ` — ${n} prompt variations` : ''}`,
+            'Expansion contact sheet');
+        knownImageFilenames.add(sheet);
+        result.className = 'result visible';
+    }
+
     if (latest.id !== lastCompletedJobId) {
         lastCompletedJobId = latest.id;
         if (latest.state === 'done') {
@@ -1719,16 +1737,41 @@ function renderVlm(vlm) {
     badge.style.display = 'inline';
 }
 
-// GPU wattage badge in the lower-right corner (value rides on /status).
-function renderPower(watts) {
+// Images still to produce: everything queued, plus whatever is left of the
+// running job's batch (mirrors the server's `images_pending`).
+function pendingImageCount(running, queued) {
+    let n = (queued || []).reduce((sum, j) => sum + Math.max(1, j.batch || 1), 0);
+    if (running) n += Math.max(0, Math.max(1, running.batch || 1) - (running.current || 0));
+    return n;
+}
+
+// GPU wattage badge in the lower-right corner (value rides on /status). On
+// phones the queue panel is usually scrolled away, so the badge also carries a
+// count of the images still to generate.
+function renderPower(watts, running, queued) {
     const badge = document.getElementById('powerBadge');
     const val = document.getElementById('powerWatts');
+    const pend = document.getElementById('powerPending');
     if (!badge || !val) return;
-    if (typeof watts === 'number') {
+
+    const touch = window.matchMedia('(hover: none), (pointer: coarse)').matches;
+    const pending = touch ? pendingImageCount(running, queued) : 0;
+    if (pend) {
+        pend.textContent = '🖼 ' + pending;
+        pend.style.display = pending > 0 ? 'inline' : 'none';
+    }
+
+    const haveWatts = typeof watts === 'number';
+    badge.classList.toggle('no-watts', !haveWatts);
+    if (haveWatts) {
         val.textContent = Math.round(watts) + ' W';
+        val.style.display = 'inline';
         badge.style.display = 'block';
     } else {
-        badge.style.display = 'none';
+        // No nvidia-smi reading — still worth showing the count on its own.
+        val.textContent = '';
+        val.style.display = 'none';
+        badge.style.display = pending > 0 ? 'block' : 'none';
     }
 }
 
@@ -1752,7 +1795,7 @@ async function pollStatus() {
         renderRunning(data.running);
         renderQueue(data.queued || []);
         renderRecentDone(data.recent_done || []);
-        renderPower(data.power_w);
+        renderPower(data.power_w, data.running, data.queued || []);
         renderVlm(data.vlm);
         renderPreviewsLink(data.running, data.recent_done);
     } catch (err) {
@@ -1816,19 +1859,21 @@ function addImageToGrid(img, index) {
     updateResultCount();
 }
 
-function addCompositeToGrid(filename) {
+function addCompositeToGrid(filename, label, caption) {
     const t = Date.now();
+    const text = label || 'Matrix composite (guidance → columns, reference following → rows)';
+    const cap = caption || 'Spectrum composite';
     const compositeCard = document.createElement('div');
     compositeCard.className = 'image-card composite-card';
     compositeCard.innerHTML = `
-        <p class="composite-label">Matrix composite (guidance → columns, reference following → rows)</p>
-        <img src="/images/${filename}?t=${t}" alt="Spectrum grid composite" class="composite-img">
+        <p class="composite-label">${text}</p>
+        <img src="/images/${filename}?t=${t}" alt="${cap}" class="composite-img">
         <div class="actions">
             <a href="/images/${filename}" download="${filename}">Download composite</a>
         </div>
     `;
     compositeCard.querySelector('img').addEventListener('click', () =>
-        openLightbox([{ src: `/images/${filename}`, caption: 'Spectrum composite' }], 0));
+        openLightbox([{ src: `/images/${filename}`, caption: cap }], 0));
     imageGrid.insertBefore(compositeCard, imageGrid.firstChild);
     updateResultCount();
 }
@@ -1927,6 +1972,10 @@ async function doGenerate() {
     const submitLabel = submitBtn.textContent;
     submitBtn.disabled = true;
     submitBtn.textContent = 'Queuing…';
+    // Start each generation with an empty results section, so what appears
+    // there is this run and not this run stacked on the last few. Nothing is
+    // deleted — every image is still in Today's Generations below.
+    await clearRecentResults();
     status.className = 'status generating';
     statusText.textContent = orientationsToQueue.length > 1
         ? `Submitting ${orientationsToQueue.length} jobs…`
@@ -1935,6 +1984,9 @@ async function doGenerate() {
 
     let firstPosition = null;
     let submitted = 0;
+    // Jobs actually queued: a `{a|b}` prompt expands server-side, so one
+    // accepted POST can be several jobs.
+    let jobsQueued = 0;
     let errorMsg = null;
     try {
         for (const orient of orientationsToQueue) {
@@ -1947,6 +1999,7 @@ async function doGenerate() {
             const data = await response.json().catch(() => ({}));
             if (response.ok && data.success) {
                 submitted += 1;
+                jobsQueued += data.expanded || 1;
                 if (firstPosition === null) firstPosition = data.position;
             } else {
                 errorMsg = data.error || `HTTP ${response.status}`;
@@ -1959,11 +2012,13 @@ async function doGenerate() {
             // that most needs saying out loud: the job was accepted, it just
             // isn't the one generating yet.
             const ahead = firstPosition > 1 ? firstPosition - 1 : 0;
-            const posMsg = orientationsToQueue.length > 1
-                ? `Queued ${submitted} jobs (one per orientation)`
-                : (ahead
-                    ? `Queued — ${ahead} job${ahead > 1 ? 's' : ''} ahead of it`
-                    : 'Queued — starting generation...');
+            const posMsg = jobsQueued > submitted
+                ? `Queued ${jobsQueued} jobs — one per {…} alternative`
+                : (orientationsToQueue.length > 1
+                    ? `Queued ${submitted} jobs (one per orientation)`
+                    : (ahead
+                        ? `Queued — ${ahead} job${ahead > 1 ? 's' : ''} ahead of it`
+                        : 'Queued — starting generation...'));
             status.className = 'status generating';
             statusText.textContent = posMsg;
             noteActivity();

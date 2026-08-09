@@ -152,6 +152,19 @@ button:disabled {
     z-index: 900;
     pointer-events: none;
 }
+/* Images still to produce, shown only on touch devices (see renderPower):
+   the queue panel is off-screen there, so this is the only in-flight cue. */
+.power-badge .pending {
+    margin-left: 8px;
+    padding-left: 8px;
+    border-left: 1px solid #333;
+    color: #ffd166;
+}
+.power-badge.no-watts .pending {
+    margin-left: 4px;
+    padding-left: 0;
+    border-left: none;
+}
 .latest-thumb {
     position: fixed;
     bottom: calc(48px + env(safe-area-inset-bottom, 0px));

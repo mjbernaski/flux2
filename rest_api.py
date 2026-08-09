@@ -208,11 +208,22 @@ def create_job():
     Returns 201 with the queued job and a Location header. Generation is
     asynchronous in every case — even an empty queue runs the job on the
     single worker thread — so poll GET /jobs/{id} for progress and results.
+
+    A prompt with `{a|b}` alternatives queues one job per combination. The
+    body then describes the first of them, as does Location, and `expanded`
+    lists them all.
     """
-    job, position = ws._api_enqueue_generation(_body())
+    queued = ws._api_enqueue_generation(_body())
+    job, position = queued[0]
     payload = job.full()
     payload['position'] = position
     payload['url'] = _job_url(job.id)
+    if len(queued) > 1:
+        payload['expanded'] = [
+            {'id': j.id, 'position': p, 'prompt': j.params['prompt'],
+             'url': _job_url(j.id)}
+            for j, p in queued
+        ]
     return jsonify(payload), 201, {'Location': _job_url(job.id)}
 
 
@@ -317,6 +328,8 @@ def job_previews(job_id):
     payload = ws._api_job_previews(job_id)
     for frame in payload['frames']:
         frame['url'] = f"{URL_PREFIX}/images/{frame['path']}"
+    for image in payload['images']:
+        image['url'] = f"{URL_PREFIX}/images/{image['filename']}"
     if payload['live']:
         payload['live']['url'] = (
             f"{URL_PREFIX}/images/{payload['live']['path']}?t={payload['live']['ts']}")
@@ -587,7 +600,10 @@ def _openapi_document():
         'type': 'object',
         'required': ['prompt'],
         'properties': {
-            'prompt': {'type': 'string', 'description': 'Required. The text prompt.'},
+            'prompt': {'type': 'string',
+                       'description': 'Required. The text prompt. `{a|b}` groups '
+                                      'expand to one job per combination; '
+                                      'backslash-escape a brace to keep it literal.'},
             'steps': {'type': 'integer', 'default': 25, 'minimum': 1, 'maximum': 200},
             'batch': {'type': 'integer', 'default': 1, 'minimum': 1, 'maximum': 128},
             'seed': {'type': ['integer', 'null'],
@@ -1001,8 +1017,19 @@ _PREVIEWS_PAGE = """<!doctype html>
   .frame img { width:100%; border-radius:4px; border:1px solid var(--line);
                display:block; cursor:pointer; }
   .frame span { font:11px ui-monospace,monospace; color:var(--dim); }
+  /* The last cell of a build strip is the finished image, not a step. */
+  .frame.final img { border-color:var(--accent); border-width:2px; }
+  .frame.final span { color:var(--accent); font-weight:700; }
   .group-label { color:var(--dim); font-size:12px; margin:14px 0 7px;
                  text-transform:uppercase; letter-spacing:.05em; font-weight:600; }
+  .results { display:flex; flex-wrap:wrap; gap:14px; justify-content:center; }
+  .result-item { text-align:center; max-width:100%; }
+  .result-item img { max-width:100%; max-height:58vh; border-radius:6px;
+                     border:1px solid var(--line); display:block; cursor:pointer; }
+  .result-item span { font:12px ui-monospace,monospace; color:var(--dim);
+                      display:block; margin-top:5px; }
+  .prompt { color:var(--dim); font-size:13px; margin:0 0 12px;
+            overflow-wrap:anywhere; }
 </style>
 <h1>Intermediate images</h1>
 <p class=sub>Job <code>__JOB_ID__</code> &middot; refreshing every 1.5s while it runs &middot;
@@ -1020,6 +1047,7 @@ const JOB = '__JOB_ID__';
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
     ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
 let timer = null;
+let lastSignature = null;   // suppresses no-op re-renders; see tick()
 
 function renderLive(live) {
     if (!live) {
@@ -1034,10 +1062,34 @@ function renderLive(live) {
       </div>`;
 }
 
-function renderFrames(frames) {
+function renderResults(images, state, seconds) {
+    if (!images.length) {
+        if (state === null) {
+            // Saved frames outlive the job record: after a restart, or once the
+            // job ages out of the recent list, the build is still on disk but
+            // the server no longer knows the result filenames.
+            return '<p class=idle>The server no longer holds this job\\'s record, ' +
+                   'so its result cannot be linked. The saved build is below.</p>';
+        }
+        return ['queued', 'running'].includes(state)
+            ? '<p class=idle>Not finished yet.</p>'
+            : `<p class=idle>This job produced no image (${esc(state)}).</p>`;
+    }
+    const took = seconds ? ` &middot; ${Number(seconds).toFixed(1)}s` : '';
+    return `<div class=results>` + images.map((img, i) => `
+        <div class=result-item>
+          <img src="/images/${encodeURI(img.filename)}"
+               onclick="window.open(this.src,'_blank')" alt="">
+          <span>${images.length > 1 ? `#${i + 1} &middot; ` : ''}seed ${esc(img.seed)}${took}</span>
+        </div>`).join('') + '</div>';
+}
+
+// The build strip: every saved step in order, with the finished image as the
+// last cell so the whole progression from noise to result reads left to right.
+function renderFrames(frames, images) {
     if (!frames.length) {
-        return '<p class=idle>No saved frames. Generate with save_previews to keep ' +
-               'every step on disk.</p>';
+        return '<p class=idle>No saved frames — generate with save_previews to keep ' +
+               'every step on disk. The finished image is above.</p>';
     }
     // Group by batch image so a multi-image job reads as several strips.
     const groups = new Map();
@@ -1046,14 +1098,24 @@ function renderFrames(frames) {
         if (!groups.has(key)) groups.set(key, []);
         groups.get(key).push(f);
     }
-    return [...groups.entries()].map(([image, list]) => `
-        <div class=group-label>Image ${image} — ${list.length} frame(s)</div>
-        <div class=grid>` + list.map(f => `
+    return [...groups.entries()].map(([image, list]) => {
+        // Frame image indices are 1-based and line up with the batch order.
+        const finished = images[image - 1];
+        const cells = list.map(f => `
           <div class=frame>
             <img loading=lazy src="/images/${encodeURI(f.path)}"
                  onclick="window.open(this.src,'_blank')" alt="">
             <span>step ${f.step ?? '?'}</span>
-          </div>`).join('') + '</div>').join('');
+          </div>`).join('') + (finished ? `
+          <div class="frame final">
+            <img loading=lazy src="/images/${encodeURI(finished.filename)}"
+                 onclick="window.open(this.src,'_blank')" alt="">
+            <span>final</span>
+          </div>` : '');
+        const total = list.length + (finished ? 1 : 0);
+        return `<div class=group-label>Image ${image} — ${total} frame(s)</div>
+                <div class=grid>${cells}</div>`;
+    }).join('');
 }
 
 async function tick() {
@@ -1070,17 +1132,38 @@ async function tick() {
             return;
         }
         const data = await res.json();
-        document.getElementById('app').innerHTML = `
-          <div class=card><h2>Generating now</h2>${renderLive(data.live)}</div>
-          <div class=card><h2>Saved frames (${data.count})</h2>
-            ${renderFrames(data.frames)}</div>`;
+        const images = data.images || [];
+        const running = ['queued', 'running'].includes(data.state);
 
-        // Once the job has settled nothing more will change, so stop polling
-        // rather than hammering the server behind a forgotten open tab.
-        if (data.state && !['queued', 'running'].includes(data.state)) {
+        // Only touch the DOM when something actually changed. Re-rendering on
+        // every poll would replace each <img> mid-download, so lazily-loaded
+        // frames never got the chance to finish and the grid stayed blank.
+        const signature = [data.state, data.count, images.length,
+                           data.live ? data.live.ts : ''].join('|');
+        if (signature !== lastSignature) {
+            lastSignature = signature;
+            // While it runs the live frame leads; once finished, the result does.
+            const liveCard = running || data.live
+                ? `<div class=card><h2>Generating now</h2>${renderLive(data.live)}</div>` : '';
+            const resultCard = running && !images.length ? '' : `
+              <div class=card><h2>Result</h2>
+                ${data.prompt ? `<p class=prompt>${esc(data.prompt)}</p>` : ''}
+                ${renderResults(images, data.state, data.generation_time)}</div>`;
+            const buildCard = `<div class=card><h2>Build (${data.count} saved)</h2>
+                  ${renderFrames(data.frames, images)}</div>`;
+            document.getElementById('app').innerHTML = running
+                ? liveCard + resultCard + buildCard
+                : resultCard + buildCard + liveCard;
+        }
+
+        // Stop polling once nothing more can change, rather than hammering the
+        // server behind a forgotten open tab. A null state counts: the job is
+        // gone from memory, so it will never progress.
+        if (!running) {
             clearInterval(timer);
-            document.querySelector('.sub').insertAdjacentHTML('beforeend',
-                ` &middot; <b>${esc(data.state)}</b>, refresh stopped`);
+            const note = data.state ? `<b>${esc(data.state)}</b>, refresh stopped`
+                                    : 'job no longer in memory, refresh stopped';
+            document.querySelector('.sub').insertAdjacentHTML('beforeend', ` &middot; ${note}`);
         }
     } catch (e) {
         document.getElementById('app').innerHTML =

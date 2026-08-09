@@ -107,7 +107,7 @@ Request body — only `prompt` is required:
 
 | field | type | default | notes |
 | --- | --- | --- | --- |
-| `prompt` | string | — | Required |
+| `prompt` | string | — | Required; `{a\|b}` groups expand (see below) |
 | `steps` | int | 25 | 1–200 |
 | `batch` | int | 1 | 1–128; the prompt is encoded once for the whole batch |
 | `seed` | int\|null | null | Omit for a fresh random seed per image |
@@ -123,6 +123,40 @@ Request body — only `prompt` is required:
 | `show_preview` | bool | false | Decode latent previews while generating |
 | `save_previews` | bool | false | Also write each frame to `steps/` |
 | `spectrum_grid` | bool | false | Sweep guidance/strength into a matrix |
+
+### Prompt expansion
+
+A `{a|b}` group in the prompt queues one job per alternative, and several
+groups queue the cartesian product — `{red|blue} car in {rain|snow}` is four
+jobs, in that reading order. Spacing around the bars is trimmed, so
+`{red | blue}` and `{red|blue}` are the same. Groups nest, duplicate results
+are dropped, and a braced run with no `|` is ordinary text — only a backslash
+(`\{literal\}`) is needed when a brace *and* a bar are meant literally.
+
+The response describes the first job — `id`, `prompt` and `Location` all point
+at it — and adds an `expanded` array listing every job the prompt produced:
+
+```json
+{
+  "id": "a1b2c3d4e5f6", "prompt": "a red car", "position": 1,
+  "expanded": [
+    { "id": "a1b2c3d4e5f6", "position": 1, "prompt": "a red car",  "url": "/api/v1/jobs/a1b2c3d4e5f6" },
+    { "id": "b2c3d4e5f6a1", "position": 2, "prompt": "a blue car", "url": "/api/v1/jobs/b2c3d4e5f6a1" }
+  ]
+}
+```
+
+Expansion is all-or-nothing. A prompt expanding past `QUEUE_MAX_SIZE` is
+`400 invalid_request` (it could never fit); one that merely doesn't fit
+alongside the current queue is `429 queue_full`. Neither queues a partial run.
+
+Once the last job of an expansion finishes, its images are tiled into a
+numbered contact sheet — `flux{1|2}_{stamp}_expansion_grid.png`, saved next to
+the individual PNGs with a `.prompt` sidecar that lists which cell came from
+which alternative. Every job in the group then reports it as
+`expansion_composite` (alongside the per-job `composite`, which is the batch
+or spectrum grid). Jobs that were canceled or failed simply don't get a cell,
+and a group left with fewer than two images produces no sheet.
 
 `GET /queue` is the queue-centric view, for answering "where is my job in line
 and when will it run":

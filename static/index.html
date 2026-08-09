@@ -6,7 +6,7 @@
     <meta name="theme-color" content="#1a1a2e">
     <title>flux</title>
     <script>document.title = window.location.hostname + ' flux';</script>
-    <link rel="stylesheet" href="/static/app.css?v=8">
+    <link rel="stylesheet" href="/static/app.css?v=9">
 </head>
 <body>
     <div class="loading-overlay" id="loadingOverlay">
@@ -479,7 +479,7 @@
     </div>
 
     <!-- GPU power draw, refreshed with the /status poll. -->
-    <div class="power-badge" id="powerBadge" style="display: none;">⚡ <span id="powerWatts"></span></div>
+    <div class="power-badge" id="powerBadge" style="display: none;">⚡ <span id="powerWatts"></span><span class="pending" id="powerPending" style="display: none;"></span></div>
 
     <!-- Always-visible thumbnail of the newest image (rides loadHistory). -->
     <button type="button" class="latest-thumb" id="latestThumb" style="display: none;">
@@ -499,6 +499,6 @@
         </details>
     </div>
 
-    <script src="/static/app.js?v=8"></script>
+    <script src="/static/app.js?v=9"></script>
 </body>
 </html>

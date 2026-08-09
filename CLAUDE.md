@@ -92,6 +92,15 @@ diffusers, transformers, flask, python-dotenv, huggingface_hub, requests.
 - **Web queue**: one worker thread, `QUEUE_MAX_SIZE=10`, jobs carry progress
   state polled by the UI via `/status`. `/generate` validates all params at the
   API boundary and returns 400s.
+- **Prompt expansion**: `{a|b}` in a prompt queues one job per alternative,
+  cartesian across groups (`expand_prompt` in `web_server.py`, applied inside
+  `_api_enqueue_generation` so both API dialects and every client get it).
+  Nesting and `\{` escaping are supported; a braced run without a top-level
+  `|` stays literal. All-or-nothing: past `QUEUE_MAX_SIZE` it's a 400, and a
+  product that won't fit beside the current queue is a 429. The group's jobs
+  carry an `expansion` dict; `_expansion_record` (called for every member, in
+  the worker and in the queued-job cancel path) tiles them into a
+  `_expansion_grid.png` contact sheet when the last one lands.
 - **Multi-model runs**: `/multi-run` generates one prompt (same seed) on a
   subset of the server configs sequentially. Each model switch is a supervised
   restart (the `/switch-model` exit-86 flow), so run state lives in

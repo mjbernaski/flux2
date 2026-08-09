@@ -9,7 +9,9 @@ a client depends on — but not generation itself. For that, queue a real job
 """
 
 import os
+import shutil
 import sys
+import tempfile
 
 os.environ.setdefault('FLUX_API_KEY', 'test-key-for-contract-tests')
 KEY = os.environ['FLUX_API_KEY']
@@ -36,6 +38,82 @@ def err_code(response):
     """The error code from the REST envelope, or None if it isn't one."""
     body = response.get_json(silent=True) or {}
     return (body.get('error') or {}).get('code')
+
+
+def _expansion_job(job_id, gid, index, total, filename, state='done'):
+    """A finished expansion member, as the worker would leave it."""
+    job = ws.Job(id=job_id, params={'prompt': f'variant {index}'}, submitted_at=0.0)
+    job.state = state
+    job.expansion = {'id': gid, 'index': index, 'total': total,
+                     'source': 'a {red|blue} car'}
+    if filename:
+        job.images = [{'filename': filename}]
+    return job
+
+
+def _sheets_in(directory):
+    return [f for f in os.listdir(directory) if f.endswith('_expansion_grid.png')]
+
+
+def _check_expansion_composite():
+    """Drive the contact-sheet builder with no GPU: write PNGs where finished
+    jobs would have left them, then close the group."""
+    tmp = tempfile.mkdtemp(prefix='flux-expansion-test-')
+    real_output = ws.OUTPUT_DIR
+    ws.OUTPUT_DIR = tmp
+    try:
+        names = []
+        for i, color in enumerate(((200, 40, 40), (40, 80, 200)), start=1):
+            name = f'flux2_20260101_00000{i}_abcdef0{i}.png'
+            ws.Image.new('RGB', (128, 96), color).save(os.path.join(tmp, name))
+            names.append(name)
+
+        gid = 'group-of-two'
+        ws._expansion_register(gid, 2, 'a {red|blue} car')
+        jobs = [_expansion_job(f'job{i + 1}', gid, i + 1, 2, names[i]) for i in range(2)]
+        ws._recent_done[:0] = jobs
+
+        ws._expansion_record(jobs[0])
+        check('no sheet until the last member of the group finishes',
+              not _sheets_in(tmp), f"got {_sheets_in(tmp)}")
+
+        ws._expansion_record(jobs[1])
+        sheets = _sheets_in(tmp)
+        check('the last member to finish builds the sheet',
+              len(sheets) == 1, f"got {sheets}")
+        if sheets:
+            with ws.Image.open(os.path.join(tmp, sheets[0])) as sheet:
+                # Two 128x96 cells scale to 256x192 and tile 2 across, 1 down.
+                check('the sheet tiles one cell per alternative',
+                      sheet.size == (512, 192), f"got {sheet.size}")
+            sidecar = os.path.join(tmp, sheets[0].rsplit('.', 1)[0] + '.prompt')
+            text = open(sidecar).read() if os.path.exists(sidecar) else ''
+            check('the sheet has a sidecar naming the unexpanded prompt',
+                  '# Prompt: a {red|blue} car' in text, f"got {text!r}")
+            check('the sidecar numbers each cell and its source file',
+                  '#   1. variant 1 [' in text and '#   2. variant 2 [' in text,
+                  f"got {text!r}")
+        check('every member of the group learns the sheet filename',
+              all(j.expansion_composite == sheets[0] for j in jobs) if sheets else False)
+        check('the finished group is dropped from the registry',
+              gid not in ws._expansions)
+
+        # One survivor is just an image; a one-cell sheet says nothing.
+        del ws._recent_done[:]
+        for f in _sheets_in(tmp):
+            os.remove(os.path.join(tmp, f))
+        gid2 = 'group-with-one-failure'
+        ws._expansion_register(gid2, 2, 'a {red|blue} car')
+        ws._expansion_record(_expansion_job('job3', gid2, 1, 2, names[0]))
+        ws._expansion_record(_expansion_job('job4', gid2, 2, 2, None, state='failed'))
+        check('a group with only one surviving image builds no sheet',
+              not _sheets_in(tmp), f"got {_sheets_in(tmp)}")
+        check('a group that produced no sheet is still dropped',
+              gid2 not in ws._expansions)
+    finally:
+        ws.OUTPUT_DIR = real_output
+        del ws._recent_done[:]
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def main():
@@ -203,6 +281,9 @@ def main():
           f"got {r.status_code}")
     check('previews reports state, count and whether frames are being saved',
           all(k in body for k in ('id', 'state', 'live', 'frames', 'count', 'saving')))
+    check('previews carries the finished images and prompt too',
+          all(k in body for k in ('images', 'prompt', 'generation_time'))
+          and body['images'] == [])
 
     r = client.get(f'{PREFIX}/jobs/not-alnum!/previews', headers=AUTH)
     check('a malformed job id is rejected on previews', r.status_code == 400)
@@ -262,6 +343,26 @@ def main():
         with ws._queue_cv:
             ws._recent_done.clear()
 
+    # A finished job: the page needs the result, not just the steps.
+    done_job = ws.Job(id='donejob0001', params={'prompt': 'a test prompt'}, state='done')
+    done_job.images = [{'filename': 'flux2_20260808_120000_abcd1234.png', 'seed': 42}]
+    done_job.generation_time = 12.5
+    with ws._queue_cv:
+        ws._recent_done.insert(0, done_job)
+    try:
+        body = client.get(f'{PREFIX}/jobs/donejob0001/previews', headers=AUTH).get_json()
+        check('a finished job reports its final image with a ready URL',
+              len(body['images']) == 1
+              and body['images'][0]['seed'] == 42
+              and body['images'][0]['url'].endswith('flux2_20260808_120000_abcd1234.png'),
+              str(body['images']))
+        check('a finished job carries its prompt and duration',
+              body['prompt'] == 'a test prompt' and body['generation_time'] == 12.5)
+        check('a finished job has no live frame', body['live'] is None)
+    finally:
+        with ws._queue_cv:
+            ws._recent_done.clear()
+
     r = client.delete(f'{PREFIX}/jobs/recent', headers=AUTH)
     check('clearing recent jobs returns 204', r.status_code == 204, f"got {r.status_code}")
 
@@ -291,8 +392,99 @@ def main():
 
         r = client.post(f'{PREFIX}/jobs', headers=AUTH, json={'prompt': 'x', 'size': '9mp'})
         check('an unknown size is 400', r.status_code == 400)
+
+        print("\nprompt expansion — {a|b} queues the cartesian product")
+        # These POSTs succeed, so each one leaves jobs on the queue; the worker
+        # thread never runs in this harness, so drain _pending between cases.
+        def enqueue(prompt):
+            r = client.post(f'{PREFIX}/jobs', headers=AUTH, json={'prompt': prompt})
+            body = r.get_json() or {}
+            queued = [j.params['prompt'] for j in ws._pending]
+            del ws._pending[:]
+            return r, body, queued
+
+        r, body, queued = enqueue('a plain prompt')
+        check('a prompt with no group queues exactly one job',
+              r.status_code == 201 and queued == ['a plain prompt'], f"got {queued}")
+        check('an unexpanded job carries no expanded key', 'expanded' not in body)
+
+        r, body, queued = enqueue('a {red | blue | greenish blue} car')
+        check('each alternative becomes its own job, padding trimmed',
+              queued == ['a red car', 'a blue car', 'a greenish blue car'],
+              f"got {queued}")
+        check('the response body describes the first job',
+              body.get('prompt') == 'a red car', f"got {body.get('prompt')!r}")
+        check('expanded lists every queued job in order',
+              [e['prompt'] for e in body.get('expanded', [])] == queued)
+        check('expanded entries carry an id, position and url',
+              all(all(k in e for k in ('id', 'position', 'prompt', 'url'))
+                  for e in body.get('expanded', [])))
+
+        r, body, queued = enqueue('{red|blue} car in {rain|snow}')
+        check('two groups expand to the cartesian product',
+              queued == ['red car in rain', 'red car in snow',
+                         'blue car in rain', 'blue car in snow'], f"got {queued}")
+
+        r, body, queued = enqueue('json-ish {not_a_group} text')
+        check('braces without a bar are literal text',
+              queued == ['json-ish {not_a_group} text'], f"got {queued}")
+
+        r, body, queued = enqueue(r'escaped \{red|blue\} literal')
+        check('a backslash escapes the group and is dropped',
+              queued == ['escaped {red|blue} literal'], f"got {queued}")
+
+        # 2^4 = 16 combinations against a queue that holds QUEUE_MAX_SIZE.
+        r = client.post(f'{PREFIX}/jobs', headers=AUTH,
+                        json={'prompt': '{a|b} {c|d} {e|f} {g|h}'})
+        check('an expansion larger than the whole queue is 400',
+              r.status_code == 400 and err_code(r) == 'invalid_request',
+              f"got {r.status_code}/{err_code(r)}")
+        check('nothing is queued when the expansion is refused',
+              not ws._pending, f"got {len(ws._pending)} pending")
+
+        # Fits in the queue in principle, but not next to what is already there.
+        ws._pending.extend(
+            ws.Job(id=f'filler{i}', params={'prompt': 'filler'}, submitted_at=0.0)
+            for i in range(ws.QUEUE_MAX_SIZE - 2))
+        r = client.post(f'{PREFIX}/jobs', headers=AUTH, json={'prompt': '{a|b|c} car'})
+        check('an expansion that will not fit right now is 429 queue_full',
+              r.status_code == 429 and err_code(r) == 'queue_full',
+              f"got {r.status_code}/{err_code(r)}")
+        check('a partial expansion is never queued',
+              len(ws._pending) == ws.QUEUE_MAX_SIZE - 2, f"got {len(ws._pending)}")
+        del ws._pending[:]
+
+        print("\nexpansion jobs are grouped, and cancelling still closes the group")
+        r = client.post(f'{PREFIX}/jobs', headers=AUTH, json={'prompt': '{red|blue} car'})
+        members = list(ws._pending)
+        groups = {j.expansion['id'] for j in members}
+        check('every job of an expansion shares one group id',
+              len(members) == 2 and len(groups) == 1, f"got {len(members)} jobs, {groups}")
+        check('each member knows its place in the group',
+              [(j.expansion['index'], j.expansion['total']) for j in members] ==
+              [(1, 2), (2, 2)])
+        check('the group records the unexpanded prompt',
+              members[0].expansion['source'] == '{red|blue} car')
+        gid = members[0].expansion['id']
+        check('the group is registered while its jobs are pending', gid in ws._expansions)
+
+        # Cancelling a queued member must still count toward the group —
+        # otherwise the survivors wait forever for a sheet that never comes.
+        client.delete(f'{PREFIX}/jobs/{members[0].id}', headers=AUTH)
+        check('cancelling a queued member counts toward the group',
+              ws._expansions.get(gid, {}).get('done') == 1,
+              f"got {ws._expansions.get(gid)}")
+        client.delete(f'{PREFIX}/jobs/{members[1].id}', headers=AUTH)
+        check('the group is dropped once every member is accounted for',
+              gid not in ws._expansions)
+        del ws._pending[:]
+        del ws._recent_done[:]
     finally:
         ws._model_ready = False
+        del ws._pending[:]
+
+    print("\nexpansion contact sheet")
+    _check_expansion_composite()
 
     print("\nimages")
     r = client.get(f'{PREFIX}/images', headers=AUTH)
