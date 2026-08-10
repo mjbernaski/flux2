@@ -100,7 +100,9 @@ diffusers, transformers, flask, python-dotenv, huggingface_hub, requests.
   product that won't fit beside the current queue is a 429. The group's jobs
   carry an `expansion` dict; `_expansion_record` (called for every member, in
   the worker and in the queued-job cancel path) tiles them into a
-  `_expansion_grid.png` contact sheet when the last one lands.
+  `_expansion_grid.png` contact sheet when the last one lands. A seedless
+  group draws one seed at enqueue and shares it across members, so the
+  alternatives are comparable (`expansion_same_seed: false` opts out).
 - **Multi-model runs**: `/multi-run` generates one prompt (same seed) on a
   subset of the server configs sequentially. Each model switch is a supervised
   restart (the `/switch-model` exit-86 flow), so run state lives in

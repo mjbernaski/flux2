@@ -244,6 +244,41 @@ def main():
     check('wait estimate is null with no completed jobs to learn from',
           body.get('estimated_wait_s') is None or
           isinstance(body.get('estimated_wait_s'), (int, float)))
+    check('queue carries a recent-images roll', body.get('recent_images') == [],
+          f"got {body.get('recent_images')}")
+
+    # The roll: newest job first, newest image within a job first, capped at
+    # RECENT_IMAGES_MAX. The running job leads even though it hasn't finished,
+    # because the batch members it already wrote are final files on disk.
+    def _img(name, seed):
+        return {'filename': name, 'seed': seed, 'timings': {'total': 1.5}}
+
+    older = ws.Job(id='old1', params={'prompt': 'older', 'size': '1mp'}, state='done')
+    older.images = [_img(f'flux2_20260809_10000{i}_aaaaaaa{i}.png', i) for i in range(4)]
+    newer = ws.Job(id='new1', params={'prompt': 'newer'}, state='done')
+    newer.images = [_img('flux2_20260809_101112_bbbbbbbb.png', 9)]
+    with ws._queue_cv:
+        ws._recent_done.extend([newer, older])
+    try:
+        body = client.get(f'{PREFIX}/queue', headers=AUTH).get_json()
+        roll = body.get('recent_images') or []
+        check('the roll is capped at RECENT_IMAGES_MAX',
+              len(roll) == ws.RECENT_IMAGES_MAX, f"got {len(roll)}")
+        check('the roll is newest job first, newest image first',
+              [e['seed'] for e in roll] == [9, 3, 2, 1, 0],
+              str([e['seed'] for e in roll]))
+        first = roll[0]
+        check('a roll entry names the final png and the job that made it',
+              first['filename'] == 'flux2_20260809_101112_bbbbbbbb.png' and
+              first['job_id'] == 'new1' and first['prompt'] == 'newer',
+              str(first))
+        check('a roll entry carries the wall clock from the filename',
+              first['time'] == '10:11:12', str(first.get('time')))
+        check('a roll entry carries the per-image duration',
+              first['seconds'] == 1.5, str(first.get('seconds')))
+    finally:
+        with ws._queue_cv:
+            ws._recent_done.clear()
 
     # Ordering with real entries. The queue worker only starts under __main__,
     # so injected jobs stay put; going through POST /jobs would need a model.
@@ -295,14 +330,19 @@ def main():
     check('queue.html is served as html',
           r.headers['Content-Type'].startswith('text/html'))
     check('queue.html polls its own JSON resource', b'/api/v1/queue?api_key=' in r.data)
+    check('queue.html renders the recent-images roll',
+          b'recent_images' in r.data and b'generated' in r.data)
+    authed_shell = r.data
 
     # The shell must load without a key or the browser never runs the code that
     # supplies one — this is what a plain <a href> from the UI does.
     r = client.get(f'{PREFIX}/queue.html')
     check('queue.html loads without a key (plain navigation)',
           r.status_code == 200, f"got {r.status_code}")
-    check('the unauthenticated shell carries no queue data',
-          b'"running"' not in r.data and b'job_id' not in r.data)
+    # It is a static shell that fetches its own data, so the key changes
+    # nothing about it — that is what keeps queue state out of the page source.
+    check('the shell is the same with or without a key, carrying no queue data',
+          r.data == authed_shell and b'"waiting":' not in r.data)
 
     r = client.get(f'{PREFIX}/jobs/abc123/previews.html')
     check('previews.html loads without a key', r.status_code == 200,
@@ -396,19 +436,23 @@ def main():
         print("\nprompt expansion — {a|b} queues the cartesian product")
         # These POSTs succeed, so each one leaves jobs on the queue; the worker
         # thread never runs in this harness, so drain _pending between cases.
-        def enqueue(prompt):
-            r = client.post(f'{PREFIX}/jobs', headers=AUTH, json={'prompt': prompt})
+        def enqueue(prompt, **extra):
+            r = client.post(f'{PREFIX}/jobs', headers=AUTH,
+                            json={'prompt': prompt, **extra})
             body = r.get_json() or {}
             queued = [j.params['prompt'] for j in ws._pending]
+            seeds = [j.params.get('seed') for j in ws._pending]
             del ws._pending[:]
-            return r, body, queued
+            return r, body, queued, seeds
 
-        r, body, queued = enqueue('a plain prompt')
+        r, body, queued, seeds = enqueue('a plain prompt')
         check('a prompt with no group queues exactly one job',
               r.status_code == 201 and queued == ['a plain prompt'], f"got {queued}")
         check('an unexpanded job carries no expanded key', 'expanded' not in body)
+        check('a lone job with no seed still picks one at generation time',
+              seeds == [None], f"got {seeds}")
 
-        r, body, queued = enqueue('a {red | blue | greenish blue} car')
+        r, body, queued, seeds = enqueue('a {red | blue | greenish blue} car')
         check('each alternative becomes its own job, padding trimmed',
               queued == ['a red car', 'a blue car', 'a greenish blue car'],
               f"got {queued}")
@@ -419,17 +463,29 @@ def main():
         check('expanded entries carry an id, position and url',
               all(all(k in e for k in ('id', 'position', 'prompt', 'url'))
                   for e in body.get('expanded', [])))
+        # The group compares prompts, so the seed must not vary underneath it.
+        check('a seedless expansion shares one drawn seed',
+              len(set(seeds)) == 1 and seeds[0] is not None, f"got {seeds}")
 
-        r, body, queued = enqueue('{red|blue} car in {rain|snow}')
+        r, body, queued, seeds = enqueue('a {red|blue} car', seed=1234)
+        check('an explicit seed is used as-is by every member',
+              seeds == [1234, 1234], f"got {seeds}")
+
+        r, body, queued, seeds = enqueue('a {red|blue} car',
+                                         expansion_same_seed=False)
+        check('expansion_same_seed=false leaves each member seedless',
+              seeds == [None, None], f"got {seeds}")
+
+        r, body, queued, seeds = enqueue('{red|blue} car in {rain|snow}')
         check('two groups expand to the cartesian product',
               queued == ['red car in rain', 'red car in snow',
                          'blue car in rain', 'blue car in snow'], f"got {queued}")
 
-        r, body, queued = enqueue('json-ish {not_a_group} text')
+        r, body, queued, seeds = enqueue('json-ish {not_a_group} text')
         check('braces without a bar are literal text',
               queued == ['json-ish {not_a_group} text'], f"got {queued}")
 
-        r, body, queued = enqueue(r'escaped \{red|blue\} literal')
+        r, body, queued, seeds = enqueue(r'escaped \{red|blue\} literal')
         check('a backslash escapes the group and is dropped',
               queued == ['escaped {red|blue} literal'], f"got {queued}")
 

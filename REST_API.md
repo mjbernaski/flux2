@@ -150,6 +150,12 @@ Expansion is all-or-nothing. A prompt expanding past `QUEUE_MAX_SIZE` is
 `400 invalid_request` (it could never fit); one that merely doesn't fit
 alongside the current queue is `429 queue_full`. Neither queues a partial run.
 
+The whole group shares one seed, so the prompt is the only thing that differs
+between its images. Give a `seed` and every member uses it; omit one and a
+single seed is drawn at submit time and stamped on all of them (as a
+multi-model run already does). Pass `expansion_same_seed: false` to go back to
+each member drawing its own.
+
 Once the last job of an expansion finishes, its images are tiled into a
 numbered contact sheet — `flux{1|2}_{stamp}_expansion_grid.png`, saved next to
 the individual PNGs with a `.prompt` sidecar that lists which cell came from
@@ -166,7 +172,12 @@ and when will it run":
   "running": { "id": "a1b2c3d4e5f6", "current": 2, "batch": 4, "step": 18, "total_steps": 30 },
   "waiting": [ { "position": 1, "id": "9f8e7d6c5b4a", "prompt": "...", "batch": 2 } ],
   "depth": 1, "capacity": 10, "accepting": true, "busy": true,
-  "images_pending": 4, "seconds_per_image": 6.4, "estimated_wait_s": 25.6
+  "images_pending": 4, "seconds_per_image": 6.4, "estimated_wait_s": 25.6,
+  "recent_images": [
+    { "filename": "flux2_20260809_101112_ab12cd34.png", "job_id": "a1b2c3d4e5f6",
+      "seed": 42, "prompt": "...", "time": "10:11:12", "size": "1mp",
+      "orientation": "landscape", "seconds": 6.4 }
+  ]
 }
 ```
 
@@ -174,6 +185,13 @@ and when will it run":
 rejected with `queue_full`. The running job holds no pending slot, so a full
 queue can still have one generating. `estimated_wait_s` extrapolates from
 recently completed jobs and is `null` until at least one has finished.
+
+`recent_images` is the last 5 finished PNGs (`RECENT_IMAGES_MAX`), newest
+first, including the batch members the running job has already written. They
+are the final outputs, not the downscaled latent previews, and are fetched
+from the unauthenticated `/images/{filename}` route. The roll only reaches as
+far back as `_recent_done` remembers, so it empties on a server restart.
+`GET /queue.html` renders it as a thumbnail strip under the queue.
 
 A job's `state` goes `queued` → `running` → `done` | `failed` | `canceled`.
 While running, `current`/`batch` track the image and `step`/`total_steps` the

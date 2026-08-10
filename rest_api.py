@@ -251,6 +251,7 @@ def get_queue():
     or rejected with queue_full — the running job holds no pending slot, so a
     full queue can still have one in flight. `estimated_wait_s` extrapolates
     from recently completed jobs and is null until at least one has finished.
+    `recent_images` is the last few finished PNGs, newest first.
     """
     return jsonify(ws._api_queue_view())
 
@@ -259,6 +260,9 @@ def get_queue():
 @endpoint
 def queue_page():
     """Human-readable view of GET /queue, refreshing itself every 2s.
+
+    Ends with a roll of the last few finished images at full quality — the
+    real PNGs, not the downscaled latent preview shown for the running job.
 
     A browser cannot send an X-API-Key header when you just navigate to a URL,
     so open this with ?api_key=... — the page then reuses that key for its own
@@ -728,10 +732,12 @@ def _openapi_document():
                 'delete': _op('Unsupported on the collection.', tag='generation'),
             },
             '/queue': {'get': _op(
-                'The current queue, ordered, with positions and a wait estimate.',
+                'The current queue, ordered, with positions, a wait estimate '
+                'and the last few finished images.',
                 tag='generation')},
             '/queue.html': {'get': _op(
-                'Self-refreshing HTML view of the queue (open with ?api_key=...).',
+                'Self-refreshing HTML view of the queue, with a roll of the '
+                'last few finished images (open with ?api_key=...).',
                 tag='generation')},
             '/jobs/{job_id}/previews.html': {'get': _op(
                 'Self-refreshing HTML view of a job\'s intermediate images.',
@@ -921,11 +927,25 @@ _QUEUE_PAGE = """<!doctype html>
                  background:var(--line); }
   .running .meta { flex:1; min-width:0; }
   .prompt { margin:2px 0 0; overflow-wrap:anywhere; }
+  .shots { display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr));
+           gap:12px; }
+  /* Fixed box, letterboxed: portrait, landscape and contact-sheet outputs
+     land in one row of tiles with their captions aligned. */
+  .shot img { width:100%; height:124px; object-fit:contain; border-radius:6px;
+              border:1px solid var(--line); background:var(--line);
+              display:block; cursor:pointer; }
+  .shot .cap { font:11px ui-monospace,monospace; color:var(--dim);
+               margin-top:5px; }
+  .shot .cap p { margin:0 0 2px; overflow-wrap:anywhere;
+                 /* Two lines of prompt keeps the tiles the same height. */
+                 display:-webkit-box; -webkit-line-clamp:2; line-clamp:2;
+                 -webkit-box-orient:vertical; overflow:hidden; }
 </style>
 <h1>Generation queue</h1>
 <p class=sub>Live, refreshing every 2s &middot;
   <a href="__PREFIX__/queue">JSON</a> &middot; <a href="__PREFIX__/docs">API docs</a></p>
 <div id=app><p class=idle>Loading...</p></div>
+<div id=recent></div>
 <script>
 // The key travels in the page URL because a plain navigation cannot set
 // headers; reuse it for polling. Thumbnails use the unauthenticated /images/
@@ -967,6 +987,35 @@ function renderWaiting(list) {
       </tr>`).join('') + '</tbody></table>';
 }
 
+// The finished PNGs, newest first — the counterpart to the live preview
+// above, which is a downscaled latent decode rather than the real output.
+function renderRecent(list) {
+    if (!list.length) return '<p class=idle>Nothing generated yet this session.</p>';
+    return '<div class=shots>' + list.map(img => `
+        <div class=shot>
+          <img loading=lazy src="/images/${encodeURI(img.filename)}"
+               onclick="window.open(this.src,'_blank')" alt="">
+          <div class=cap>
+            <p>${esc(img.prompt)}</p>
+            ${esc(img.time || '')} &middot; seed ${esc(img.seed)}${
+              img.seconds ? ' &middot; ' + esc(img.seconds) + 's' : ''} &middot;
+            <a href="__PREFIX__/jobs/${encodeURIComponent(img.job_id)}/previews.html">steps</a>
+          </div>
+        </div>`).join('') + '</div>';
+}
+
+// Re-rendering the tiles on every poll would replace each <img> mid-download,
+// so they never finish loading; only touch them when the roll actually moves.
+let lastShots = null;
+function paintRecent(list) {
+    const signature = list.map(i => i.filename).join('|');
+    if (signature === lastShots) return;
+    lastShots = signature;
+    const title = list.length ? `Last ${list.length} generated` : 'Just generated';
+    document.getElementById('recent').innerHTML =
+        `<div class=card><h2>${title}</h2>${renderRecent(list)}</div>`;
+}
+
 async function tick() {
     try {
         const res = await fetch(`__PREFIX__/queue?api_key=${encodeURIComponent(KEY)}`,
@@ -992,6 +1041,7 @@ async function tick() {
             <div class=stat><b class="pill ${q.accepting ? 'ok' : 'warn'}">
                 ${q.accepting ? 'accepting' : 'full'}</b><span>new jobs</span></div>
           </div>`;
+        paintRecent(q.recent_images || []);
     } catch (e) {
         // A dropped connection usually means a model switch is restarting the
         // server; keep polling rather than giving up.

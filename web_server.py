@@ -138,6 +138,8 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # Queue configuration
 QUEUE_MAX_SIZE = 10
 RECENT_DONE_MAX = 10
+# How many finished images the queue view rolls up as "just generated".
+RECENT_IMAGES_MAX = 5
 
 # Server configuration menu, mirroring run_server.sh's case statement (and
 # SERVER_OPTIONS.md — keep all three in sync). The launcher exports the active
@@ -1303,6 +1305,13 @@ def _api_enqueue_generation(data):
         # last one to finish can tile them all into one contact sheet.
         exp_id = uuid.uuid4().hex[:12] if len(prompts) > 1 else None
         if exp_id:
+            # The group exists to compare alternatives, so the prompt has to be
+            # the only variable: draw one seed here and share it. Without this
+            # each member would draw its own at generation time and the sheet
+            # would compare two different images, not two prompts. Same
+            # reasoning (and same default) as a multi-model run.
+            if data.get('seed') is None and data.get('expansion_same_seed', True):
+                data['seed'] = random.randint(0, 2**32 - 1)
             _expansion_register(exp_id, len(prompts), prompt)
         queued = []
         for index, text in enumerate(prompts, start=1):
@@ -1448,9 +1457,48 @@ def _api_job_previews(job_id):
     }
 
 
+def _recent_image_entry(job, img):
+    """One entry of the queue view's "just generated" roll: the final PNG plus
+    enough context to say what produced it."""
+    filename = img.get('filename') or ''
+    # flux{1|2}_YYYYMMDD_HHMMSS_{8hex}.png — the wall clock is in the name.
+    parts = filename.split('_')
+    stamp = parts[2] if len(parts) >= 3 else ''
+    p = job.prompt
+    return {
+        'filename': filename,
+        'job_id': job.id,
+        'seed': img.get('seed'),
+        'prompt': (p[:120] + '…') if len(p) > 120 else p,
+        'time': f"{stamp[:2]}:{stamp[2:4]}:{stamp[4:6]}" if len(stamp) == 6 else None,
+        'size': job.params.get('size'),
+        'orientation': job.params.get('orientation'),
+        'seconds': (img.get('timings') or {}).get('total'),
+    }
+
+
+def _recent_images_locked(limit=RECENT_IMAGES_MAX):
+    """The last `limit` finished images, newest first. Caller holds _queue_cv.
+
+    The running job leads: the batch members it has already written are on
+    disk and final, even though the job itself isn't done. _recent_done is
+    newest-job-first, but a job appends its images in generation order, so
+    each job's own list is walked backwards.
+    """
+    out = []
+    for job in ([_running_job] if _running_job else []) + _recent_done:
+        for img in reversed(job.images):
+            if img.get('filename'):
+                out.append(_recent_image_entry(job, img))
+                if len(out) >= limit:
+                    return out
+    return out
+
+
 def _api_queue_view():
     """Queue-centric view: what is generating now, what is waiting and in what
-    order, how much room is left, and how long the backlog is likely to take.
+    order, how much room is left, how long the backlog is likely to take, and
+    the last few images that came out.
 
     Distinct from _api_queue_snapshot, which is the raw three-list dump the
     /status route has always returned. This one answers "where is my job in
@@ -1464,6 +1512,7 @@ def _api_queue_view():
             entry = job.summary()
             entry['position'] = position
             waiting.append(entry)
+        recent_images = _recent_images_locked()
         # Only completed jobs carry a trustworthy duration; canceled ones
         # stopped early and would bias the estimate downward.
         samples = [(j.generation_time, len(j.images)) for j in _recent_done
@@ -1489,6 +1538,9 @@ def _api_queue_view():
         'images_pending': images_ahead,
         'seconds_per_image': round(per_image, 2) if per_image else None,
         'estimated_wait_s': round(per_image * images_ahead, 1) if per_image else None,
+        # Newest first, at most RECENT_IMAGES_MAX; empty until something
+        # finishes, and only as deep as _recent_done still remembers.
+        'recent_images': recent_images,
     }
 
 
