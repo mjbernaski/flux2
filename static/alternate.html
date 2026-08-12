@@ -6,7 +6,7 @@
     <meta name="theme-color" content="#1a1a2e">
     <title>flux</title>
     <script>document.title = window.location.hostname + ' flux';</script>
-    <link rel="stylesheet" href="/static/app.css?v=9">
+    <link rel="stylesheet" href="/static/app.css?v=13">
     <!-- Layout-only overrides: same components/IDs/behavior as the classic
          page, arranged as a sticky sidebar + main dashboard instead of one
          long scrolling column. Loaded after app.css so its rules win. -->
@@ -135,6 +135,18 @@
                             <input type="checkbox" id="boostThink"> think
                         </label>
                     </div>
+                    <div class="boost-control boost-variants-control">
+                        <button type="button" id="boostVariantsBtn" class="describe-btn boost-btn"
+                                title="Rewrites your prompt N separate times, each pushed in a different direction, and generates from each one the moment it lands — the rewrites are listed as they arrive">&#10024; Boost &times;N &amp; generate</button>
+                        <select id="boostVariantCount" title="How many distinct rewrites to produce">
+                            <option value="2">2 rewrites</option>
+                            <option value="3" selected>3 rewrites</option>
+                            <option value="4">4 rewrites</option>
+                            <option value="5">5 rewrites</option>
+                            <option value="6">6 rewrites</option>
+                        </select>
+                    </div>
+                    <div id="boostOptions" class="boost-options" style="display:none"></div>
                     <div class="boost-control evolve-control">
                         <button type="button" id="evolveBtn" class="describe-btn boost-btn"
                                 title="Evolves your prompt into N independent variations (each boosted separately with the settings above, nudged in different directions) and queues one generation per variation">&#129516; Evolve &amp; generate</button>
@@ -498,6 +510,6 @@
         <img id="latestThumbImg" alt="Latest generation">
     </button>
 
-    <script src="/static/app.js?v=9"></script>
+    <script src="/static/app.js?v=13"></script>
 </body>
 </html>

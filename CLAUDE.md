@@ -63,8 +63,22 @@ diffusers, transformers, flask, python-dotenv, huggingface_hub, requests.
   4-bit/full/GGUF/schnell, FLUX.1-Kontext editor (4-bit or full bf16), FLUX.2
   4-bit/full (32B), FLUX.2-klein (9B). Turbo LoRA (FLUX.2-dev only) and
   uncensored LoRA (FLUX.1 only) load on top.
-- **VLM VRAM**: the ollama vision model (critique/describe/boost) competes with
-  the diffusion pipeline for the same card — a resident qwen3.6 is ~5GB.
+- **VLM endpoint**: critique/describe/boost talk to the vision model through
+  `edit_loop.py`, which speaks two dialects. `OLLAMA_URL` (the endpoint, name
+  kept for compatibility) may point at a local ollama daemon — `/api/chat`,
+  base64 `images`, `format` schema — or at an OpenAI-compatible server such as
+  vLLM — `/v1/chat/completions`, `image_url` data-URL parts, `response_format`
+  guided decoding. `vlm_dialect()` probes `/api/version` once per URL and
+  caches the answer (`VLM_API=ollama|openai` forces it); `_openai_body()` does
+  the translation, and the reply is reshaped back into ollama's envelope so
+  every caller stays dialect-agnostic. `CRITIQUE_MODEL`/`DESCRIBE_MODEL` must
+  name a model the endpoint serves. Serving the VLM off-box is the point of
+  this: it takes the vision model's VRAM off the generating card entirely,
+  which makes the note below moot for that setup (the status badge reads
+  `/v1/models` instead of `/api/ps`, and startup warm-up is skipped — a remote
+  server owns its own residency).
+- **VLM VRAM**: a *local* ollama vision model (critique/describe/boost) competes
+  with the diffusion pipeline for the same card — a resident qwen3.6 is ~5GB.
   `edit_loop.KEEP_ALIVE` (env `VLM_KEEP_ALIVE`, default `"0"`) is sent as
   ollama's `keep_alive` on every call, so the model unloads as soon as a call
   returns and the startup warm-up is skipped. Set `VLM_KEEP_ALIVE=15m` to keep

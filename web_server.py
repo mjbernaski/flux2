@@ -171,9 +171,16 @@ except ValueError:
 if _current_config not in SERVER_CONFIGS:
     _current_config = None
 
-# Edit-loop critique (local ollama vision model; see /critique). qwen3.6 is
-# the strongest local VLM on this box — slower than gemma4:e2b but its
-# judgments and revised prompts are markedly better.
+# Edit-loop critique (vision model; see /critique). qwen3.6 is the strongest
+# local VLM on this box — slower than gemma4:e2b but its judgments and revised
+# prompts are markedly better.
+#
+# OLLAMA_URL keeps its name for compatibility but is really "the VLM endpoint":
+# it may point at a local ollama daemon or at an OpenAI-compatible server
+# (vLLM, llama.cpp, LM Studio) on another box, which is the better deal when
+# the local card is busy holding the diffusion pipeline. edit_loop detects
+# which dialect the endpoint speaks; CRITIQUE_MODEL must then name a model
+# that endpoint serves (e.g. qwen3-vl-235b, not qwen3.6:latest).
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 CRITIQUE_MODEL = os.environ.get("CRITIQUE_MODEL", "qwen3.6:latest")
 # The reverse path (/describe) can use a different — typically Ollama Cloud —
@@ -212,22 +219,41 @@ _vlm_state = {"status": None, "ts": 0.0}
 _vlm_warming = False
 
 
+def _probe_vlm():
+    """"loaded" / "unloaded" / "unavailable" for the critique model.
+
+    ollama loads and unloads on demand, so residency is a real question and
+    /api/ps answers it. An OpenAI-compatible server (vLLM et al.) instead
+    serves a fixed model list for its lifetime: if /v1/models lists the model
+    it is resident by definition, and there is no "unloaded" state to report.
+    """
+    import urllib.request
+    import edit_loop
+    base = OLLAMA_URL.rstrip('/')
+    try:
+        if edit_loop.vlm_dialect(base) == 'ollama':
+            with urllib.request.urlopen(base + "/api/ps", timeout=2) as r:
+                models = json.loads(r.read().decode()).get("models") or []
+            norm = lambda n: n if ":" in n else n + ":latest"
+            names = [norm(m.get("name") or "") for m in models]
+            return "loaded" if norm(CRITIQUE_MODEL) in names else "unloaded"
+        if not base.endswith('/v1'):
+            base += '/v1'
+        with urllib.request.urlopen(base + "/models", timeout=2) as r:
+            served = json.loads(r.read().decode()).get("data") or []
+        ids = [m.get("id") for m in served]
+        return "loaded" if CRITIQUE_MODEL in ids else "unloaded"
+    except Exception:
+        return "unavailable"
+
+
 def _vlm_status():
     now = time.monotonic()
     if now - _vlm_state["ts"] < _VLM_CACHE_S:
         status = _vlm_state["status"]
     else:
         _vlm_state["ts"] = now
-        status = "unloaded"
-        try:
-            import urllib.request
-            with urllib.request.urlopen(OLLAMA_URL + "/api/ps", timeout=2) as r:
-                models = json.loads(r.read().decode()).get("models") or []
-            norm = lambda n: n if ":" in n else n + ":latest"
-            if any(norm(m.get("name") or "") == norm(CRITIQUE_MODEL) for m in models):
-                status = "loaded"
-        except Exception:
-            status = "unavailable"
+        status = _probe_vlm()
         _vlm_state["status"] = status
     if status != "loaded" and _vlm_warming:
         status = "loading"
@@ -2492,6 +2518,13 @@ def _warm_critique_model():
     # Imported here, matching the other edit_loop uses in this file — it pulls
     # in PIL/requests and is not needed unless a VLM path actually runs.
     import edit_loop
+    if edit_loop.vlm_dialect(OLLAMA_URL) != 'ollama':
+        # An OpenAI-compatible server holds its model resident for its own
+        # lifetime; there is nothing for a client to preload, and /api/generate
+        # doesn't exist there.
+        print(f"Critique model warm-up skipped ({OLLAMA_URL} is not ollama; "
+              "the model is resident on the serving host).")
+        return
     if edit_loop.KEEP_ALIVE in ('0', 0, '', None):
         print("Critique model warm-up skipped (VLM_KEEP_ALIVE=0: the vision "
               "model loads on demand and releases its VRAM after each call).")

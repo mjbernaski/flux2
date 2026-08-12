@@ -358,6 +358,9 @@ button:disabled {
 .image-card .save-hidden-btn:hover { background: #9c7209; }
 .image-card .save-hidden-btn.saved { background: #4a4a4a; cursor: default; }
 .image-card .save-hidden-btn.saving { opacity: 0.7; cursor: default; }
+.image-card .delete-btn { background: #c0392b; cursor: pointer; }
+.image-card .delete-btn:hover { background: #992d22; }
+.image-card .delete-btn.deleting { opacity: 0.7; cursor: default; }
 .image-card .info {
     color: #888;
     font-size: 13px;
@@ -751,6 +754,37 @@ button:disabled {
 .boost-think { display: flex; align-items: center; gap: 5px; color: #ccc; font-size: 13px; cursor: pointer; }
 .boost-think input[type="checkbox"] { width: auto; }
 .evolve-control { margin-top: 6px; }
+.boost-variants-control { margin-top: 6px; }
+/* Rewrite picker for "Boost xN" — cards land in completion order, so it grows
+   while the slower rewrites are still running. */
+.boost-options { margin-top: 8px; border: 1px solid #333; border-radius: 6px;
+                 background: #16162a; padding: 8px; }
+.boost-options-head { display: flex; align-items: center; justify-content: space-between;
+                      gap: 10px; margin-bottom: 6px; }
+.boost-options-title { color: #00d4ff; font-size: 13px; font-weight: bold; }
+.boost-options-actions { display: flex; gap: 6px; }
+.boost-options-close, .boost-options-restore {
+    background: #333; color: #ccc; border: 1px solid #444;
+    border-radius: 4px; padding: 4px 10px; cursor: pointer; font-size: 12px; }
+.boost-options-close:hover, .boost-options-restore:hover { background: #3d3d3d; }
+.boost-option { border: 1px solid #2e2e44; border-radius: 5px; padding: 8px;
+                margin-top: 6px; background: #1a1a2e; }
+.boost-option-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.boost-option-label { color: #888; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
+.boost-option-actions { display: flex; gap: 6px; }
+.boost-option-use, .boost-option-gen {
+    background: #28a745; color: #fff; border: none; border-radius: 4px;
+    padding: 4px 12px; cursor: pointer; font-size: 12px; font-weight: bold; }
+.boost-option-use:hover, .boost-option-gen:hover { background: #218838; }
+.boost-option-use { background: #6c757d; }
+.boost-option-use:hover { background: #5a6268; }
+.boost-option-gen:disabled { background: #2e4a35; color: #9ecfa8; cursor: default; }
+/* The rewrite currently sitting in the prompt box, and ones already queued. */
+.boost-option-active { border-color: #00d4ff; }
+.boost-option-queued .boost-option-label::after { content: ' · generating'; color: #4a8c5a; }
+.boost-option-text { color: #ddd; font-size: 13px; line-height: 1.45; margin-top: 6px; cursor: pointer; }
+.boost-option-text:hover { color: #fff; }
+.boost-option-negative { color: #b06a6a; font-size: 12px; margin-top: 6px; }
 .describe-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .inpaint-control { margin-top: 10px; }
 .inpaint-toggle { display: flex; align-items: center; gap: 8px; color: #ccc; font-size: 14px; cursor: pointer; }

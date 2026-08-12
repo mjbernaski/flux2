@@ -111,6 +111,7 @@ function saveSwitchState() {
         guidance: val('guidance'),
         batch: val('batch'),
         evolveCount: val('evolveCount'),
+        boostVariantCount: val('boostVariantCount'),
         allOrientations: chk('allOrientations'),
         spectrumGrid: chk('spectrumGrid'),
         spectrumSameSeed: chk('spectrumSameSeed'),
@@ -590,6 +591,26 @@ async function saveHidden(el, filename) {
     }
 }
 
+// Permanently delete one of today's images (PNG + .prompt sidecar) after
+// confirming. Shared by the result cards and the history grid. Returns true
+// when the server reports the delete succeeded.
+async function deleteImage(filename) {
+    if (!confirm(`Permanently delete this image?\n\n${filename}`)) return false;
+    try {
+        const res = await fetch('/delete', {
+            method: 'POST',
+            headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+            body: JSON.stringify({ filename: filename })
+        });
+        const body = await res.json();
+        if (body.success) return true;
+        alert('Delete failed: ' + (body.error || 'unknown error'));
+    } catch (err) {
+        alert('Delete failed: ' + err.message);
+    }
+    return false;
+}
+
 // Re-render the reference thumbnails and every control whose visibility
 // depends on how many references are loaded.
 function syncRefUI() {
@@ -1010,6 +1031,246 @@ async function runBoost() {
 
 const boostBtn = document.getElementById('boostBtn');
 if (boostBtn) boostBtn.addEventListener('click', runBoost);
+
+// Boost variants: rewrite the same draft N separate times, show each rewrite
+// as it lands, and generate from it immediately. Each call is told it is
+// variation i of N — the same variant plumbing evolve uses — so the VLM
+// commits to a distinct direction per call instead of returning N paraphrases
+// of one idea.
+//
+// The two stages overlap deliberately: a rewrite is queued for generation the
+// moment it arrives, so the GPU works through the early rewrites while the VLM
+// is still writing the later ones. This is evolve's behavior plus the rewrites
+// themselves on screen — readable, reusable via "Use this", and attributable
+// to the image each produced.
+const BOOST_VARIANTS_DEFAULT = 3;
+
+// The draft the open panel's rewrites came from, so "Keep my draft" can put it
+// back after a pick (the pick overwrites the prompt box).
+let boostVariantsDraft = null;
+
+function closeBoostVariants() {
+    const panel = document.getElementById('boostOptions');
+    if (panel) { panel.innerHTML = ''; panel.style.display = 'none'; }
+    boostVariantsDraft = null;
+}
+
+// One rewrite card. The text is model output and the draft is user-typed, so
+// both go in via textContent, never innerHTML. "Generate" queues that rewrite
+// on its own — it does not wait for the rewrites still being boosted, so the
+// GPU starts working while the VLM is still writing the rest.
+function addBoostVariantCard(panel, label, text, negative, onUse, onGenerate) {
+    const card = document.createElement('div');
+    card.className = 'boost-option';
+    card.innerHTML = `
+        <div class="boost-option-head">
+            <span class="boost-option-label"></span>
+            <span class="boost-option-actions">
+                <button type="button" class="boost-option-use">Use this</button>
+                <button type="button" class="boost-option-gen">Generate</button>
+            </span>
+        </div>
+        <p class="boost-option-text"></p>
+        <p class="boost-option-negative" style="display:none"></p>
+    `;
+    card.querySelector('.boost-option-label').textContent = label;
+    card.querySelector('.boost-option-text').textContent = text;
+    if (negative) {
+        const neg = card.querySelector('.boost-option-negative');
+        neg.textContent = 'Negative: ' + negative;
+        neg.style.display = '';
+    }
+    const useBtn = card.querySelector('.boost-option-use');
+    const use = function() {
+        onUse();
+        // Mark which rewrite is currently in the prompt box; the panel stays
+        // open, so without this there is no way to tell after scrolling.
+        Array.from(panel.querySelectorAll('.boost-option')).forEach(function(c) {
+            c.classList.remove('boost-option-active');
+        });
+        card.classList.add('boost-option-active');
+    };
+    useBtn.addEventListener('click', use);
+    card.querySelector('.boost-option-text').addEventListener('click', use);
+    const genBtn = card.querySelector('.boost-option-gen');
+    genBtn.addEventListener('click', async function() {
+        if (genBtn.disabled) return;
+        genBtn.disabled = true;
+        genBtn.textContent = 'Queueing…';
+        const ok = await onGenerate();
+        genBtn.textContent = ok ? 'Queued ✓' : 'Generate';
+        genBtn.disabled = !!ok;
+        if (ok) card.classList.add('boost-option-queued');
+    });
+    panel.appendChild(card);
+    return card;
+}
+
+async function runBoostVariants() {
+    const btn = document.getElementById('boostVariantsBtn');
+    const promptEl = document.getElementById('prompt');
+    const levelEl = document.getElementById('boostLevel');
+    const thinkEl = document.getElementById('boostThink');
+    const countEl = document.getElementById('boostVariantCount');
+    const negativeEl = document.getElementById('negativePrompt');
+    const panel = document.getElementById('boostOptions');
+    const draft = (promptEl.value || '').trim();
+    if (!draft) { alert('Type a prompt to boost first.'); return; }
+    let n = countEl ? parseInt(countEl.value, 10) : BOOST_VARIANTS_DEFAULT;
+    if (!(n >= 1)) n = BOOST_VARIANTS_DEFAULT;
+
+    const draftNegative = negativeEl && negativeEl.value.trim() ? negativeEl.value.trim() : null;
+    boostVariantsDraft = { prompt: draft, negative: draftNegative };
+
+    // Snapshot the form once, up front: every rewrite generates with the same
+    // settings, and reading them per-rewrite would pick up edits made while
+    // the boosts were still running.
+    const built = buildGenerateFormData();
+    if (!built) return;
+    recordPromptHistory(draft);
+
+    if (panel) {
+        panel.innerHTML = '';
+        panel.style.display = 'block';
+        const head = document.createElement('div');
+        head.className = 'boost-options-head';
+        head.innerHTML = `
+            <span class="boost-options-title"></span>
+            <span class="boost-options-actions">
+                <button type="button" class="boost-options-restore">Restore draft</button>
+                <button type="button" class="boost-options-close">Close</button>
+            </span>
+        `;
+        head.querySelector('.boost-options-title').textContent =
+            `${n} rewrites — each generates as it lands`;
+        head.querySelector('.boost-options-restore').addEventListener('click', function() {
+            if (boostVariantsDraft) {
+                promptEl.value = boostVariantsDraft.prompt;
+                if (negativeEl) negativeEl.value = boostVariantsDraft.negative || '';
+            }
+        });
+        head.querySelector('.boost-options-close').addEventListener('click', closeBoostVariants);
+        panel.appendChild(head);
+    }
+
+    // Same fresh start as Generate: the results section shows this run's
+    // rewrites, not the previous run's alongside them.
+    await clearRecentResults();
+
+    const oldLabel = btn.textContent;
+    btn.disabled = true;
+    let done = 0, queued = 0, failed = 0;
+    const prog = vlmStatusStart(btn, `Boosting ${n} rewrites`);
+    const tick = function() {
+        const btnText = `Boosting ${done}/${n}… ${prog.elapsed()}`;
+        // Once a generation is running, its step-by-step progress owns the
+        // status bar; keep the tally on the button only.
+        if (runningJobId) { btn.textContent = btnText; return; }
+        prog.tick(`Boosting ${n} rewrites — ${done} boosted, ${queued} queued`
+                  + (failed ? `, ${failed} failed` : ''), btnText);
+    };
+    tick();
+
+    // Queue one generation from a landed rewrite. Called the moment that
+    // rewrite arrives, so the GPU works through the early ones while the VLM
+    // is still writing the rest — the two stages overlap instead of the queue
+    // sitting idle until every rewrite is back.
+    const queueGeneration = async function(data) {
+        const overrides = { prompt: data.prompt };
+        if (data.negative_prompt) overrides.negative_prompt = data.negative_prompt;
+        try {
+            const gres = await fetch('/generate', {
+                method: 'POST',
+                headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+                body: JSON.stringify(Object.assign({}, built.formData, overrides))
+            });
+            const gdata = await gres.json().catch(() => ({}));
+            if (!gres.ok || !gdata.success) throw new Error(gdata.error || `HTTP ${gres.status}`);
+            queued += 1; tick();
+            noteActivity();
+            schedulePoll(0);
+            return true;
+        } catch (err) {
+            console.warn('boost variant generate failed:', err);
+            if (status && statusText && !runningJobId) {
+                status.className = 'status error';
+                statusText.textContent = 'Could not queue a rewrite: ' + err.message;
+            }
+            return false;
+        }
+    };
+    try {
+        await Promise.all(Array.from({ length: n }, async function(_, i) {
+            try {
+                const res = await fetch('/boost', {
+                    method: 'POST',
+                    headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+                    body: JSON.stringify({
+                        prompt: draft,
+                        level: levelEl ? parseInt(levelEl.value, 10) : 3,
+                        think: thinkEl ? thinkEl.checked : false,
+                        has_image: currentInputImages.length > 0,
+                        negative_prompt: draftNegative,
+                        variant_index: i + 1,
+                        variant_count: n
+                    })
+                });
+                const submitted = await res.json().catch(() => ({}));
+                if (!res.ok || !submitted.success) throw new Error(submitted.error || `HTTP ${res.status}`);
+                const data = await pollVlmJob('/boost/' + submitted.boost_id, null, tick);
+                if (!data.prompt) throw new Error('boost returned no prompt');
+                done += 1; tick();
+                // Cards land in completion order — whichever rewrite finishes
+                // first is on top, so there is something to read while the
+                // slower ones are still running.
+                let card = null;
+                if (panel && panel.style.display !== 'none') {
+                    card = addBoostVariantCard(panel, `Rewrite ${i + 1}`, data.prompt,
+                                               data.negative_prompt, function() {
+                        // "Use this" only fills the prompt box (the rewrite is
+                        // already generating); the panel stays open so the
+                        // rewrites still arriving are not lost.
+                        promptEl.value = data.prompt;
+                        if (data.negative_prompt && negativeEl) {
+                            negativeEl.value = data.negative_prompt;
+                        }
+                    }, function() { return queueGeneration(data); });
+                }
+                // Auto-generate: don't wait for the other rewrites.
+                const ok = await queueGeneration(data);
+                if (card) {
+                    const genBtn = card.querySelector('.boost-option-gen');
+                    genBtn.textContent = ok ? 'Queued ✓' : 'Generate';
+                    genBtn.disabled = ok;
+                    if (ok) card.classList.add('boost-option-queued');
+                }
+            } catch (err) {
+                failed += 1; tick();
+                console.warn(`boost variant ${i + 1} failed:`, err);
+            }
+        }));
+    } finally {
+        prog.end();
+        btn.disabled = false;
+        btn.textContent = oldLabel;
+    }
+    if (status && statusText) {
+        if (!done) {
+            status.className = 'status error';
+            statusText.textContent = 'Boost failed: no rewrite came back.';
+            closeBoostVariants();
+        } else if (!runningJobId) {
+            // With a generation already running, its live progress owns the bar.
+            status.className = 'status generating';
+            statusText.textContent = `${done} rewrite${done > 1 ? 's' : ''} boosted in `
+                + prog.elapsed() + `, ${queued} queued`
+                + (failed ? ` (${failed} failed)` : '') + '.';
+        }
+    }
+}
+
+const boostVariantsBtn = document.getElementById('boostVariantsBtn');
+if (boostVariantsBtn) boostVariantsBtn.addEventListener('click', runBoostVariants);
 
 // Evolve & generate: boost the base prompt N times independently (each call
 // told it is variation i of N so the VLM takes divergent directions, using
@@ -1826,6 +2087,7 @@ function addImageToGrid(img, index) {
     const meta = img.guidance != null ? `Guidance: ${img.guidance}${img.strength != null ? ', Strength: ' + img.strength : ''}` : '';
     const card = document.createElement('div');
     card.className = 'image-card';
+    card.dataset.filename = img.filename;
     // Filename/seed are set via DOM APIs (not string-interpolated into
     // innerHTML/onclick) so unexpected characters can't break out of markup.
     card.innerHTML = `
@@ -1835,6 +2097,7 @@ function addImageToGrid(img, index) {
             <a href="#" class="seed-btn">Use Seed</a>
             <a href="#" class="ref-btn">Use as Reference</a>
             <a href="#" class="save-hidden-btn">★ Save</a>
+            <a href="#" class="delete-btn">Delete</a>
         </div>
         <p class="info">${meta ? meta + ' · Seed: ' + img.seed : 'Seed: ' + img.seed}</p>
         <div class="timings">
@@ -1846,16 +2109,46 @@ function addImageToGrid(img, index) {
     `;
     const cardImg = card.querySelector('img');
     cardImg.src = `/images/${encodeURIComponent(img.filename)}?t=${t}`;
-    const lbIdx = resultLbItems.length;
-    resultLbItems.push({ src: `/images/${encodeURIComponent(img.filename)}`, caption: `Seed ${img.seed}` });
-    cardImg.addEventListener('click', () => openLightbox(resultLbItems, lbIdx));
+    // The entry (not its index) is captured: deleting a card splices the list,
+    // so every other card's position shifts and must be looked up at click time.
+    const lbEntry = { src: `/images/${encodeURIComponent(img.filename)}`, caption: `Seed ${img.seed}` };
+    resultLbItems.push(lbEntry);
+    cardImg.addEventListener('click', () =>
+        openLightbox(resultLbItems, Math.max(0, resultLbItems.indexOf(lbEntry))));
     const dl = card.querySelector('.download-btn');
     dl.href = `/images/${encodeURIComponent(img.filename)}`;
     dl.setAttribute('download', img.filename);
     card.querySelector('.seed-btn').addEventListener('click', (e) => { e.preventDefault(); useSeed(img.seed); });
     card.querySelector('.ref-btn').addEventListener('click', (e) => { e.preventDefault(); useAsReference(img.filename); });
     card.querySelector('.save-hidden-btn').addEventListener('click', function(e) { e.preventDefault(); saveHidden(this, img.filename); });
+    card.querySelector('.delete-btn').addEventListener('click', async function(e) {
+        e.preventDefault();
+        if (this.classList.contains('deleting')) return;
+        this.classList.add('deleting');
+        const ok = await deleteImage(img.filename);
+        this.classList.remove('deleting');
+        if (!ok) return;
+        removeResultCard(img.filename);
+        loadHistory();
+    });
     imageGrid.appendChild(card);
+    updateResultCount();
+}
+
+// Drop a deleted image's result card and its lightbox entry. Called from both
+// delete paths, so removing an image in the history grid also clears the card
+// that would otherwise be left showing a now-missing file. The filename stays
+// in knownImageFilenames, so /status polling won't re-add the card for a job
+// that still lists the image.
+function removeResultCard(filename) {
+    const src = `/images/${encodeURIComponent(filename)}`;
+    const lbIdx = resultLbItems.findIndex(it => it.src === src);
+    if (lbIdx >= 0) resultLbItems.splice(lbIdx, 1);
+    if (!imageGrid) return;
+    const card = Array.from(imageGrid.children)
+        .find(el => el.dataset && el.dataset.filename === filename);
+    if (!card) return;
+    card.remove();
     updateResultCount();
 }
 
@@ -2425,17 +2718,10 @@ async function loadHistory() {
             if (delBtn) {
                 delBtn.addEventListener('click', async (e) => {
                     e.stopPropagation();
-                    if (!confirm(`Permanently delete this image?\n\n${img.filename}`)) return;
-                    try {
-                        const res = await fetch('/delete', {
-                            method: 'POST',
-                            headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
-                            body: JSON.stringify({ filename: img.filename })
-                        });
-                        const body = await res.json();
-                        if (body.success) { loadHistory(); }
-                        else { alert('Delete failed: ' + (body.error || 'unknown error')); }
-                    } catch (err) { alert('Delete failed: ' + err.message); }
+                    if (await deleteImage(img.filename)) {
+                        removeResultCard(img.filename);
+                        loadHistory();
+                    }
                 });
             }
             historyGrid.appendChild(item);
@@ -2881,6 +3167,7 @@ if (loopAcceptBtn) loopAcceptBtn.addEventListener('click', function() {
     setVal('guidance', saved.guidance);
     setVal('batch', saved.batch);
     setVal('evolveCount', saved.evolveCount);
+    setVal('boostVariantCount', saved.boostVariantCount);
     setChk('allOrientations', saved.allOrientations);
     setChk('spectrumGrid', saved.spectrumGrid);
     setChk('spectrumSameSeed', saved.spectrumSameSeed);

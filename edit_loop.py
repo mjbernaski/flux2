@@ -56,6 +56,50 @@ SESSIONS_DIR = os.path.join(SCRIPT_DIR, "edit-loop-sessions")
 # previous behavior — when the edit loop, not generation, is the main workload.
 KEEP_ALIVE = os.environ.get("VLM_KEEP_ALIVE", "0")
 
+# Which chat dialect the vision endpoint speaks. Everything here was written
+# against ollama's /api/chat, but an OpenAI-compatible server (vLLM, llama.cpp,
+# LM Studio, ...) serves the same vision models at /v1/chat/completions with a
+# different request and response shape. "auto" (the default) asks the endpoint
+# once per URL and caches the answer, so pointing OLLAMA_URL at either kind of
+# server just works; set VLM_API=ollama|openai to skip the probe.
+VLM_API = os.environ.get("VLM_API", "auto").strip().lower()
+
+# Reply length cap for the OpenAI dialect. ollama has no equivalent knob (it
+# generates until the model stops), but /v1/chat/completions defaults to a
+# small budget on some servers, which would truncate a /describe paragraph.
+VLM_MAX_TOKENS = int(os.environ.get("VLM_MAX_TOKENS", "2048"))
+
+_dialect_cache = {}
+
+
+def vlm_dialect(url):
+    """"ollama" or "openai" for `url`, cached per URL.
+
+    The probe asks for ollama's /api/version: a 200 means ollama, a 404 means
+    something else HTTP-shaped is listening (an OpenAI-compatible server). Any
+    other status — e.g. the 401 ollama.com answers unauthenticated — and a
+    connection failure both keep the historical default, so a daemon that is
+    merely down still reports its own connection error from the real call
+    rather than being mistaken for a different backend.
+    """
+    if VLM_API in ("ollama", "openai"):
+        return VLM_API
+    url = url.rstrip("/")
+    if url not in _dialect_cache:
+        if url.endswith("/v1"):
+            _dialect_cache[url] = "openai"
+        else:
+            try:
+                with urllib.request.urlopen(url + "/api/version", timeout=4) as r:
+                    r.read()
+                _dialect_cache[url] = "ollama"
+            except urllib.error.HTTPError as e:
+                _dialect_cache[url] = "openai" if e.code == 404 else "ollama"
+            except Exception:
+                _dialect_cache[url] = "ollama"
+    return _dialect_cache[url]
+
+
 KONTEXT_PROMPT_TIPS = (
     "Kontext instruction tips: use a direct imperative ('Change X to Y', "
     "'Remove X'), name the subject concretely, describe the desired result "
@@ -203,19 +247,66 @@ CRITIQUE_SCHEMA = {
 }
 
 
-def _ollama_chat(ollama_url, payload, api_key=None):
+def _post_json(url, body, api_key=None, timeout=300):
     # api_key: Bearer auth for ollama.com's hosted API (cloud models hit
-    # directly, without the local daemon proxy). The local daemon needs none.
+    # directly, without the local daemon proxy) and for OpenAI-compatible
+    # servers started with a key. A local daemon needs none.
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = "Bearer " + api_key
-    req = urllib.request.Request(
-        ollama_url.rstrip("/") + "/api/chat",
-        data=json.dumps(payload).encode(),
-        headers=headers,
-    )
-    with urllib.request.urlopen(req, timeout=300) as r:
+    req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                 headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode())
+
+
+def _openai_body(payload):
+    """Translate an ollama /api/chat payload into an OpenAI
+    /v1/chat/completions body.
+
+    Base64 `images` on a message become `image_url` data-URL content parts,
+    the `format` JSON schema becomes `response_format` (guided decoding), and
+    the ollama-only knobs drop out: `think` has no OpenAI equivalent, and
+    `keep_alive`/`num_ctx` are the serving process's business, not the
+    client's, once the model lives on another host.
+    """
+    messages = []
+    for m in payload.get("messages", []):
+        images = m.get("images") or []
+        content = m.get("content", "")
+        if images:
+            content = [{"type": "text", "text": content}] + [
+                {"type": "image_url",
+                 "image_url": {"url": "data:image/png;base64," + b}}
+                for b in images
+            ]
+        messages.append({"role": m.get("role", "user"), "content": content})
+    body = {"model": payload["model"], "messages": messages, "stream": False,
+            "max_tokens": VLM_MAX_TOKENS}
+    schema = payload.get("format")
+    if isinstance(schema, dict):
+        body["response_format"] = {"type": "json_schema",
+                                   "json_schema": {"name": "reply",
+                                                   "schema": schema}}
+    options = payload.get("options") or {}
+    if "temperature" in options:
+        body["temperature"] = options["temperature"]
+    return body
+
+
+def _ollama_chat(vlm_url, payload, api_key=None):
+    """One chat round trip, in whichever dialect the endpoint speaks. The
+    OpenAI reply is reshaped into ollama's {"message": {"content": ...}} so
+    every caller — and _chat_text's retry logic — stays dialect-agnostic."""
+    base = vlm_url.rstrip("/")
+    if vlm_dialect(base) == "ollama":
+        return _post_json(base + "/api/chat", payload, api_key)
+    if not base.endswith("/v1"):
+        base += "/v1"
+    resp = _post_json(base + "/chat/completions", _openai_body(payload), api_key)
+    choice = (resp.get("choices") or [{}])[0]
+    return {"message": {"content": choice.get("message", {}).get("content") or ""},
+            "done_reason": choice.get("finish_reason")}
 
 
 def _chat_text(ollama_url, payload, api_key=None):
