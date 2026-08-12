@@ -117,9 +117,37 @@ function Stop-ExistingServer {
     if ($killed) { Start-Sleep -Seconds 1 }
 }
 
-# The critique/describe VLM needs ollama on 11434. On Windows the ollama app
-# usually runs already; start it detached if it isn't responding.
+# The critique/describe VLM lives at OLLAMA_URL, which despite the name is not
+# necessarily ollama and not necessarily local: edit_loop also speaks the
+# OpenAI dialect, so the endpoint may be vLLM or llama.cpp on another box. Only
+# a local ollama is ours to start — anything else is another host's process, so
+# probe it and report. Without this distinction the launcher claimed
+# "ollama not installed" on a box correctly pointed at a remote vLLM.
 function Confirm-Ollama {
+    $url = $env:OLLAMA_URL
+    if (-not $url -and (Test-Path ".env")) {
+        $m = Select-String -Path ".env" -Pattern '^OLLAMA_URL=(.+)$' -ErrorAction SilentlyContinue
+        if ($m) { $url = $m.Matches[0].Groups[1].Value.Trim() }
+    }
+    if (-not $url) { $url = "http://127.0.0.1:11434" }
+    $url = $url.TrimEnd('/')
+
+    if ($url -notmatch '^https?://(127\.0\.0\.1|localhost)(:11434)?$') {
+        # Remote and/or OpenAI-compatible. Probe both dialects' cheap endpoints
+        # — whichever answers, the VLM features have a backend. "$url/models"
+        # covers a URL that already ends in /v1, which edit_loop accepts (and
+        # treats as OpenAI without probing).
+        foreach ($probe in @("$url/api/version", "$url/v1/models", "$url/models")) {
+            try {
+                Invoke-RestMethod -Uri $probe -TimeoutSec 3 | Out-Null
+                Write-Host "VLM endpoint $url is up (critique/describe available)." -ForegroundColor Green
+                return
+            } catch {}
+        }
+        Write-Host "VLM endpoint $url is not responding - critique/describe may be unavailable" -ForegroundColor Yellow
+        return
+    }
+
     if (-not (Get-Command ollama -ErrorAction SilentlyContinue)) {
         Write-Host "ollama not installed - VLM critique/describe will be unavailable" -ForegroundColor Yellow
         return
