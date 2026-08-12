@@ -131,6 +131,17 @@ diffusers, transformers, flask, python-dotenv, huggingface_hub, requests.
   (`_shrink_latents_for_preview`), not full resolution; `web_server.py
   --compile` torch.compiles the transformer (lazy — first generation per
   resolution is slow).
+- **Status note**: a daemon thread (`_note_reporter`) posts a short status line
+  — config, model state, image/job counters, queue depth, last error — to
+  `NOTE_URL` (default `http://127.0.0.1:9999/note`) every `NOTE_INTERVAL`
+  seconds, default 300. The board holds *one* note and a POST replaces it, so
+  the post is a full status line, not a log entry; its text is capped at 500
+  characters server-side (a longer post is rejected outright and the stale note
+  survives), so `_note_text` truncates. **Never put prompt text in it** — the
+  board is shared and visible. Counters live in `_stats`, incremented in the
+  queue worker's `finally`, and reset on restart, which means they are
+  per-config totals (a model switch is a restart). Post failures are non-fatal
+  and logged once. `NOTE_URL=off` disables it.
 - **Output convention**: `flux{1|2}_{YYYYMMDD_HHMMSS}_{8hex}.png` plus a
   `.prompt` sidecar with the generation metadata, in `web-generated/` (server)
   or the CWD (CLI). `image_manager.py` parses the `# Prompt:` sidecar line —

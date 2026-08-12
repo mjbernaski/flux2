@@ -391,6 +391,19 @@ _running_job: Optional[Job] = None
 _recent_done: list = []      # list[Job], newest first, bounded by RECENT_DONE_MAX
 _queue_worker_thread: Optional[threading.Thread] = None
 
+# Lifetime counters for this process, for the status note (see _note_reporter).
+# Not persisted: a model switch is a restart, so these are per-config totals,
+# which is what you want when reading "how has this config been doing".
+_stats = {
+    'boot_ts': time.time(),
+    'jobs_done': 0,
+    'jobs_failed': 0,
+    'jobs_canceled': 0,
+    'images': 0,
+    'last_error': None,
+    'last_finish_ts': None,
+}
+
 # Orientation presets (width, height) at 1K base
 ORIENTATIONS_1K = {
     'square': (1024, 1024),
@@ -911,6 +924,18 @@ def _queue_worker():
             job.error = str(e)
         finally:
             job.finished_at = time.time()
+            # Counters for the status note. Images are counted from the job's
+            # own list rather than its requested batch, so a job that died
+            # halfway still contributes the images it actually wrote.
+            _stats['images'] += len(job.images)
+            _stats['last_finish_ts'] = job.finished_at
+            if job.state == 'done':
+                _stats['jobs_done'] += 1
+            elif job.state == 'canceled':
+                _stats['jobs_canceled'] += 1
+            else:
+                _stats['jobs_failed'] += 1
+                _stats['last_error'] = job.error
             # Finished jobs sit in _recent_done for a while; drop the (large)
             # base64 image payloads so they don't stay resident in memory.
             job.params.pop('input_image', None)
@@ -935,6 +960,104 @@ def _start_queue_worker():
     if _queue_worker_thread is None or not _queue_worker_thread.is_alive():
         _queue_worker_thread = threading.Thread(target=_queue_worker, daemon=True, name="queue-worker")
         _queue_worker_thread.start()
+
+
+# ---- Status note ----
+# A small note board on this box that the operator reads instead of tailing
+# server.log. Three things about it shape the code below:
+#
+#   * It holds ONE note. A POST replaces whatever was there, so this is a
+#     status line, not an append log — always post the full current picture.
+#   * Text is capped at 500 characters server-side; a longer post is rejected
+#     outright (the old note survives), so we build short and truncate.
+#   * The board is shared and visible, so prompt text never goes in it. Only
+#     counters, queue depth, config, and error strings.
+#
+# Set NOTE_URL=off to disable. The default target is local because that is the
+# instance being watched; the LAN copy has its own network-stats reporter
+# overwriting it every few minutes.
+NOTE_URL = os.environ.get("NOTE_URL", "http://127.0.0.1:9999/note")
+NOTE_INTERVAL_S = int(os.environ.get("NOTE_INTERVAL", "300"))
+NOTE_MAX_CHARS = 500
+_note_failed = False
+# The port actually bound, which is PORT unless --port overrode it.
+_note_port = PORT
+
+
+def _fmt_duration(seconds):
+    seconds = int(seconds)
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+    return f"{seconds // 86400}d{(seconds % 86400) // 3600}h"
+
+
+def _note_text():
+    """The status line to post. Must stay under NOTE_MAX_CHARS and must not
+    contain prompt text."""
+    config = SERVER_CONFIGS.get(_current_config, 'unknown config')
+    if _model_load_error:
+        model = f"MODEL LOAD FAILED: {_model_load_error}"
+    elif not _model_ready:
+        model = _model_load_status
+    else:
+        model = 'ready'
+    with _queue_cv:
+        queued, running = len(_pending), _running_job is not None
+    lines = [
+        f"flux2 :{_note_port} · {config} · up {_fmt_duration(time.time() - _stats['boot_ts'])}",
+        f"model: {model}",
+        f"images {_stats['images']} · jobs {_stats['jobs_done']} ok"
+        f" / {_stats['jobs_failed']} fail / {_stats['jobs_canceled']} cancel",
+        f"queue: {queued} waiting, {'1 running' if running else 'idle'}",
+    ]
+    if _stats['last_finish_ts']:
+        lines.append("last finish "
+                     f"{_fmt_duration(time.time() - _stats['last_finish_ts'])} ago")
+    if _stats['last_error']:
+        lines.append(f"last err: {_stats['last_error']}")
+    text = "\n".join(lines) + f"\n@ {datetime.now().strftime('%H:%M')}"
+    return text[:NOTE_MAX_CHARS]
+
+
+def _post_note(text):
+    """POST the note, returning True on success. Failures are non-fatal — the
+    board is a convenience, and the server must not care whether it is up."""
+    global _note_failed
+    import urllib.request
+    req = urllib.request.Request(
+        NOTE_URL, data=json.dumps({'text': text}).encode(),
+        headers={'Content-Type': 'application/json'})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            r.read()
+        _note_failed = False
+        return True
+    except Exception as e:
+        # One line the first time it breaks, then quiet: this runs every few
+        # minutes forever and must not fill server.log on a box where the
+        # note service simply isn't running.
+        if not _note_failed:
+            print(f"[note] posting to {NOTE_URL} failed ({e}); "
+                  "continuing quietly. Set NOTE_URL=off to disable.", flush=True)
+            _note_failed = True
+        return False
+
+
+def _note_reporter():
+    while True:
+        _post_note(_note_text())
+        time.sleep(NOTE_INTERVAL_S)
+
+
+def _start_note_reporter(port=None):
+    global _note_port
+    if port:
+        _note_port = port
+    if NOTE_URL.lower() in ('off', 'none', '') or NOTE_INTERVAL_S <= 0:
+        return
+    threading.Thread(target=_note_reporter, daemon=True, name='note-reporter').start()
 
 
 # ---- Multi-model runs ----
@@ -2866,5 +2989,6 @@ if __name__ == '__main__':
         threading.Thread(target=_warm_critique_model, daemon=True,
                          name='critique-warmup').start()
     _start_queue_worker()
+    _start_note_reporter(args.port)
     print(f"\nStarting web server on http://0.0.0.0:{args.port} (model loading in background)")
     app.run(host='0.0.0.0', port=args.port, threaded=True)
