@@ -77,10 +77,25 @@ Check `GET /model` before sending optional fields: `negative_prompt` needs the
 SDXL backend, `mask_image` needs FLUX.2 or SDXL, and more than one reference
 image needs Kontext or FLUX.2. Sending an unsupported field is a `400`.
 
-`GET /model` also reports `vae_tiling`, which says whether the server was
-started with `--vae-tiling`. That decodes the final image in overlapping tiles
-instead of one allocation — worth turning on if generations above roughly 1 MP
-stall on their last step, which is the fp32 VAE decode spilling out of VRAM.
+`GET /model` also reports `vae_tiling` and `vae_tiling_threshold_mp`, which
+describe how the final image is decoded. The fp32 VAE decode is the
+peak-memory moment of a generation, and above a certain resolution it spills
+out of VRAM and stalls the job on its last step with no error; decoding in
+overlapping tiles bounds that, but costs roughly 50% on sizes that would have
+been fine untiled. So `vae_tiling` is a mode, not a flag, and it is decided per
+generation from the output size:
+
+| value | meaning |
+| --- | --- |
+| `auto` | Default. Tile only above `vae_tiling_threshold_mp` |
+| `always` | Tile every decode |
+| `off` | Never tile |
+
+`vae_tiling_threshold_mp` is the cutoff `auto` compares against — 1.9 by
+default, sitting between the largest size that decodes fine untiled and the
+smallest that doesn't on the reference card. The mode is set at launch with
+`--vae-tiling [always|off]` and the threshold with the
+`VAE_TILING_THRESHOLD_MP` environment variable; neither is a per-request field.
 
 `PUT /models/current` answers `202`, not `200`: the models are far too large to
 hot-swap, so switching writes the target config to a file and exits with a code
@@ -123,6 +138,9 @@ Request body — only `prompt` is required:
 | `show_preview` | bool | false | Decode latent previews while generating |
 | `save_previews` | bool | false | Also write each frame to `steps/` |
 | `spectrum_grid` | bool | false | Sweep guidance/strength into a matrix |
+| `spectrum_same_seed` | bool | true | Hold the seed across the matrix so only the swept axis varies |
+| `selected_cells` | int[] | — | Regenerate only these cells of a spectrum grid |
+| `expansion_same_seed` | bool | true | Hold one seed across a `{a\|b}` expansion (see below) |
 
 ### Prompt expansion
 

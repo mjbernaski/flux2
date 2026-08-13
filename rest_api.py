@@ -641,6 +641,12 @@ def _openapi_document():
                               'description': 'Sweep guidance/strength into a matrix.'},
             'spectrum_same_seed': {'type': 'boolean', 'default': True},
             'selected_cells': {'type': 'array', 'items': {'type': 'integer'}},
+            'expansion_same_seed': {
+                'type': 'boolean', 'default': True,
+                'description': 'When a `{a|b}` prompt expands to several jobs and no '
+                               'seed was given, one seed is drawn at submit time and '
+                               'shared by the group so the prompt is the only variable. '
+                               'False lets each member draw its own.'},
         },
     }
 
