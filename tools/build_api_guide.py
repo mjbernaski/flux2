@@ -2,16 +2,18 @@
 
     python tools/build_api_guide.py
 
-Writes docs/flux-api-guide-python.pdf and docs/flux-api-guide-rust.pdf, plus
-the intermediate HTML next to them for inspection.
+Writes docs/flux-api-guide-{python,rust,js}.pdf, plus the intermediate HTML
+next to them for inspection.
 
-The prose is shared; only the code samples differ, so the two guides can't
-drift apart in what they claim the API does. Rendering is headless Chrome's
+The prose is shared; only the code samples differ, so the guides can't drift
+apart in what they claim the API does. Rendering is headless Chrome's
 print-to-PDF — the project has no PDF library, and Chrome gives us real
 pagination and web typography for free.
 
-Add a section by appending to SECTIONS. Every Body entry needs both a `py` and
-an `rs` sample, so a language never silently lacks coverage: build() checks.
+Add a section by appending to SECTIONS. Every Code entry needs a sample for
+each language in LANGUAGES (`py`, `rs`, `js`), so a language never silently
+lacks coverage: validate() checks before anything is written. Adding a fourth
+language is a row in LANGUAGES, a field on Code, and a sample per block.
 """
 
 import html
@@ -30,9 +32,13 @@ from pygments.lexers import get_lexer_by_name
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_DIR = os.path.join(ROOT, 'docs')
 
+# `attr` names the field on a Code block that holds this language's sample, so
+# adding a language is a row here plus a field on Code — render and validate
+# both drive off this table rather than testing for a particular language.
 LANGUAGES = {
-    'python': {'title': 'Python', 'lexer': 'python', 'file': 'python'},
-    'rust': {'title': 'Rust', 'lexer': 'rust', 'file': 'rust'},
+    'python': {'title': 'Python', 'lexer': 'python', 'file': 'python', 'attr': 'py'},
+    'rust': {'title': 'Rust', 'lexer': 'rust', 'file': 'rust', 'attr': 'rs'},
+    'javascript': {'title': 'JavaScript', 'lexer': 'javascript', 'file': 'js', 'attr': 'js'},
 }
 
 CHROME_CANDIDATES = [
@@ -49,9 +55,10 @@ CHROME_CANDIDATES = [
 
 @dataclass
 class Code:
-    """A code sample per language. `shared` renders in both guides."""
+    """A code sample per language. `shared` renders in every guide."""
     py: str = ''
     rs: str = ''
+    js: str = ''
     shared: str = ''
     shared_lang: str = 'bash'
     caption: str = ''
@@ -146,6 +153,11 @@ SECTIONS = [
                    'serde = { version = "1", features = ["derive"] }\n'
                    'serde_json = "1"\n'
                    'base64 = "0.22"',
+                js="// No dependencies: the client is one ES module using fetch, which\n"
+                   "// Node 18+ and every current browser already have.\n"
+                   "//\n"
+                   "// The sample client lives in examples/flux_client.js\n"
+                   "FLUX_API_KEY=your_key node examples/flux_client.js health",
                 caption='Dependencies'),
             p("The complete client used throughout this guide ships with the server. "
               "Everything below is an excerpt from it, so you can read the whole thing "
@@ -168,6 +180,14 @@ SECTIONS = [
                    '    println!("{}", path.display());\n'
                    "    Ok(())\n"
                    "}",
+                js="import { FluxClient } from './flux_client.js';\n\n"
+                   "const flux = new FluxClient({\n"
+                   "    baseUrl: process.env.FLUX_URL ?? 'http://localhost:2222',\n"
+                   "    apiKey: process.env.FLUX_API_KEY,\n"
+                   "});\n"
+                   "await flux.waitUntilReady();\n\n"
+                   "const job = await flux.generate('a red fox in falling snow', { steps: 30 });\n"
+                   "console.log(job.images[0].filename, 'seed', job.images[0].seed);",
                 caption='The whole thing, end to end'),
         ],
     ),
@@ -194,7 +214,14 @@ SECTIONS = [
                    "    .await?\n"
                    "    .json()\n"
                    "    .await?;\n"
-                   'println!("{}", info["description"]);'),
+                   'println!("{}", info["description"]);',
+                js="const res = await fetch('http://localhost:2222/api/v1/model', {\n"
+                   "    headers: { 'X-API-Key': process.env.FLUX_API_KEY },\n"
+                   "});\n"
+                   "const info = await res.json();\n"
+                   "console.log(info.description);\n\n"
+                   "// The query-param form is what an <img> needs, since a tag sends no headers\n"
+                   "img.src = `${base}/images/${filename}?api_key=${encodeURIComponent(key)}`;"),
             note("A missing or wrong key is 401 with code `unauthorized`. The key gates "
                  "endpoints that read arbitrary server paths and fetch arbitrary URLs, so "
                  "treat it as a host credential and do not expose the server to untrusted "
@@ -220,6 +247,11 @@ SECTIONS = [
                    "if !state.ready {\n"
                    "    flux.wait_until_ready(Some(&|status| println!(\"  {status}...\")))\n"
                    "        .await?;\n"
+                   "}",
+                js="const state = await flux.health();\n"
+                   "// { ready: false, status: 'loading FLUX.2 model', elapsed_s: 47.2 }\n\n"
+                   "if (!state.ready) {\n"
+                   "    await flux.waitUntilReady({ onStatus: s => console.log(`  ${s}...`) });\n"
                    "}"),
             p("Once ready, ask what the loaded backend can actually do. Build your request "
               "from these flags rather than assuming — the same server binary serves very "
@@ -238,7 +270,15 @@ SECTIONS = [
                    "if info.negative_prompt {\n"
                    "    // SDXL backend; negative_prompt is accepted\n"
                    "}\n"
-                   "let max_refs = if info.kontext || info.flux_version == 2 { 3 } else { 1 };"),
+                   "let max_refs = if info.kontext || info.flux_version == 2 { 3 } else { 1 };",
+                js="const info = await flux.model();\n"
+                   "if (info.inpaint) {\n"
+                   "    // mask_image is accepted\n"
+                   "}\n"
+                   "if (info.negative_prompt) {\n"
+                   "    // SDXL backend; negative_prompt is accepted\n"
+                   "}\n"
+                   "const maxRefs = info.kontext || info.flux_version === 2 ? 3 : 1;"),
             Table(
                 headers=['Field', 'Meaning'],
                 rows=[
@@ -248,7 +288,10 @@ SECTIONS = [
                     ['inpaint', 'mask_image is accepted'],
                     ['kontext', 'Instruction-editing backend'],
                     ['turbo, schnell', 'Few-step variants — expect fewer steps than requested'],
-                    ['vae_tiling', 'Server started with --vae-tiling (tiled final decode)'],
+                    ['vae_tiling', "How the final decode is tiled: auto (the default — "
+                                   "tile only above vae_tiling_threshold_mp), always, or off"],
+                    ['vae_tiling_threshold_mp', 'Megapixel cutoff auto compares against '
+                                                '(1.9 by default)'],
                 ],
                 caption='GET /model'),
         ],
@@ -277,6 +320,16 @@ SECTIONS = [
                    "for image in &job.images {\n"
                    '    println!("{} seed {}", image.filename, image.seed);\n'
                    '    flux.download(&image.filename, "./out").await?;\n'
+                   "}",
+                js="const job = await flux.generate('a red fox in falling snow, golden hour', {\n"
+                   "    steps: 30,\n"
+                   "    size: '1.5mp',\n"
+                   "    orientation: 'widescreen',\n"
+                   "});\n\n"
+                   "for (const image of job.images) {\n"
+                   "    console.log(image.filename, 'seed', image.seed);\n"
+                   "    document.body.append(\n"
+                   "        Object.assign(new Image(), { src: flux.imageUrl(image.filename) }));\n"
                    "}"),
             Table(
                 headers=['Field', 'Type', 'Default', 'Notes'],
@@ -309,7 +362,10 @@ SECTIONS = [
                    "    .batch(8)\n"
                    "    .steps(28);\n"
                    "let job = flux.generate(&request, None).await?;\n"
-                   'println!("{} images in {:.1}s", job.images.len(), job.generation_time);'),
+                   'println!("{} images in {:.1}s", job.images.len(), job.generation_time);',
+                js="const job = await flux.generate('a lighthouse in a storm',\n"
+                   "                                { batch: 8, steps: 28 });\n"
+                   "console.log(job.images.length, 'images in', job.generation_time, 's');"),
         ],
     ),
 
@@ -344,7 +400,18 @@ SECTIONS = [
                    "                job.current, job.batch, job.step, job.total_steps);\n"
                    "        }\n"
                    "    }))\n"
-                   "    .await?;"),
+                   "    .await?;",
+                js="const queued = await flux.submit('a mountain range at dawn',\n"
+                   "                                 { steps: 40, show_preview: true });\n"
+                   "console.log('queued at position', queued.position);\n\n"
+                   "const job = await flux.waitForJob(queued.id, {\n"
+                   "    onProgress: j => {\n"
+                   "        if (j.state === 'running') {\n"
+                   "            console.log(`image ${j.current}/${j.batch} `\n"
+                   "                      + `step ${j.step}/${j.total_steps}`);\n"
+                   "        }\n"
+                   "    },\n"
+                   "});"),
             note("total_steps is not always what you asked for. It is re-read from the live "
                  "scheduler on the first step, because img2img, turbo and schnell variants "
                  "denoise fewer steps than requested. Compute progress from the reported "
@@ -390,6 +457,23 @@ SECTIONS = [
                    "// Kept frames outlive the job\n"
                    "for frame in flux.previews(&queued.id).await?.frames {\n"
                    '    println!("{:?} {:?} {}", frame.image, frame.step, frame.url);\n'
+                   "}",
+                js="const queued = await flux.submit(prompt,\n"
+                   "    { steps: 30, show_preview: true, save_previews: true });\n\n"
+                   "for (;;) {\n"
+                   "    const previews = await flux.previews(queued.id);\n"
+                   "    if (previews.live) {\n"
+                   "        const { step, total_steps, url } = previews.live;\n"
+                   "        console.log(`step ${step}/${total_steps}  ${url}`);\n"
+                   "        // `url` carries a cache-busting ts — the file is overwritten in place\n"
+                   "        preview.src = url;\n"
+                   "    }\n"
+                   "    if (['done', 'failed', 'canceled'].includes(previews.state)) break;\n"
+                   "    await new Promise(r => setTimeout(r, 1000));\n"
+                   "}\n\n"
+                   "// Kept frames outlive the job\n"
+                   "for (const frame of (await flux.previews(queued.id)).frames) {\n"
+                   "    console.log(frame.image, frame.step, frame.url);\n"
                    "}"),
             note("Previews cost real time: each one decodes a latent through the VAE. The "
                  "server throttles live previews to at most one every 0.75s for that reason, "
@@ -406,7 +490,8 @@ SECTIONS = [
               "diffusion loop at the next step. Batch images that already finished are kept."),
             Code(
                 py="flux.cancel(job['id'])",
-                rs="flux.cancel(&job.id).await?;"),
+                rs="flux.cancel(&job.id).await?;",
+                js="await flux.cancel(job.id);"),
             '<h3>Seeing the whole queue</h3>',
             p("One worker serves everyone, so your job may sit behind others. GET /queue "
               "answers where it is in line and roughly when it will run: each waiting entry "
@@ -428,6 +513,15 @@ SECTIONS = [
                    "        job.prompt.chars().take(50).collect::<String>());\n"
                    "}\n\n"
                    "if !q.accepting {\n"
+                   "    // a further submit would fail with queue_full\n"
+                   "}",
+                js="const q = await flux.queue();\n"
+                   "console.log(`${q.depth}/${q.capacity} waiting, `\n"
+                   "          + `${q.images_pending} image(s) pending`);\n\n"
+                   "for (const job of q.waiting) {\n"
+                   "    console.log(job.position, job.id, job.prompt.slice(0, 50));\n"
+                   "}\n\n"
+                   "if (!q.accepting) {\n"
                    "    // a further submit would fail with queue_full\n"
                    "}"),
             note("`accepting` is the honest answer to \"can I submit right now\". It goes "
@@ -456,7 +550,14 @@ SECTIONS = [
                    '    .reference(encode_image("house.jpg")?)\n'
                    "    .strength(0.55)\n"
                    "    .keep_aspect();\n\n"
-                   "let job = flux.generate(&request, None).await?;"),
+                   "let job = flux.generate(&request, None).await?;",
+                js="// toDataUrl takes anything File-like — a drop event, a file input, a Blob\n"
+                   "const reference = await FluxClient.toDataUrl(input.files[0]);\n\n"
+                   "const job = await flux.generate('make it winter, heavy snow on the roof', {\n"
+                   "    input_images: [reference],\n"
+                   "    strength: 0.55,\n"
+                   "    aspect_mode: 'keep',\n"
+                   "});"),
             p("strength controls how far the result may drift from the reference: low "
               "values preserve the original closely, high values treat it as loose "
               "inspiration. It applies to FLUX.1 img2img; Kontext and FLUX.2 read the "
@@ -472,7 +573,10 @@ SECTIONS = [
                    ")",
                 rs='let request = GenerateRequest::new("make it winter")\n'
                    '    .server_path("archive/house.jpg");\n'
-                   "let job = flux.generate(&request, None).await?;"),
+                   "let job = flux.generate(&request, None).await?;",
+                js="const job = await flux.generate('make it winter', {\n"
+                   "    input_paths: ['archive/house.jpg'],\n"
+                   "});"),
             '<h3>Inpainting</h3>',
             p("Supply exactly one reference plus a mask, on a FLUX.2 or SDXL backend. "
               "White in the mask marks the region to regenerate."),
@@ -488,6 +592,12 @@ SECTIONS = [
                    '        .reference(encode_image("room.png")?)\n'
                    '        .mask(encode_image("mask.png")?);\n'
                    "    let job = flux.generate(&request, None).await?;\n"
+                   "}",
+                js="if ((await flux.model()).inpaint) {\n"
+                   "    const job = await flux.generate('a brass telescope on the table', {\n"
+                   "        input_images: [await FluxClient.toDataUrl(roomFile)],\n"
+                   "        mask_image: await FluxClient.toDataUrl(maskFile),\n"
+                   "    });\n"
                    "}"),
         ],
     ),
@@ -519,7 +629,14 @@ SECTIONS = [
                    "    .reference(reference.image);\n"
                    "let job = flux.generate(&request, None).await?;\n\n"
                    "// Camera RAW needs the rawpy package on the server (501 if absent)\n"
-                   'let raw = flux.import_raw("DSC_0001.NEF").await?;'),
+                   'let raw = flux.import_raw("DSC_0001.NEF").await?;',
+                js="const reference = await flux.importUrl('https://example.com/photo.jpg');\n"
+                   "console.log(reference.width, reference.height);\n\n"
+                   "const job = await flux.generate('in the style of a woodcut',\n"
+                   "                                { input_images: [reference.image] });\n\n"
+                   "// Camera RAW needs the rawpy package on the server (501 if absent).\n"
+                   "// importRaw posts multipart, so it takes the File itself, not a data URL.\n"
+                   "const raw = await flux.importRaw(rawInput.files[0]);"),
             p("To find server-side paths, browse the filesystem. Relative directories "
               "resolve against the output folder; the response always carries an absolute "
               "dir and its parent so you can navigate without doing path arithmetic."),
@@ -535,7 +652,14 @@ SECTIONS = [
                    "}\n"
                    "for file in &listing.files {\n"
                    '    println!("{}", file.filename);\n'
-                   "}"),
+                   "}",
+                js="const listing = await flux.browse('archive');\n"
+                   "for (const name of listing.dirs) console.log('[dir]', name);\n"
+                   "for (const entry of listing.files) console.log(entry.filename);\n\n"
+                   "// Entries carry only a filename; join them onto the absolute\n"
+                   "// listing.dir to get a path the thumbnail endpoint can resolve.\n"
+                   "grid.append(...listing.files.map(entry => Object.assign(new Image(),\n"
+                   "    { src: flux.thumbnailUrl(`${listing.dir}/${entry.filename}`) })));"),
         ],
     ),
 
@@ -554,7 +678,12 @@ SECTIONS = [
                    '    println!("{} {} {:?}", image.time, image.filename, image.prompt);\n'
                    "}\n\n"
                    "let data = flux.image_bytes(&filename).await?;      // raw bytes\n"
-                   'let path = flux.download(&filename, "./out").await?;'),
+                   'let path = flux.download(&filename, "./out").await?;',
+                js="for (const image of await flux.history()) {\n"
+                   "    console.log(image.time, image.filename, image.prompt);\n"
+                   "}\n\n"
+                   "const blob = await flux.imageBlob(filename);   // a Blob, for canvas or download\n"
+                   "img.src = flux.imageUrl(filename);             // or let the tag fetch it"),
             p("Housekeeping has three levels. Saving copies an image somewhere the other "
               "two cannot reach; archiving moves the day's work aside non-destructively; "
               "deleting is permanent."),
@@ -566,7 +695,11 @@ SECTIONS = [
                 rs="flux.save_image(&filename).await?;   // copy into .saved/\n"
                    "flux.archive().await?;               // move today's output into archive/\n"
                    "flux.delete_image(&filename).await?; // permanent\n"
-                   "flux.delete_today().await?;          // permanent, everything from today"),
+                   "flux.delete_today().await?;          // permanent, everything from today",
+                js="await flux.saveImage(filename);    // copy into .saved/, beyond archive and delete\n"
+                   "await flux.archive();              // move today's output into archive/\n"
+                   "await flux.deleteImage(filename);  // permanent\n"
+                   "await flux.deleteToday();          // permanent, everything from today"),
             note("Both delete calls are irreversible and the delete-today form takes no "
                  "confirmation. Archive first if there is any doubt."),
         ],
@@ -600,7 +733,12 @@ SECTIONS = [
                 rs='let prompt = flux.describe(&[encode_image("photo.jpg")?], false).await?;\n'
                    'println!("{prompt}");\n\n'
                    "// then generate a fresh image from that description alone\n"
-                   "let job = flux.generate(&GenerateRequest::new(&prompt), None).await?;"),
+                   "let job = flux.generate(&GenerateRequest::new(&prompt), None).await?;",
+                js="const prompt = await flux.describe(\n"
+                   "    await FluxClient.toDataUrl(photoInput.files[0]));\n"
+                   "console.log(prompt);\n\n"
+                   "// then generate a fresh image from that description alone\n"
+                   "const job = await flux.generate(prompt);"),
             '<h3>Improving a prompt</h3>',
             p("Boost rewrites a draft into the prompting idiom of whichever model is "
               "loaded — descriptive prose for FLUX, an imperative instruction for Kontext, "
@@ -611,7 +749,9 @@ SECTIONS = [
                 py='result = flux.boost("a castle", level=4)\n'
                    'job = flux.generate(result["prompt"])',
                 rs='let prompt = flux.boost("a castle", 4, false).await?;\n'
-                   "let job = flux.generate(&GenerateRequest::new(&prompt), None).await?;"),
+                   "let job = flux.generate(&GenerateRequest::new(&prompt), None).await?;",
+                js="const result = await flux.boost('a castle', { level: 4 });\n"
+                   "const job = await flux.generate(result.prompt);"),
             note("A vision-model failure polls as 502 with code `vlm_failed` — the request "
                  "was fine, the model was not. In practice this means ollama is not running "
                  "or the model has not been pulled. GET /telemetry reports its residency."),
@@ -634,7 +774,13 @@ SECTIONS = [
                    "}\n\n"
                    "flux.switch_model(9).await?;\n"
                    "tokio::time::sleep(Duration::from_secs(3)).await;   // let the old process exit\n"
-                   "flux.wait_until_ready(None).await?;"),
+                   "flux.wait_until_ready(None).await?;",
+                js="for (const config of (await flux.models()).configs) {\n"
+                   "    console.log(config.id, config.label);\n"
+                   "}\n\n"
+                   "await flux.switchModel(9);\n"
+                   "await new Promise(r => setTimeout(r, 3000));   // let the old process exit\n"
+                   "await flux.waitUntilReady();"),
             note("Expect connection failures while polling across a restart — the process "
                  "genuinely is gone for a moment. Both sample clients treat transport "
                  "errors during a readiness wait as \"still restarting\" rather than fatal. "
@@ -654,6 +800,15 @@ SECTIONS = [
                    "while let Some(state) = flux.multi_run_status().await? {\n"
                    "    if !state.active { break; }\n"
                    "    tokio::time::sleep(Duration::from_secs(5)).await;\n"
+                   "}",
+                js="const run = await flux.multiRun('a red fox in snow', [9, 6, 1], { steps: 28 });\n"
+                   "console.log('seed', run.seed);\n\n"
+                   "// multiRunStatus resolves to null once the run is gone; the server is\n"
+                   "// unreachable across each restart, so treat a transport error as 'still going'\n"
+                   "for (;;) {\n"
+                   "    const state = await flux.multiRunStatus().catch(() => ({ active: true }));\n"
+                   "    if (!state?.active) break;\n"
+                   "    await new Promise(r => setTimeout(r, 5000));\n"
                    "}"),
         ],
     ),
@@ -704,6 +859,19 @@ SECTIONS = [
                    "        flux.wait_until_ready(None).await?;\n"
                    "    }\n"
                    "    Err(e) => return Err(e),    // including invalid_request\n"
+                   "}",
+                js="import { FluxError } from './flux_client.js';\n\n"
+                   "try {\n"
+                   "    const job = await flux.generate(prompt);\n"
+                   "} catch (e) {\n"
+                   "    if (!(e instanceof FluxError)) throw e;   // transport, not a rejection\n"
+                   "    if (e.code === 'queue_full') {\n"
+                   "        await new Promise(r => setTimeout(r, 30_000));   // transient — retry\n"
+                   "    } else if (e.code === 'model_loading') {\n"
+                   "        await flux.waitUntilReady();\n"
+                   "    } else {\n"
+                   "        throw e;                              // including invalid_request\n"
+                   "    }\n"
                    "}"),
             p("Transport failures are a separate category from rejections, and both clients "
               "keep them distinct. During a model switch the server is legitimately absent "
@@ -787,7 +955,7 @@ def render_block(block, language):
     if block.shared:
         source, lexer = block.shared, block.shared_lang
     else:
-        source = block.py if language == 'python' else block.rs
+        source = getattr(block, LANGUAGES[language]['attr'])
         lexer = LANGUAGES[language]['lexer']
     caption = f'<div class="caption">{html.escape(block.caption)}</div>' if block.caption else ''
     return f'<div class="code">{caption}{render_code(source.rstrip(), lexer)}</div>'
@@ -950,15 +1118,14 @@ def html_to_pdf(chrome, html_path, pdf_path):
 
 
 def validate():
-    """Every code block must cover both languages, or one guide loses a sample."""
+    """Every code block must cover every language, or a guide loses a sample."""
     problems = []
     for section in SECTIONS:
         for block in section.blocks:
             if isinstance(block, Code) and not block.shared:
-                if not block.py.strip():
-                    problems.append(f"{section.title}: missing Python sample")
-                if not block.rs.strip():
-                    problems.append(f"{section.title}: missing Rust sample")
+                for language, meta in LANGUAGES.items():
+                    if not getattr(block, meta['attr']).strip():
+                        problems.append(f"{section.title}: missing {meta['title']} sample")
     if problems:
         raise SystemExit("Incomplete samples:\n  " + "\n  ".join(problems))
 
