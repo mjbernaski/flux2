@@ -73,3 +73,7 @@ image_manager.err.log
 
 # API guide build intermediates; the PDFs in docs/ are the deliverable
 docs/*.html
+
+# Compact UI (port 3333) supervisor output
+new_ui.log
+new_ui.err.log
