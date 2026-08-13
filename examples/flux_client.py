@@ -194,7 +194,11 @@ class FluxClient:
         Accepts every generation parameter: steps, batch, seed, guidance,
         strength, orientation, size, negative_prompt, input_images,
         input_paths, mask_image, aspect_mode, show_preview, save_previews,
-        spectrum_grid. See GET /api/v1/openapi.json for the full schema.
+        spectrum_grid, spectrum_same_seed, selected_cells,
+        expansion_same_seed. See GET /api/v1/openapi.json for the full schema.
+
+        A `{a|b}` prompt expands to one job per alternative; the response then
+        carries an `expanded` list naming all of them. This returns the first.
         """
         return self.post('/jobs', json=dict(params, prompt=prompt))
 
@@ -220,6 +224,11 @@ class FluxClient:
         """Cancel a queued job, or interrupt the running one. Images already
         finished within a batch are kept."""
         return self.delete(f'/jobs/{job_id}')
+
+    def clear_recent(self):
+        """Forget the finished-jobs list, so a fresh client doesn't replay an
+        old session. Queued and running jobs are untouched."""
+        return self.delete('/jobs/recent')
 
     def wait_for_job(self, job_id, poll=1.5, timeout=3600, on_progress=None):
         """Poll until the job settles. Returns the finished job dict.

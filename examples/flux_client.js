@@ -96,7 +96,9 @@ export class FluxClient {
 
     /** Queue a job without waiting. Accepts every generation parameter —
      *  steps, batch, seed, guidance, strength, orientation, size,
-     *  input_images, mask_image, show_preview, ... */
+     *  input_images, mask_image, show_preview, expansion_same_seed, ...
+     *  A `{a|b}` prompt queues one job per alternative and the response lists
+     *  them all in `expanded`; this resolves to the first. */
     submit(prompt, params = {}) { return this.post('/jobs', { ...params, prompt }); }
 
     job(id) { return this.get(`/jobs/${id}`); }
@@ -106,6 +108,9 @@ export class FluxClient {
      *  `accepting` is false once a further submit would hit queue_full. */
     queue() { return this.get('/queue'); }
     cancel(id) { return this.del(`/jobs/${id}`); }
+    /** Forget the finished-jobs list so a fresh client doesn't replay an old
+     *  session. Queued and running jobs are untouched. */
+    clearRecent() { return this.del('/jobs/recent'); }
     /** Intermediate images: `live` is the frame being denoised now (needs
      *  show_preview), `frames` are per-step images on disk (needs
      *  save_previews, but they outlive the job). */
@@ -150,6 +155,15 @@ export class FluxClient {
     deleteToday() { return this.del('/images'); }
     archive() { return this.post('/archive'); }
 
+    /** Compose an edit-loop film strip — the reference plus each iteration,
+     *  side by side — and preserve the iterations in .saved/. Saved as a
+     *  normal output, so it shows up in history() like any other image. */
+    filmstrip(filenames, { direction = '', prompts = [], refImage } = {}) {
+        const body = { filenames, direction, prompts };
+        if (refImage) body.ref_image = refImage;
+        return this.post('/filmstrips', body);
+    }
+
     // -- reference images ---------------------------------------------------
 
     /** Turn a File/Blob (drag-drop, file input) into the data URL the API
@@ -165,6 +179,18 @@ export class FluxClient {
     importUrl(url) { return this.post('/imports/url', { url }); }
     importPath(path) { return this.post('/imports/path', { path }); }
     browse(dir) { return this.get('/files', { params: { dir } }); }
+
+    /** A small JPEG thumbnail of any server-side image, as a Blob — for
+     *  rendering a reference picker over what browse() returned. */
+    thumbnail(path) {
+        return this.request('GET', '/files/thumbnail', { raw: true, params: { path } });
+    }
+
+    /** The same thumbnail as a URL for an <img src>, keyed by query param. */
+    thumbnailUrl(path) {
+        return `${this.base}/files/thumbnail?path=${encodeURIComponent(path)}`
+             + `&api_key=${encodeURIComponent(this.apiKey)}`;
+    }
 
     /** Camera RAW needs multipart, so it bypasses the JSON helper. */
     async importRaw(file) {

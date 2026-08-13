@@ -67,6 +67,14 @@ curl -s -X POST "${AUTH[@]}" "${JSON[@]}" "$API/jobs" -d '{
   "show_preview": true
 }' | jq
 
+# A {a|b} prompt queues one job per alternative — this is four jobs, and the
+# response lists them all in `expanded`. The group shares one seed so the
+# prompt is the only variable; "expansion_same_seed": false opts out.
+curl -s -X POST "${AUTH[@]}" "${JSON[@]}" "$API/jobs" -d '{
+  "prompt": "a {red|blue} car in {rain|snow}",
+  "expansion_same_seed": true
+}' | jq '.expanded[] | {id, prompt}'
+
 # Poll one job. `state` settles at done | failed | canceled.
 JOB=abc123def456
 curl -s "${AUTH[@]}" "$API/jobs/$JOB" | jq '{state, current, batch, step, total_steps}'

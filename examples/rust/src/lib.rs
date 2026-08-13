@@ -404,6 +404,17 @@ pub struct GenerateRequest {
     pub save_previews: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spectrum_grid: Option<bool>,
+    /// Hold the seed across a spectrum grid so only the swept axis varies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spectrum_same_seed: Option<bool>,
+    /// Regenerate only these cells of a spectrum grid.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub selected_cells: Vec<u32>,
+    /// A `{a|b}` prompt queues one job per alternative. With no explicit seed,
+    /// one is drawn at submit time and shared by the group so the prompt is
+    /// the only variable; `Some(false)` lets each member draw its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expansion_same_seed: Option<bool>,
 }
 
 impl GenerateRequest {
@@ -460,6 +471,12 @@ impl GenerateRequest {
     }
     pub fn with_previews(mut self) -> Self {
         self.show_preview = Some(true);
+        self
+    }
+    /// Let every member of a `{a|b}` expansion draw its own seed, instead of
+    /// sharing one across the group.
+    pub fn independent_expansion_seeds(mut self) -> Self {
+        self.expansion_same_seed = Some(false);
         self
     }
 }
@@ -668,6 +685,13 @@ impl FluxClient {
         self.delete(&format!("/jobs/{id}")).await
     }
 
+    /// Forget the finished-jobs list, so a fresh client doesn't replay an old
+    /// session. Queued and running jobs are untouched.
+    pub async fn clear_recent(&self) -> Result<()> {
+        let _: serde_json::Value = self.delete("/jobs/recent").await?;
+        Ok(())
+    }
+
     /// Intermediate images from a generation: the frame being denoised right
     /// now (`live`, only with `show_preview`) plus any per-step frames written
     /// to disk (`frames`, only with `save_previews` — but they outlive the job).
@@ -778,6 +802,28 @@ impl FluxClient {
         self.post_empty("/archive").await
     }
 
+    /// Finish an edit-loop run: compose the reference plus every iteration
+    /// into one film strip, saved as a normal output, and preserve the
+    /// iterations in `.saved/`. `prompts` labels the frames; `ref_image` is
+    /// the data URL the loop started from, if there was one.
+    pub async fn filmstrip(
+        &self,
+        filenames: &[String],
+        direction: &str,
+        prompts: &[String],
+        ref_image: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let mut body = serde_json::json!({
+            "filenames": filenames,
+            "direction": direction,
+            "prompts": prompts,
+        });
+        if let Some(reference) = ref_image {
+            body["ref_image"] = serde_json::Value::String(reference.into());
+        }
+        self.post_json("/filmstrips", &body).await
+    }
+
     // -- reference images ---------------------------------------------------
 
     pub async fn import_url(&self, url: &str) -> Result<ImportedImage> {
@@ -811,6 +857,28 @@ impl FluxClient {
             None => "/files".to_string(),
         };
         self.get(&path).await
+    }
+
+    /// JPEG bytes of a small thumbnail for any server-side image — enough to
+    /// render a picker over what [`browse`](Self::browse) returned without
+    /// pulling down full-size files.
+    pub async fn thumbnail(&self, path: &str) -> Result<Vec<u8>> {
+        let response = self
+            .http
+            .get(self.url(&format!("/files/thumbnail?path={}", urlencode(path))))
+            .header("X-API-Key", &self.api_key)
+            .send()
+            .await?;
+        let status = response.status();
+        let bytes = response.bytes().await?;
+        if !status.is_success() {
+            return Err(Error::Api {
+                code: "not_found".into(),
+                message: format!("could not thumbnail {path}"),
+                status: status.as_u16(),
+            });
+        }
+        Ok(bytes.to_vec())
     }
 
     // -- vision-model jobs --------------------------------------------------
