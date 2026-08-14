@@ -743,11 +743,256 @@ $('keySave').onclick = () => {
     toast('Key saved');
 };
 
+/* ── edit loop ──────────────────────────────────────────────────────────── */
+
+/* One round is: generate from the current base with the current instruction,
+ * ask the vision model whether the edit actually landed, and take its revised
+ * instruction into the next round. The loop's whole point is that the critic,
+ * not the user, writes the retry — so a critique failure degrades to reusing
+ * the previous instruction rather than aborting the run.
+ */
+
+let loopRun = null;   // {stop, decision, nextBase} while a run is in flight
+
+function loopStatus(message, kind = '') {
+    const node = $('loopStatus');
+    node.hidden = !message;
+    node.textContent = message || '';
+    node.style.color = kind === 'error' ? 'var(--danger)'
+                     : kind === 'done'  ? 'var(--ok)' : '';
+}
+
+async function loopGenerate(prompt, refDataUrl, onTick) {
+    const job = await POST('/jobs', {
+        prompt,
+        input_images: [refDataUrl],
+        batch: 1,
+        steps: Number($('steps').value),
+        guidance: $('guidance').value ? Number($('guidance').value) : null,
+        aspect_mode: 'keep',
+        show_preview: $('showPreview').checked,
+    });
+
+    for (;;) {
+        await sleep(1500);
+        const current = await GET(`/jobs/${job.id}`);
+        if (TERMINAL.includes(current.state)) {
+            if (current.state !== 'done' || current.error) {
+                throw new Error(current.error || `job ${current.state}`);
+            }
+            return current.images[0].filename;
+        }
+        onTick?.(current);
+        if (loopRun?.stop) {
+            // A queued job can be dropped; a running one has to finish.
+            await DEL(`/jobs/${job.id}`).catch(() => {});
+            throw new Error('stopped');
+        }
+    }
+}
+
+async function loopCritique(fields) {
+    const started = await POST('/vlm/jobs', { task: 'critique', ...fields });
+    for (;;) {
+        await sleep(2000);
+        const poll = await GET(`/vlm/jobs/${started.id}`);
+        if (poll.done) return poll.result;
+        if (loopRun?.stop) throw new Error('stopped');
+    }
+}
+
+// Chaining and backtracking both need a produced PNG back as a data URL; the
+// server already resolves a bare filename against the output directory.
+const loopBaseFrom = (filename) =>
+    POST('/imports/path', { path: filename }).then(r => r.image);
+
+function loopCard(round, prompt, filename) {
+    const card = el('div', 'card');
+    const img = el('img');
+    img.src = `/api/v1/files/thumbnail?path=${encodeURIComponent(filename)}`;
+    img.alt = prompt;
+    img.style.aspectRatio = 'auto';
+    img.onclick = () => {
+        state.gallery = [{ filename, prompt, time: `round ${round}` }];
+        openLightbox(0);
+    };
+    card.append(img, el('div', 'card-meta', `round ${round}`), el('div', 'card-prompt', prompt));
+
+    const verdict = el('div', 'card-prompt');
+    verdict.style.color = 'var(--text-3)';
+    card.append(verdict);
+
+    // Backtrack: make this round's output the base for the next one.
+    const useBase = el('button', 'mini', '⏪ Base for next round');
+    useBase.onclick = () => {
+        if (loopRun) { loopRun.nextBase = filename; toast(`Round ${round} is the next base`); }
+    };
+    card.append(useBase);
+
+    $('loopCards').prepend(card);
+    return verdict;
+}
+
+function loopAwaitDecision() {
+    $('loopControls').hidden = false;
+    return new Promise(resolve => {
+        loopRun.decision = (choice) => {
+            $('loopControls').hidden = true;
+            loopRun.decision = null;
+            resolve(choice);
+        };
+    });
+}
+
+async function runEditLoop() {
+    const direction = $('loopDirection').value.trim();
+    const maxRounds = Number($('loopIterations').value);
+    const auto = $('loopAuto').checked;
+    const chain = $('loopChain').checked;
+
+    if (!direction) { toast('Enter an edit direction first', 'err'); return; }
+    if (!state.refs.length) { toast('Attach a reference image — the loop edits the first one', 'err'); return; }
+
+    loopRun = { stop: false, decision: null, nextBase: null };
+    $('loopStart').hidden = true;
+    $('loopStop').hidden = false;
+    $('loopCards').replaceChildren();
+
+    const originalRef = state.refs[0].dataUrl;
+    let base = originalRef;
+    let prompt = direction;
+    const completed = [];
+    const history = [];                 // trajectory, so the critic stops re-proposing
+    let best = { score: -1, round: 0 };
+    let makeStrip = false;
+
+    try {
+        for (let round = 1; round <= maxRounds && !loopRun.stop; round++) {
+            loopStatus(`Round ${round}/${maxRounds}: generating…`);
+            const filename = await loopGenerate(prompt, base, (job) => {
+                const phase = job.state === 'running' && job.total_steps
+                    ? ` — step ${job.step}/${job.total_steps}` : ' — queued';
+                loopStatus(`Round ${round}/${maxRounds}: generating${phase}`);
+            });
+            completed.push({ filename, prompt });
+            const verdict = loopCard(round, prompt, filename);
+
+            loopStatus(`Round ${round}/${maxRounds}: comparing input and output…`);
+            let critique = null;
+            try {
+                critique = await loopCritique({
+                    direction, prompt, ref_image: base,
+                    output_filename: filename, history,
+                });
+            } catch (e) {
+                if (e.message === 'stopped') throw e;
+                verdict.textContent = `Critique unavailable: ${e.message}`;
+            }
+
+            let next = prompt;
+            if (critique) {
+                const applied = critique.applied === null ? ''
+                    : critique.applied ? '✔ applied — ' : '✘ not applied — ';
+                const score = typeof critique.score === 'number' ? ` (${critique.score}/10)` : '';
+                verdict.textContent = applied + (critique.critique || '') + score;
+                verdict.style.color = critique.applied === false ? 'var(--danger)' : 'var(--ok)';
+                next = critique.revised_prompt || prompt;
+                if (typeof critique.score === 'number' && critique.score > best.score) {
+                    best = { score: critique.score, round };
+                }
+            }
+            $('loopNext').value = next;
+            history.push({
+                prompt,
+                applied: critique ? critique.applied : null,
+                score: critique ? critique.score : null,
+                critique: critique ? (critique.critique || '') : '',
+            });
+
+            if (loopRun.stop) break;
+            // Auto mode stops early once the critic says the goal landed.
+            if (auto && critique?.applied && typeof critique.score === 'number' && critique.score >= 8) {
+                loopStatus(`Goal reached at round ${round} (${critique.score}/10).`);
+                makeStrip = true;
+                break;
+            }
+            if (round === maxRounds) { makeStrip = true; break; }
+
+            if (auto) {
+                prompt = next;
+            } else {
+                loopStatus(`Round ${round}/${maxRounds} done — adjust the instruction or continue.`);
+                const decision = await loopAwaitDecision();
+                if (decision === 'accept') { makeStrip = true; break; }
+                if (decision === 'stop') break;
+                prompt = $('loopNext').value.trim() || next;
+            }
+
+            // Base for the next round: an explicit backtrack wins, then chain
+            // mode follows the newest output, otherwise stay on the original.
+            if (loopRun.nextBase) {
+                base = loopRun.nextBase === '__original__'
+                    ? originalRef : await loopBaseFrom(loopRun.nextBase);
+                loopRun.nextBase = null;
+            } else if (chain) {
+                base = await loopBaseFrom(filename);
+            }
+        }
+
+        if (makeStrip && completed.length) {
+            loopStatus('Saving iterations and composing the film strip…');
+            try {
+                const strip = await POST('/filmstrips', {
+                    direction,
+                    ref_image: originalRef,
+                    filenames: completed.map(c => c.filename),
+                    prompts: completed.map(c => c.prompt),
+                });
+                const card = el('div', 'card');
+                const img = el('img');
+                img.src = `/api/v1/images/${encodeURIComponent(strip.filename)}`;
+                img.style.aspectRatio = 'auto';
+                card.append(img, el('div', 'card-meta', 'film strip — input plus each edit'));
+                $('loopCards').prepend(card);
+            } catch (e) {
+                loopStatus(`Film strip failed: ${e.message}`, 'error');
+            }
+        }
+
+        const bestText = best.score >= 0 ? ` Best: round ${best.round} (${best.score}/10).` : '';
+        loopStatus((loopRun.stop ? 'Loop stopped.' : 'Loop finished.') + bestText, 'done');
+    } catch (e) {
+        loopStatus(e.message === 'stopped' ? 'Loop stopped.' : `Loop error: ${e.message}`,
+                   e.message === 'stopped' ? 'done' : 'error');
+    } finally {
+        $('loopControls').hidden = true;
+        $('loopStop').hidden = true;
+        $('loopStart').hidden = false;
+        loopRun = null;
+        loadGallery();
+    }
+}
+
+$('loopStart').onclick = runEditLoop;
+$('loopStop').onclick = () => {
+    if (!loopRun) return;
+    loopRun.stop = true;
+    loopRun.decision?.('stop');
+    loopStatus('Stopping after this round…');
+};
+$('loopContinue').onclick = () => loopRun?.decision?.('continue');
+$('loopAccept').onclick = () => loopRun?.decision?.('accept');
+$('loopBaseOriginal').onclick = () => {
+    if (!loopRun) return;
+    loopRun.nextBase = '__original__';
+    toast('Next round edits the original again');
+};
+
 /* Controls whose behavior lands in pass 2. Disabled rather than hidden so the
    layout being reviewed is the finished one. */
 function markPending() {
     const pending = ['boostBtn', 'boostNBtn', 'evolveBtn', 'describeBtn',
-                     'inpaintMode', 'loopStart', 'compareStart'];
+                     'inpaintMode', 'compareStart'];
     for (const id of pending) {
         const node = $(id);
         node.disabled = true;
