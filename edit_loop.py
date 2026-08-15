@@ -81,6 +81,13 @@ def vlm_dialect(url):
     connection failure both keep the historical default, so a daemon that is
     merely down still reports its own connection error from the real call
     rather than being mistaken for a different backend.
+
+    Only an answer from something actually listening is cached. A connection
+    failure returns the default *without* caching it: an endpoint that was
+    down when first probed would otherwise be pinned to the wrong dialect for
+    the life of the process, and a remote OpenAI-compatible server that comes
+    back up answers every later call with a 404 on /api/chat. Re-probing costs
+    one request against a host that has already proved reachable.
     """
     if VLM_API in ("ollama", "openai"):
         return VLM_API
@@ -96,7 +103,7 @@ def vlm_dialect(url):
             except urllib.error.HTTPError as e:
                 _dialect_cache[url] = "openai" if e.code == 404 else "ollama"
             except Exception:
-                _dialect_cache[url] = "ollama"
+                return "ollama"
     return _dialect_cache[url]
 
 

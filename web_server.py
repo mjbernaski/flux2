@@ -2561,8 +2561,13 @@ def _run_boost(cid, model, prompt, family, model_desc, level, think, variant=Non
             payload = {'success': True, 'prompt': boosted['prompt'],
                        'negative_prompt': boosted.get('negative_prompt')}
         else:
+            # Boost is a text-only call, so "vision model" misdirected: every
+            # failure here is the VLM endpoint being unreachable, speaking a
+            # dialect we got wrong, or replying without a usable prompt. The
+            # specific reason is printed by vlm_boost.
             payload = {'success': False,
-                       'error': 'vision model unavailable or returned no rewrite'}
+                       'error': f'no rewrite from VLM at {OLLAMA_URL} '
+                                f'(model {model}) — see server.log'}
     except Exception as e:
         payload = {'success': False, 'error': f'boost failed: {e}'}
     _vlm_job_finish(cid, payload)
