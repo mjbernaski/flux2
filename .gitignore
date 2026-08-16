@@ -77,3 +77,7 @@ docs/*.html
 # Compact UI (port 3333) supervisor output
 new_ui.log
 new_ui.err.log
+
+# f14.ps1's detached run_server.ps1 output (server.log gets the real logging)
+supervisor.out.log
+supervisor.err.log
