@@ -790,7 +790,10 @@ SECTIONS = [
             p("A multi-model run generates the same prompt on several configs in turn, "
               "sharing one seed so the outputs are genuinely comparable. Because each "
               "config change restarts the process, the run is file-backed and survives "
-              "them. Text-to-image only, and at most one run at a time."),
+              "them. Text-to-image only, and at most one run at a time. When the run "
+              "ends, its images are tiled into one comparison sheet with each cell "
+              "captioned by model; the finished run carries its filename as "
+              "`composite`."),
             Code(
                 py='run = flux.multi_run("a red fox in snow", configs=[9, 6, 1], steps=28)\n'
                    'print("seed", run["seed"])\n'

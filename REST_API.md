@@ -342,6 +342,12 @@ Each config change is a supervised restart, so run state lives in a file, not
 memory, and survives them. At most one run is active at a time; expect
 connection failures while polling across a restart.
 
+When the run ends its images are tiled into one comparison sheet, each cell
+captioned with the model that produced it. Its filename lands on the run as
+`composite` (fetch it from `/images/{filename}` like any other output); a run
+where fewer than two models produced an image has nothing to compare and gets
+no sheet.
+
 ## Quick start
 
 ```bash

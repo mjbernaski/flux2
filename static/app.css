@@ -1555,3 +1555,12 @@ button:disabled {
     cursor: pointer;
     border: 1px solid #3d3d5c;
 }
+.mr-composite { margin-top: 10px; }
+.mr-composite-caption { font-size: 12px; color: #aaa; margin-bottom: 6px; }
+.mr-composite img {
+    display: block;
+    width: 100%;
+    border-radius: 6px;
+    cursor: pointer;
+    border: 1px solid #3d3d5c;
+}

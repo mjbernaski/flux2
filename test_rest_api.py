@@ -51,8 +51,8 @@ def _expansion_job(job_id, gid, index, total, filename, state='done'):
     return job
 
 
-def _sheets_in(directory):
-    return [f for f in os.listdir(directory) if f.endswith('_expansion_grid.png')]
+def _sheets_in(directory, suffix='_expansion_grid.png'):
+    return [f for f in os.listdir(directory) if f.endswith(suffix)]
 
 
 def _check_expansion_composite():
@@ -113,6 +113,73 @@ def _check_expansion_composite():
     finally:
         ws.OUTPUT_DIR = real_output
         del ws._recent_done[:]
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _multi_run_state(results, configs=(9, 10)):
+    """A multi-model run's state file, as the worker would have left it."""
+    return {'id': 'run-under-test', 'created': 0.0, 'prompt': 'a red fox in snow',
+            'params': {'prompt': 'a red fox in snow', 'seed': 1234},
+            'configs': list(configs), 'results': results}
+
+
+def _check_multi_run_composite():
+    """Drive the multi-model comparison sheet with no GPU: write PNGs where the
+    run's finished jobs would have left them, then finish the run."""
+    tmp = tempfile.mkdtemp(prefix='flux-multirun-test-')
+    real_output, real_state = ws.OUTPUT_DIR, ws.MULTI_RUN_FILE
+    ws.OUTPUT_DIR = tmp
+    ws.MULTI_RUN_FILE = os.path.join(tmp, '.multi_run.json')
+    try:
+        results = []
+        for i, (color, label) in enumerate(
+                (((200, 40, 40), 'FLUX.2-klein (9B)'),
+                 ((40, 80, 200), 'FLUX.1-dev 4-bit')), start=1):
+            name = f'flux2_20260101_00000{i}_abcdef0{i}.png'
+            ws.Image.new('RGB', (128, 96), color).save(os.path.join(tmp, name))
+            results.append({'config': 8 + i, 'label': label, 'model': label,
+                            'state': 'done', 'error': None,
+                            'images': [{'filename': name, 'seed': 1234}],
+                            'generation_time': 1.0})
+
+        state = _multi_run_state(results)
+        ws._multi_run_finish(state)
+        sheets = _sheets_in(tmp, '_multi_run_grid.png')
+        check('finishing a run builds one comparison sheet',
+              len(sheets) == 1, f"got {sheets}")
+        check('the sheet is published on the run state',
+              state.get('composite') == (sheets[0] if sheets else None),
+              f"got {state.get('composite')!r}")
+        check('the finished run is saved with the sheet',
+              (ws._multi_run_load() or {}).get('composite') == state.get('composite'))
+        if sheets:
+            with ws.Image.open(os.path.join(tmp, sheets[0])) as sheet:
+                # 128x96 scales to 512x384 cells, 2 across 1 down, plus the
+                # caption strip (384 // 10 = 38) under each row.
+                check('the sheet tiles one labeled cell per model',
+                      sheet.size == (1024, 384 + 38), f"got {sheet.size}")
+            sidecar = os.path.join(tmp, sheets[0].rsplit('.', 1)[0] + '.prompt')
+            text = open(sidecar).read() if os.path.exists(sidecar) else ''
+            check('the sheet has a sidecar naming the prompt and seed',
+                  '# Prompt: a red fox in snow' in text and '# Seed: 1234' in text,
+                  f"got {text!r}")
+            check('the sidecar names the model behind each cell',
+                  '#   1. FLUX.2-klein (9B) [' in text and
+                  '#   2. FLUX.1-dev 4-bit [' in text, f"got {text!r}")
+
+        # A run whose models mostly failed has nothing to compare.
+        for f in _sheets_in(tmp, '_multi_run_grid.png'):
+            os.remove(os.path.join(tmp, f))
+        failed = dict(results[1], state='failed', error='OOM', images=[])
+        one = _multi_run_state([results[0], failed])
+        ws._multi_run_finish(one, canceled=True)
+        check('a run with one surviving image builds no sheet',
+              not _sheets_in(tmp, '_multi_run_grid.png'),
+              f"got {_sheets_in(tmp, '_multi_run_grid.png')}")
+        check('a canceled run is still marked finished',
+              one.get('finished') and one.get('canceled') and 'composite' not in one)
+    finally:
+        ws.OUTPUT_DIR, ws.MULTI_RUN_FILE = real_output, real_state
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -541,6 +608,9 @@ def main():
 
     print("\nexpansion contact sheet")
     _check_expansion_composite()
+
+    print("\nmulti-model comparison sheet")
+    _check_multi_run_composite()
 
     print("\nimages")
     r = client.get(f'{PREFIX}/images', headers=AUTH)

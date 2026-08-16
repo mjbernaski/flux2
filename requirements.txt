@@ -3,6 +3,7 @@ torchvision
 diffusers
 transformers
 accelerate
+peft  # required by diffusers' load_lora_weights (turbo + uncensored LoRAs)
 safetensors
 huggingface_hub
 requests

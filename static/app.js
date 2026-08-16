@@ -3328,7 +3328,9 @@ if (loopAcceptBtn) loopAcceptBtn.addEventListener('click', function() {
             setStatus('Run complete. Seed ' + run.params.seed + '.', 'done');
         }
 
-        // One lightbox across every image of the run, captioned by model.
+        // One lightbox across every image of the run, captioned by model. The
+        // comparison sheet the server writes when the run ends goes in too, at
+        // the end, so its index stays stable while the rows are being filled.
         const lbItems = [];
         run.results.forEach(function(r) {
             (r.images || []).forEach(function(img) {
@@ -3336,6 +3338,12 @@ if (loopAcceptBtn) loopAcceptBtn.addEventListener('click', function() {
                                caption: r.label + ' — seed ' + img.seed });
             });
         });
+        let sheetIdx = -1;
+        if (run.composite) {
+            sheetIdx = lbItems.length;
+            lbItems.push({ src: '/images/' + run.composite,
+                           caption: 'All models — seed ' + run.params.seed });
+        }
 
         rowsEl.innerHTML = '';
         let lbIdx = 0;
@@ -3385,6 +3393,21 @@ if (loopAcceptBtn) loopAcceptBtn.addEventListener('click', function() {
             }
             rowsEl.appendChild(row);
         });
+
+        if (run.composite) {
+            const wrap = document.createElement('div');
+            wrap.className = 'mr-composite';
+            const cap = document.createElement('div');
+            cap.className = 'mr-composite-caption';
+            cap.textContent = 'Comparison sheet — every model, labeled';
+            const sheet = document.createElement('img');
+            sheet.src = '/images/' + run.composite;
+            sheet.alt = 'Multi-model comparison sheet';
+            sheet.addEventListener('click', function() { openLightbox(lbItems, sheetIdx); });
+            wrap.appendChild(cap);
+            wrap.appendChild(sheet);
+            rowsEl.appendChild(wrap);
+        }
     }
 
     async function poll() {

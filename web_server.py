@@ -179,24 +179,33 @@ if _current_config not in SERVER_CONFIGS:
 # it may point at a local ollama daemon or at an OpenAI-compatible server
 # (vLLM, llama.cpp, LM Studio) on another box, which is the better deal when
 # the local card is busy holding the diffusion pipeline. edit_loop detects
-# which dialect the endpoint speaks; CRITIQUE_MODEL must then name a model
-# that endpoint serves (e.g. qwen3-vl-235b, not qwen3.6:latest).
+# which dialect the endpoint speaks, and CRITIQUE_MODEL says which model to
+# ask it for. The default, "auto", asks the endpoint what it is serving
+# (edit_loop.resolve_vlm_model) instead of pinning a name here: the serving
+# host gets restarted on a new checkpoint far more often than this config gets
+# edited, and a stale pinned name 404s every VLM call. Name a model explicitly
+# only to pin one out of several — e.g. when the endpoint serves both a vision
+# and a text-only model.
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
-CRITIQUE_MODEL = os.environ.get("CRITIQUE_MODEL", "qwen3.6:latest")
+CRITIQUE_MODEL = os.environ.get("CRITIQUE_MODEL", "auto").strip() or "auto"
 # The reverse path (/describe) can use a different — typically Ollama Cloud —
 # model, so image→prompt costs no local VRAM next to the resident FLUX
 # pipeline. With OLLAMA_API_KEY set, cloud models (":cloud"/"-cloud" tags)
 # are sent straight to ollama.com's hosted API (suffix stripped — hosted
 # names don't carry it); without a key they go through the local daemon,
 # which then needs a one-time `ollama signin`.
-DESCRIBE_MODEL = os.environ.get("DESCRIBE_MODEL", CRITIQUE_MODEL)
+DESCRIBE_MODEL = os.environ.get("DESCRIBE_MODEL", "").strip() or CRITIQUE_MODEL
 OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY")
 OLLAMA_CLOUD_URL = os.environ.get("OLLAMA_CLOUD_URL", "https://ollama.com")
 
 
 def _ollama_call_params(model):
     """(model, url, api_key) for a VLM call: cloud models route to ollama.com
-    when an API key is configured, everything else to the local daemon."""
+    when an API key is configured, everything else to the local daemon.
+
+    Cloud routing keys off the ":cloud"/"-cloud" tag, so it only ever applies
+    to an explicitly named model — "auto" is resolved later, against
+    OLLAMA_URL, by the time anything knows what the name is."""
     if OLLAMA_API_KEY and re.search(r'[:-]cloud$', model):
         return re.sub(r'[:-]cloud$', '', model), OLLAMA_CLOUD_URL, OLLAMA_API_KEY
     return model, OLLAMA_URL, None
@@ -215,49 +224,51 @@ _power_state = {"watts": None, "ts": 0.0}
 # so the answer is cached. _vlm_warming is set while the startup preload
 # runs, so the badge can distinguish "loading" from "not loaded yet".
 _VLM_CACHE_S = 10.0
-_vlm_state = {"status": None, "ts": 0.0}
+_vlm_state = {"status": None, "model": None, "ts": 0.0}
 _vlm_warming = False
 
 
 def _probe_vlm():
-    """"loaded" / "unloaded" / "unavailable" for the critique model.
+    """("loaded"|"unloaded"|"unavailable", model name) for the critique model.
 
     ollama loads and unloads on demand, so residency is a real question and
     /api/ps answers it. An OpenAI-compatible server (vLLM et al.) instead
     serves a fixed model list for its lifetime: if /v1/models lists the model
     it is resident by definition, and there is no "unloaded" state to report.
+
+    This is also where model auto-discovery refreshes. It runs at most once
+    per _VLM_CACHE_S, so a serving host restarted on a different checkpoint is
+    picked up within one poll — and the name comes back with the status, so
+    the UI badge shows the model actually in use rather than the word "auto".
     """
-    import urllib.request
     import edit_loop
     base = OLLAMA_URL.rstrip('/')
     try:
+        models = edit_loop.vlm_endpoint_models(base, refresh=True)
+        # Reads the list just fetched; no second round trip.
+        model = edit_loop.resolve_vlm_model(base, CRITIQUE_MODEL)
+        if not models["served"]:
+            return "unavailable", model
         if edit_loop.vlm_dialect(base) == 'ollama':
-            with urllib.request.urlopen(base + "/api/ps", timeout=2) as r:
-                models = json.loads(r.read().decode()).get("models") or []
             norm = lambda n: n if ":" in n else n + ":latest"
-            names = [norm(m.get("name") or "") for m in models]
-            return "loaded" if norm(CRITIQUE_MODEL) in names else "unloaded"
-        if not base.endswith('/v1'):
-            base += '/v1'
-        with urllib.request.urlopen(base + "/models", timeout=2) as r:
-            served = json.loads(r.read().decode()).get("data") or []
-        ids = [m.get("id") for m in served]
-        return "loaded" if CRITIQUE_MODEL in ids else "unloaded"
+            resident = [norm(n) for n in models["resident"]]
+            return ("loaded" if norm(model) in resident else "unloaded"), model
+        return ("loaded" if model in models["served"] else "unloaded"), model
     except Exception:
-        return "unavailable"
+        return "unavailable", CRITIQUE_MODEL
 
 
 def _vlm_status():
     now = time.monotonic()
     if now - _vlm_state["ts"] < _VLM_CACHE_S:
-        status = _vlm_state["status"]
+        status, model = _vlm_state["status"], _vlm_state["model"]
     else:
         _vlm_state["ts"] = now
-        status = _probe_vlm()
-        _vlm_state["status"] = status
+        status, model = _probe_vlm()
+        _vlm_state["status"], _vlm_state["model"] = status, model
     if status != "loaded" and _vlm_warming:
         status = "loading"
-    return {"model": CRITIQUE_MODEL, "status": status}
+    return {"model": model or CRITIQUE_MODEL, "status": status}
 
 
 def _gpu_power_watts():
@@ -440,50 +451,111 @@ def _composite_cell_size(width, height, cell_px=256):
     return cell_width, cell_height
 
 
-def _build_composite_grid(grid_cells, cell_width, cell_height):
-    """Paste a 2D list of (image, seq_label)/None cells into one labeled composite image."""
-    n_rows, n_cols = len(grid_cells), len(grid_cells[0])
-    composite = Image.new('RGB', (n_cols * cell_width, n_rows * cell_height), (32, 32, 32))
-    for row_idx, row_images in enumerate(grid_cells):
-        for col_idx, cell in enumerate(row_images):
-            if cell is None:
-                continue
-            img, _seq = cell
-            img_small = img if img.size == (cell_width, cell_height) else \
-                img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
-            composite.paste(img_small, (col_idx * cell_width, row_idx * cell_height))
+_FONT_CACHE = {}
+LABEL_MIN_PX = 11  # below this a caption is unreadable; truncate instead
 
-    draw = ImageDraw.Draw(composite)
-    font_size = max(14, cell_height // 12)
+
+def _composite_font(size):
+    """A bold TrueType face at `size` — whichever one this box has. Falls back
+    to Pillow's bitmap default (fixed size on Pillow < 10.1, hence the
+    truncation path in _fit_label)."""
+    if size in _FONT_CACHE:
+        return _FONT_CACHE[size]
     font = None
     for font_path in (
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "C:\\Windows\\Fonts\\segoeuib.ttf",
+        "C:\\Windows\\Fonts\\arialbd.ttf",
     ):
         if os.path.exists(font_path):
             try:
-                font = ImageFont.truetype(font_path, font_size)
+                font = ImageFont.truetype(font_path, size)
                 break
             except Exception:
                 font = None
     if font is None:
-        font = ImageFont.load_default()
+        try:
+            font = ImageFont.load_default(size=size)  # Pillow >= 10.1
+        except TypeError:
+            font = ImageFont.load_default()
+    _FONT_CACHE[size] = font
+    return font
+
+
+def _fit_label(draw, text, max_px, max_width):
+    """Return (text, font) for a label that fits `max_width`.
+
+    Shrinks the face from `max_px` down to LABEL_MIN_PX, and only then clips the
+    text. Sequence numbers always fit at full size; model names — the reason
+    this exists — usually land a few points smaller."""
+    size = max_px
+    while size > LABEL_MIN_PX:
+        font = _composite_font(size)
+        if draw.textlength(text, font=font) <= max_width:
+            return text, font
+        size -= 1
+    font = _composite_font(LABEL_MIN_PX)
+    if draw.textlength(text, font=font) <= max_width:
+        return text, font
+    while len(text) > 1 and draw.textlength(text + '…', font=font) > max_width:
+        text = text[:-1]
+    return text + '…', font
+
+
+def _build_composite_grid(grid_cells, cell_width, cell_height, label_height=0):
+    """Paste a 2D list of (image, label)/None cells into one labeled composite.
+
+    With `label_height` the label gets its own strip under each cell, centered
+    and sized to fit — for text labels (model names) that would otherwise cover
+    the image or run off the edge. Without it the label is a small badge in the
+    cell's top-left corner, which is all a sequence number needs."""
+    n_rows, n_cols = len(grid_cells), len(grid_cells[0])
+    row_height = cell_height + label_height
+    composite = Image.new('RGB', (n_cols * cell_width, n_rows * row_height), (32, 32, 32))
     for row_idx, row_images in enumerate(grid_cells):
         for col_idx, cell in enumerate(row_images):
             if cell is None:
                 continue
-            _img, seq = cell
-            label = str(seq)
+            img, _label = cell
+            img_small = img if img.size == (cell_width, cell_height) else \
+                img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
+            composite.paste(img_small, (col_idx * cell_width, row_idx * row_height))
+
+    draw = ImageDraw.Draw(composite)
+    badge_px = max(14, cell_height // 12)
+    caption_px = max(LABEL_MIN_PX, int(label_height * 0.62))
+    for row_idx, row_images in enumerate(grid_cells):
+        for col_idx, cell in enumerate(row_images):
+            if cell is None:
+                continue
+            _img, label = cell
+            label = str(label)
+            if label_height:
+                text, font = _fit_label(draw, label, caption_px, cell_width - 12)
+                bbox = draw.textbbox((0, 0), text, font=font)
+                tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                strip_y = row_idx * row_height + cell_height
+                draw.rectangle(
+                    [col_idx * cell_width, strip_y,
+                     (col_idx + 1) * cell_width - 1, strip_y + label_height - 1],
+                    fill=(0, 0, 0),
+                )
+                draw.text((col_idx * cell_width + (cell_width - tw) // 2 - bbox[0],
+                           strip_y + (label_height - th) // 2 - bbox[1]),
+                          text, fill=(255, 255, 255), font=font)
+                continue
+            text, font = _fit_label(draw, label, badge_px, cell_width - 20)
             pad = 4
-            bbox = draw.textbbox((0, 0), label, font=font)
+            bbox = draw.textbbox((0, 0), text, font=font)
             tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
             x0 = col_idx * cell_width + 6
-            y0 = row_idx * cell_height + 6
+            y0 = row_idx * row_height + 6
             draw.rectangle(
                 [x0 - pad, y0 - pad, x0 + tw + pad, y0 + th + pad],
                 fill=(0, 0, 0),
             )
-            draw.text((x0 - bbox[0], y0 - bbox[1]), label, fill=(255, 255, 255), font=font)
+            draw.text((x0 - bbox[0], y0 - bbox[1]), text, fill=(255, 255, 255), font=font)
     return composite
 
 
@@ -1103,6 +1175,94 @@ def _multi_run_next_config(state):
     return None
 
 
+MULTI_RUN_CELL_PX = 512  # bigger than the batch/expansion cells: model names have to be readable
+
+
+def _build_multi_run_composite(state):
+    """Tile a finished run's images into one sheet, each cell captioned with the
+    model that produced it.
+
+    The whole point of a multi-model run is the side-by-side, and the images are
+    scattered across the run's separate jobs (and separate processes — every
+    config change is a restart), so the sheet is built at the end from the files
+    the run recorded. Returns its filename, or None when fewer than two models
+    produced an image and there is nothing to compare."""
+    cells = []
+    for result in state.get('results', []):
+        if result.get('state') != 'done' or not result.get('images'):
+            continue
+        # A batch job already gets its own grid; take its first image as the
+        # model's representative, same as the expansion sheet does.
+        cells.append((result['images'][0]['filename'],
+                      result.get('label') or f"config {result.get('config')}"))
+    if len(cells) < 2:
+        return None
+
+    thumbs, drawn, cell_width, cell_height = [], [], None, None
+    for filename, label in cells:
+        try:
+            with Image.open(os.path.join(OUTPUT_DIR, filename)) as im:
+                im = im.convert('RGB')
+                if cell_width is None:
+                    cell_width, cell_height = _composite_cell_size(
+                        *im.size, cell_px=MULTI_RUN_CELL_PX)
+                thumbs.append((im.resize((cell_width, cell_height),
+                                         Image.Resampling.LANCZOS), label))
+                drawn.append((filename, label))
+        except OSError as e:
+            # A missing or unreadable image costs one cell, not the sheet.
+            print(f"[multi-run] skipping {filename}: {e}", flush=True)
+    if len(thumbs) < 2:
+        return None
+
+    n_cols = math.ceil(math.sqrt(len(thumbs)))
+    n_rows = math.ceil(len(thumbs) / n_cols)
+    grid_cells = [
+        thumbs[r * n_cols:(r + 1) * n_cols] +
+        [None] * (n_cols - len(thumbs[r * n_cols:(r + 1) * n_cols]))
+        for r in range(n_rows)
+    ]
+    composite = _build_composite_grid(grid_cells, cell_width, cell_height,
+                                      label_height=max(26, cell_height // 10))
+
+    stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    comp_filename = f"{_output_prefix()}_{stamp}_multi_run_grid.png"
+    comp_path = os.path.join(OUTPUT_DIR, comp_filename)
+    composite.save(comp_path)
+
+    # Sidecar: `# Prompt:` stays first-class for image_manager.py, with the
+    # per-cell model names so the sheet can be read on its own.
+    with open(comp_path.rsplit('.', 1)[0] + '.prompt', 'w') as f:
+        f.write(f"# Raw input: {state['prompt']}\n")
+        f.write(f"# Prompt: {state['prompt']}\n")
+        f.write(f"# Multi-model run: {len(thumbs)} of {len(state['configs'])} models\n")
+        f.write(f"# Seed: {state['params'].get('seed')}\n")
+        for seq, (filename, label) in enumerate(drawn, start=1):
+            f.write(f"#   {seq}. {label} [{filename}]\n")
+    print(f"[multi-run] wrote {comp_filename} ({len(thumbs)} cells)", flush=True)
+    return comp_filename
+
+
+def _multi_run_finish(state, canceled=False):
+    """Mark a run finished and save it, building its comparison sheet first.
+
+    Both endings come through here — every config done, or the run canceled
+    partway — so a canceled run still gets a sheet of whatever it managed to
+    generate. Caller holds _multi_run_lock."""
+    state['finished'] = time.time()
+    if canceled:
+        state['canceled'] = True
+    try:
+        filename = _build_multi_run_composite(state)
+    except Exception as e:
+        # The sheet is a convenience; never lose the run's results over it.
+        print(f"[multi-run] composite failed: {e}", flush=True)
+        filename = None
+    if filename:
+        state['composite'] = filename
+    _multi_run_save(state)
+
+
 def _multi_run_enqueue(state):
     job = Job(id=uuid.uuid4().hex[:12], params=dict(state['params']), submitted_at=time.time())
     job.multi_run = state['id']
@@ -1137,10 +1297,11 @@ def _multi_run_record(job):
             'generation_time': round(job.generation_time, 2),
         })
         if job.state == 'canceled':
-            # Interrupting the run's job cancels the whole run.
-            state['finished'] = time.time()
-            state['canceled'] = True
-        _multi_run_save(state)
+            # Interrupting the run's job cancels the whole run — the sheet still
+            # gets built from the models that did finish.
+            _multi_run_finish(state, canceled=True)
+        else:
+            _multi_run_save(state)
 
 
 def _multi_run_advance():
@@ -1159,8 +1320,7 @@ def _multi_run_advance():
             return
         nxt = _multi_run_next_config(state)
         if nxt is None:
-            state['finished'] = time.time()
-            _multi_run_save(state)
+            _multi_run_finish(state)
             print(f"[multi-run] run {state['id']} complete", flush=True)
             return
         if nxt == _current_config:
@@ -2120,8 +2280,9 @@ def _run_critique(cid, model, direction, prompt, reference, output, history, sty
 def critique():
     """Compare an edit output against its reference and propose a revised
     instruction — the "look at the output" step of the edit loop (UI panel
-    and edit_loop.py). Vision critique runs on the local ollama daemon
-    (OLLAMA_URL / CRITIQUE_MODEL env vars); when it's unavailable the
+    and edit_loop.py). Vision critique runs on the VLM endpoint (OLLAMA_URL,
+    with CRITIQUE_MODEL naming the model or "auto" to use whatever that
+    endpoint is currently serving); when it's unavailable the
     result falls back to pixel-metric heuristics. Returns a critique_id
     immediately; poll GET /critique/<id> for the result."""
     try:
@@ -2658,7 +2819,8 @@ def _warm_critique_model():
               "model loads on demand and releases its VRAM after each call).")
         return
     import urllib.request
-    payload = json.dumps({"model": CRITIQUE_MODEL, "stream": False,
+    model = edit_loop.resolve_vlm_model(OLLAMA_URL, CRITIQUE_MODEL)
+    payload = json.dumps({"model": model, "stream": False,
                           "keep_alive": edit_loop.KEEP_ALIVE}).encode()
     req = urllib.request.Request(f"{OLLAMA_URL}/api/generate", data=payload,
                                  headers={"Content-Type": "application/json"})
@@ -2666,7 +2828,7 @@ def _warm_critique_model():
     try:
         with urllib.request.urlopen(req, timeout=600) as r:
             r.read()
-        print(f"Critique model {CRITIQUE_MODEL} loaded in ollama.")
+        print(f"Critique model {model} loaded in ollama.")
     except Exception as e:
         print(f"Critique model warm-up skipped: {e}")
     finally:

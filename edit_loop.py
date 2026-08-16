@@ -6,8 +6,9 @@ Takes an input image and an edit direction, runs the edit through the server
 again — up to N iterations, stoppable between any two.
 
 The "look at the output" step is pluggable:
-  - a local ollama vision model (--vlm; default from the CRITIQUE_MODEL env
-    var, falling back to qwen3.6:latest) compares the reference and the
+  - a vision model on the VLM endpoint (--vlm; default from the CRITIQUE_MODEL
+    env var, falling back to "auto" — whatever that endpoint is currently
+    serving, asked for at call time) compares the reference and the
     output, grades the result 0-10, and proposes a revised instruction,
     entirely on-box (no cloud), so any content stays local. It sees the
     session's prompt trajectory (what was tried and why it failed) and runs
@@ -105,6 +106,102 @@ def vlm_dialect(url):
             except Exception:
                 return "ollama"
     return _dialect_cache[url]
+
+
+# Model auto-discovery. "auto" — the default for CRITIQUE_MODEL/DESCRIBE_MODEL
+# and --vlm — means "whatever that endpoint is serving", asked for at call time
+# instead of pinned in config. The serving host is the authority on what it is
+# running, and it gets restarted on a different checkpoint far more often than
+# this repo's config gets edited; a pinned name that falls out of sync 404s
+# every VLM call until someone goes looking.
+AUTO_MODEL = "auto"
+
+_endpoint_cache = {}   # url -> {"resident": [...], "served": [...]}
+_announced = {}        # url -> the model name auto-discovery last reported
+
+
+def _json_get(url, timeout=4):
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
+def vlm_endpoint_models(url, refresh=False):
+    """What `url` has to offer, as {"resident": [...], "served": [...]}.
+
+    On an OpenAI-compatible server the two lists are identical: the process was
+    started with a fixed set of models and holds them for its lifetime, which
+    is what makes /v1/models a straight answer to "what is running over
+    there". ollama separates the two — /api/ps is what is resident (routinely
+    nothing, under KEEP_ALIVE="0") and /api/tags is the installed library,
+    asked only when nothing is resident.
+
+    Cached per URL; `refresh=True` re-asks. The server's /status probe
+    refreshes, which is how a model swap on the serving host gets noticed
+    without restarting anything here. An unreachable endpoint yields two empty
+    lists and is *not* cached, so a host that is merely down isn't remembered
+    as serving nothing for the life of the process.
+    """
+    base = url.rstrip("/")
+    if refresh:
+        _endpoint_cache.pop(base, None)
+    if base in _endpoint_cache:
+        return _endpoint_cache[base]
+    found = {"resident": [], "served": []}
+    try:
+        if vlm_dialect(base) == "ollama":
+            names = lambda d: [n for n in
+                               ((e.get("name") or e.get("model") or "")
+                                for e in (d.get("models") or [])) if n]
+            found["resident"] = names(_json_get(base + "/api/ps"))
+            found["served"] = (list(found["resident"])
+                               or names(_json_get(base + "/api/tags")))
+        else:
+            v1 = base if base.endswith("/v1") else base + "/v1"
+            ids = [m.get("id") for m in (_json_get(v1 + "/models").get("data") or [])]
+            ids = [i for i in ids if i]
+            found["resident"] = list(ids)
+            found["served"] = list(ids)
+    except Exception:
+        return found
+    _endpoint_cache[base] = found
+    return found
+
+
+def resolve_vlm_model(url, requested=None, refresh=False):
+    """The model name to send to `url`.
+
+    An explicit name is returned verbatim — pinning stays pinning, and pinning
+    is what you want when the endpoint serves several models and only one of
+    them has vision. "auto" (or nothing) asks the endpoint instead and takes
+    what it is serving, preferring a model that is already resident. When
+    discovery comes up empty the name passes through unchanged, so the failure
+    surfaces as the endpoint's own error rather than as a silent substitution.
+    """
+    name = (requested or "").strip()
+    if name and name.lower() != AUTO_MODEL:
+        return name
+    pool = vlm_endpoint_models(url, refresh=refresh)
+    pool = pool["resident"] or pool["served"]
+    if not pool:
+        return name or AUTO_MODEL
+    chosen, base = pool[0], url.rstrip("/")
+    if _announced.get(base) != chosen:
+        _announced[base] = chosen
+        extra = ", ".join(m for m in pool if m != chosen)
+        print(f"VLM auto-discovery: {base} is serving {chosen}"
+              + (f" (also available: {extra} — the first is used)" if extra else ""))
+    return chosen
+
+
+def forget_vlm_model(url):
+    """Drop the cached model list for `url` so the next resolve re-asks.
+
+    Called when a call fails: the usual reason a name that worked a minute ago
+    stops working is that the serving host came back on a different
+    checkpoint, and re-asking heals that in place instead of at the next
+    restart of this process.
+    """
+    _endpoint_cache.pop(url.rstrip("/"), None)
 
 
 KONTEXT_PROMPT_TIPS = (
@@ -306,6 +403,11 @@ def _ollama_chat(vlm_url, payload, api_key=None):
     OpenAI reply is reshaped into ollama's {"message": {"content": ...}} so
     every caller — and _chat_text's retry logic — stays dialect-agnostic."""
     base = vlm_url.rstrip("/")
+    # Resolved per call, so an "auto" model name follows whatever the endpoint
+    # is serving right now. Into a copy: _chat_text retries with the caller's
+    # payload, and a resolved name baked into it would outlive a
+    # forget_vlm_model() and defeat the retry.
+    payload = dict(payload, model=resolve_vlm_model(base, payload.get("model")))
     if vlm_dialect(base) == "ollama":
         return _post_json(base + "/api/chat", payload, api_key)
     if not base.endswith("/v1"):
@@ -317,8 +419,12 @@ def _ollama_chat(vlm_url, payload, api_key=None):
 
 
 def _chat_text(ollama_url, payload, api_key=None):
-    """Chat with retries for two ollama quirks: models that reject the
-    "think" flag (HTTP error → retry without it), and 200 replies with empty
+    """Chat with retries for three quirks: models that reject the "think"
+    flag (HTTP error → retry without it), a model name that has gone stale
+    because the serving host came back on a different checkpoint (same HTTP
+    error, a 404 → the discovered name is dropped and re-asked before the
+    retry, so a swap over there costs one failed request, not a restart here
+    and a config edit), and 200 replies with empty
     content — a request racing a model load/unload returns done_reason
     "load" (retried with a short wait until the load settles, which can take
     a while right after server startup while the warm-up pull runs), and a
@@ -329,6 +435,7 @@ def _chat_text(ollama_url, payload, api_key=None):
         resp = _ollama_chat(ollama_url, payload, api_key)
     except urllib.error.HTTPError:
         payload.pop("think", None)
+        forget_vlm_model(ollama_url)
         resp = _ollama_chat(ollama_url, payload, api_key)
     text = resp["message"]["content"]
     for _ in range(5):
@@ -827,9 +934,10 @@ def main():
     ap.add_argument("-n", "--iterations", type=int, default=5,
                     help="max iterations (default 5)")
     ap.add_argument("--server", default="http://127.0.0.1:2222")
-    ap.add_argument("--vlm", default=os.environ.get("CRITIQUE_MODEL", "qwen3.6:latest"),
-                    help="ollama vision model for critique, or 'none' "
-                         "(default: CRITIQUE_MODEL env or qwen3.6:latest)")
+    ap.add_argument("--vlm", default=os.environ.get("CRITIQUE_MODEL", AUTO_MODEL),
+                    help="vision model for critique, 'auto' to use whatever "
+                         "the endpoint is serving, or 'none' to skip the VLM "
+                         "(default: CRITIQUE_MODEL env or auto)")
     ap.add_argument("--ollama", default="http://127.0.0.1:11434",
                     help="ollama endpoint")
     ap.add_argument("--auto", action="store_true",
@@ -896,7 +1004,9 @@ def main():
 
         critique = None
         if use_vlm:
-            print(f"  asking {args.vlm} to compare input and output...")
+            # Resolved for the message too, so "auto" prints the real name.
+            print(f"  asking {resolve_vlm_model(args.ollama, args.vlm)} "
+                  "to compare input and output...")
             critique = vlm_critique(args.vlm, args.direction, prompt,
                                     reference, output, metrics, args.ollama,
                                     style=prompt_style, history=history)

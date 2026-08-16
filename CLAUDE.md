@@ -71,10 +71,19 @@ diffusers, transformers, flask, python-dotenv, huggingface_hub, requests.
   guided decoding. `vlm_dialect()` probes `/api/version` once per URL and
   caches the answer (`VLM_API=ollama|openai` forces it); `_openai_body()` does
   the translation, and the reply is reshaped back into ollama's envelope so
-  every caller stays dialect-agnostic. `CRITIQUE_MODEL`/`DESCRIBE_MODEL` must
-  name a model the endpoint serves. Serving the VLM off-box is the point of
-  this: it takes the vision model's VRAM off the generating card entirely,
-  which makes the note below moot for that setup (the status badge reads
+  every caller stays dialect-agnostic. `CRITIQUE_MODEL`/`DESCRIBE_MODEL` name
+  the model, and default to `auto` — `resolve_vlm_model()` asks the endpoint
+  what it serves (`/v1/models`, or ollama's `/api/ps` then `/api/tags`) and
+  takes the first, preferring a resident one, so restarting the serving host
+  on a different checkpoint doesn't need a config edit. The answer is cached
+  per URL, refreshed by the `/status` probe (so a swap is noticed within one
+  poll and the UI badge names the real model), and dropped by
+  `forget_vlm_model()` on any HTTP error, which makes `_chat_text`'s existing
+  retry re-discover in place. An explicit name still pins — do that when the
+  endpoint serves several models and only one has vision. Serving the VLM
+  off-box is the point of this: it takes the vision model's VRAM off the
+  generating card entirely, which makes the note below moot for that setup
+  (the status badge reads
   `/v1/models` instead of `/api/ps`, and startup warm-up is skipped — a remote
   server owns its own residency).
 - **VLM VRAM**: a *local* ollama vision model (critique/describe/boost) competes
@@ -123,7 +132,11 @@ diffusers, transformers, flask, python-dotenv, huggingface_hub, requests.
   `.multi_run.json`, not memory: `_multi_run_advance()` — called on
   model-ready and after every finished job — queues the current config's job,
   restarts into the next config once the queue is idle, or marks the run
-  finished. Text-to-image only.
+  finished. Text-to-image only. Both endings go through `_multi_run_finish()`,
+  which tiles the run's images into a `_multi_run_grid.png` comparison sheet
+  (each cell captioned with the model that made it) and records its filename as
+  `composite` on the run state, so a canceled run still gets a sheet of the
+  models that did finish.
 - **Performance**: batch jobs pre-encode the prompt once
   (`encode_prompt_once` → `prompt_embeds_kwargs`) instead of re-running the
   LLM-sized FLUX.2 encoders per image; LoRAs are fused after loading
