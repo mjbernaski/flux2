@@ -17,7 +17,8 @@ from datetime import datetime
 from typing import Optional
 import random
 import uuid
-from flask import Flask, request, jsonify, send_from_directory, Response, stream_with_context
+from flask import (Flask, request, jsonify, send_from_directory, Response,
+                   stream_with_context, has_request_context)
 from PIL import Image, ImageDraw, ImageFont
 from dotenv import load_dotenv
 
@@ -134,6 +135,70 @@ PORT = 2222
 
 # Ensure output directory exists
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Hidden mode. A generation made with `hidden` set writes everything it
+# produces — images, .prompt sidecars, composites, previews, saved step frames
+# — into this dot-subdir of OUTPUT_DIR instead of alongside the rest. That
+# keeps it out of every listing in this file (they all iterate top-level files
+# only), out of the reference-image folder browser (which skips dotfiles), and
+# out of image_manager.py's gallery, so the output exists on disk without
+# appearing anywhere by default. Concealment, not security: anyone holding the
+# API key can ask for the hidden listing, and the files are plain PNGs.
+HIDDEN_DIR_NAME = ".hidden"
+HIDDEN_PREFIX = HIDDEN_DIR_NAME + "/"
+# The web UI sends this header on every request while its hidden toggle is on,
+# so one switch in the browser puts generate/status/history/archive/delete in
+# the same mode without threading a flag through each of them. An explicit
+# `hidden` field in a request body or query string still wins over it.
+HIDDEN_HEADER = "X-Flux-Hidden"
+_TRUTHY = ('1', 'true', 'yes', 'on')
+
+
+def _output_dir(hidden=False):
+    """Where a job's artifacts get written: OUTPUT_DIR, or its hidden subdir."""
+    if not hidden:
+        return OUTPUT_DIR
+    path = os.path.join(OUTPUT_DIR, HIDDEN_DIR_NAME)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _output_name(filename, hidden=False):
+    """The name a hidden artifact is known by outside the server.
+
+    Hidden output carries the `.hidden/` prefix in every filename it reports,
+    so /images/, delete, save and use-as-reference keep working off a single
+    identifier instead of needing a parallel flag beside every filename.
+    """
+    return (HIDDEN_PREFIX + filename) if hidden else filename
+
+
+def _resolve_output_name(name):
+    """Validate a client-supplied output filename and return its full path.
+
+    A leading `.hidden/` is the only path component accepted; everything after
+    it must be a bare filename, which is what keeps this inside OUTPUT_DIR.
+    """
+    if not name or not isinstance(name, str) or '\\' in name or not name.endswith('.png'):
+        raise ApiError('Invalid filename', 400, 'invalid_request')
+    bare = name[len(HIDDEN_PREFIX):] if name.startswith(HIDDEN_PREFIX) else name
+    if '/' in bare or bare.startswith('.'):
+        raise ApiError('Invalid filename', 400, 'invalid_request')
+    return os.path.join(OUTPUT_DIR, name)
+
+
+def _hidden_requested(explicit=None):
+    """Whether this request is in hidden mode.
+
+    An explicit `hidden` value from the caller decides; otherwise the UI's
+    session header does. Outside a request (the queue worker advancing a
+    multi-model run) there is no header, so the answer is no.
+    """
+    if explicit is not None:
+        return bool(explicit) and str(explicit).strip().lower() not in ('0', 'false', 'no', '')
+    if has_request_context():
+        return request.headers.get(HIDDEN_HEADER, '').strip().lower() in _TRUTHY
+    return False
 
 # Queue configuration
 QUEUE_MAX_SIZE = 10
@@ -343,6 +408,12 @@ class Job:
     @property
     def prompt(self) -> str:
         return (self.params.get('prompt') or '').strip()
+
+    @property
+    def hidden(self) -> bool:
+        """True when this job's output belongs in OUTPUT_DIR/.hidden/ and the
+        job itself should stay out of listings a non-hidden client asks for."""
+        return bool(self.params.get('hidden', False))
 
     def summary(self) -> dict:
         p = self.prompt
@@ -572,7 +643,7 @@ _expansions = {}  # expansion id -> group state, dropped once the sheet is built
 EXPANSION_GROUP_TTL = 6 * 3600  # abandoned groups (restart mid-run) expire
 
 
-def _expansion_register(exp_id, total, source_prompt):
+def _expansion_register(exp_id, total, source_prompt, hidden=False):
     with _expansion_lock:
         # A supervised restart strands whatever was in flight; don't let those
         # groups accumulate for the life of the process.
@@ -580,7 +651,8 @@ def _expansion_register(exp_id, total, source_prompt):
         for dead in [k for k, g in _expansions.items() if g['created'] < cutoff]:
             del _expansions[dead]
         _expansions[exp_id] = {'total': total, 'done': 0, 'cells': [],
-                               'prompt': source_prompt, 'created': time.time()}
+                               'prompt': source_prompt, 'created': time.time(),
+                               'hidden': hidden}
 
 
 def _expansion_record(job):
@@ -651,8 +723,9 @@ def _build_expansion_composite(group):
     composite = _build_composite_grid(grid_cells, cell_width, cell_height)
 
     stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    hidden = bool(group.get('hidden'))
     comp_filename = f"{_output_prefix()}_{stamp}_expansion_grid.png"
-    comp_path = os.path.join(OUTPUT_DIR, comp_filename)
+    comp_path = os.path.join(_output_dir(hidden), comp_filename)
     composite.save(comp_path)
 
     # Sidecar: `# Prompt:` stays first-class for image_manager.py, with the
@@ -664,12 +737,17 @@ def _build_expansion_composite(group):
         for seq, (_index, filename, text) in enumerate(cells, start=1):
             f.write(f"#   {seq}. {text} [{filename}]\n")
     print(f"[expansion] wrote {comp_filename} ({len(thumbs)} cells)", flush=True)
-    return comp_filename
+    return _output_name(comp_filename, hidden)
 
 
 def _run_job(job: Job):
     """Execute one generation job, writing progress/results into the Job object."""
     data = job.params
+    # Hidden mode: everything this job writes lands in OUTPUT_DIR/.hidden/, and
+    # every name it reports back carries the prefix, so the client can still
+    # fetch, reuse and delete its output by filename.
+    hidden = job.hidden
+    out_dir = _output_dir(hidden)
     prompt = (data.get('prompt') or '').strip()
     orientation = data.get('orientation', 'landscape')
     size = data.get('size', '1mp')
@@ -776,7 +854,7 @@ def _run_job(job: Job):
     # only iterate top-level files). Requires show_preview: the frames ARE the
     # preview decodes.
     save_previews = show_preview and bool(data.get('save_previews', False))
-    steps_dir = os.path.join(OUTPUT_DIR, 'steps')
+    steps_dir = os.path.join(out_dir, 'steps')
     preview_state = {"last_decode": 0.0}
 
     def _check_cancel():
@@ -811,8 +889,8 @@ def _run_job(job: Job):
                 )
                 if preview_img is not None:
                     try:
-                        preview_img.save(os.path.join(OUTPUT_DIR, PREVIEW_FILENAME))
-                        job.preview = PREVIEW_FILENAME
+                        preview_img.save(os.path.join(out_dir, PREVIEW_FILENAME))
+                        job.preview = _output_name(PREVIEW_FILENAME, hidden)
                         job.preview_step = step_index + 1
                         job.preview_ts = int(time.time() * 1000)
                         preview_state["last_decode"] = now
@@ -881,13 +959,13 @@ def _run_job(job: Job):
                 g_str = str(g_val).replace('.', '_')
                 s_str = f"str_{s_val}" if s_val is not None else "txt2img"
                 output_filename = f"{_output_prefix()}_{timestamp}_g{g_str}_{s_str}_{unique_id}.png"
-                output_path = os.path.join(OUTPUT_DIR, output_filename)
+                output_path = os.path.join(out_dir, output_filename)
                 image.save(output_path)
                 timings['save'] = time.perf_counter() - t_save
                 save_prompt_file(output_path, prompt, prompt, width, height, used_seed, steps, timings, g_val, s_val if input_image else None)
-                
+
                 img_data = {
-                    "filename": output_filename,
+                    "filename": _output_name(output_filename, hidden),
                     "seed": used_seed,
                     "guidance": g_val,
                     "strength": s_val,
@@ -907,8 +985,8 @@ def _run_job(job: Job):
         composite = _build_composite_grid(grid_cells, cell_width, cell_height)
 
         comp_filename = f"{_output_prefix()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_spectrum_grid.png"
-        composite.save(os.path.join(OUTPUT_DIR, comp_filename))
-        job.composite = comp_filename
+        composite.save(os.path.join(out_dir, comp_filename))
+        job.composite = _output_name(comp_filename, hidden)
     else:
         # For batch > 1, collect a small thumbnail per image (not the full-res
         # frame, to avoid holding many full images in memory at once) so a
@@ -934,13 +1012,13 @@ def _run_job(job: Job):
 
             t_save = time.perf_counter()
             output_filename = f"{_output_prefix()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.png"
-            output_path = os.path.join(OUTPUT_DIR, output_filename)
+            output_path = os.path.join(out_dir, output_filename)
             image.save(output_path)
             timings['save'] = time.perf_counter() - t_save
             save_prompt_file(output_path, prompt, prompt, width, height, used_seed, steps, timings, guidance_scale, None if mask_image is not None else (strength if input_image else None))
 
             img_data = {
-                'filename': output_filename,
+                'filename': _output_name(output_filename, hidden),
                 'seed': used_seed,
                 'guidance': guidance_scale,
                 'strength': None if mask_image is not None else (strength if input_image else None),
@@ -967,8 +1045,8 @@ def _run_job(job: Job):
             ]
             composite = _build_composite_grid(grid_cells, cell_width, cell_height)
             comp_filename = f"{_output_prefix()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_batch_grid.png"
-            composite.save(os.path.join(OUTPUT_DIR, comp_filename))
-            job.composite = comp_filename
+            composite.save(os.path.join(out_dir, comp_filename))
+            job.composite = _output_name(comp_filename, hidden)
 
     job.generation_time = time.perf_counter() - start_time
 
@@ -1473,6 +1551,11 @@ def _validate_generate_params(data):
     valid. Doing this at the API boundary means bad input fails fast with a
     clear message instead of surfacing later as an opaque failed job.
     """
+    # Hidden mode is a property of the request, not of the model call: it only
+    # decides where the output lands and who gets told about it. Normalizing it
+    # here means both API dialects and the queue see one boolean.
+    data['hidden'] = _hidden_requested(data.get('hidden'))
+
     try:
         data['steps'] = int(data.get('steps', 25))
     except (TypeError, ValueError):
@@ -1621,7 +1704,8 @@ def _api_enqueue_generation(data):
             # reasoning (and same default) as a multi-model run.
             if data.get('seed') is None and data.get('expansion_same_seed', True):
                 data['seed'] = random.randint(0, 2**32 - 1)
-            _expansion_register(exp_id, len(prompts), prompt)
+            _expansion_register(exp_id, len(prompts), prompt,
+                                hidden=bool(data.get('hidden')))
         queued = []
         for index, text in enumerate(prompts, start=1):
             # One params dict per job so each carries its own prompt; the
@@ -1685,24 +1769,40 @@ def _api_cancel_job(job_id):
 
 
 def _api_list_step_frames(job_id):
-    """A job's saved preview frames, in image/step order, as /images/ paths."""
+    """A job's saved preview frames, in image/step order, as /images/ paths.
+
+    Both steps/ dirs are scanned: the job that wrote the frames may have been
+    a hidden one, and the caller only has its id to go on."""
     if not job_id.isalnum():
         raise ApiError('invalid job id', 400, 'invalid_request')
-    try:
-        names = sorted(f for f in os.listdir(os.path.join(OUTPUT_DIR, 'steps'))
-                       if f.startswith(job_id + '_') and f.endswith('.png'))
-    except FileNotFoundError:
-        names = []
-    return ['steps/' + n for n in names]
+    paths = []
+    for hidden in (False, True):
+        prefix = _output_name('steps/', hidden)
+        try:
+            names = sorted(f for f in os.listdir(os.path.join(OUTPUT_DIR, prefix))
+                           if f.startswith(job_id + '_') and f.endswith('.png'))
+        except FileNotFoundError:
+            continue
+        paths.extend(prefix + n for n in names)
+    return paths
 
 
-def _api_queue_snapshot():
-    """Running job, pending queue, and recently-finished jobs in one lock hold."""
+def _api_queue_snapshot(include_hidden=False):
+    """Running job, pending queue, and recently-finished jobs in one lock hold.
+
+    Hidden jobs are omitted entirely unless the caller asks for them: their
+    prompts and images are the whole point of the mode, and a second browser
+    tab polling /status is exactly where they would otherwise surface."""
+    def _visible(jobs):
+        return jobs if include_hidden else [j for j in jobs if not j.hidden]
+
     with _queue_cv:
+        running = _running_job if (include_hidden or not _running_job or
+                                   not _running_job.hidden) else None
         return {
-            'running': _running_job.full() if _running_job else None,
-            'queued': [j.summary() for j in _pending],
-            'recent_done': [j.full() for j in _recent_done],
+            'running': running.full() if running else None,
+            'queued': [j.summary() for j in _visible(_pending)],
+            'recent_done': [j.full() for j in _visible(_recent_done)],
         }
 
 
@@ -1786,16 +1886,19 @@ def _recent_image_entry(job, img):
     }
 
 
-def _recent_images_locked(limit=RECENT_IMAGES_MAX):
+def _recent_images_locked(limit=RECENT_IMAGES_MAX, include_hidden=False):
     """The last `limit` finished images, newest first. Caller holds _queue_cv.
 
     The running job leads: the batch members it has already written are on
     disk and final, even though the job itself isn't done. _recent_done is
     newest-job-first, but a job appends its images in generation order, so
-    each job's own list is walked backwards.
+    each job's own list is walked backwards. Hidden jobs are skipped unless
+    asked for — /queue.html is a page anyone with the key can leave open.
     """
     out = []
     for job in ([_running_job] if _running_job else []) + _recent_done:
+        if job.hidden and not include_hidden:
+            continue
         for img in reversed(job.images):
             if img.get('filename'):
                 out.append(_recent_image_entry(job, img))
@@ -1804,7 +1907,7 @@ def _recent_images_locked(limit=RECENT_IMAGES_MAX):
     return out
 
 
-def _api_queue_view():
+def _api_queue_view(include_hidden=False):
     """Queue-centric view: what is generating now, what is waiting and in what
     order, how much room is left, how long the backlog is likely to take, and
     the last few images that came out.
@@ -1815,13 +1918,29 @@ def _api_queue_view():
     position and the queue carries a wait estimate.
     """
     with _queue_cv:
-        running = _running_job.full() if _running_job else None
+        # Hidden jobs are dropped from `running`/`waiting` — their prompts are
+        # the thing being concealed — but the counts below still include them.
+        # A queue that claims to be accepting and then answers queue_full would
+        # be a bug in the client's face; depth is a number, not content.
+        shown_running = (_running_job if (_running_job and
+                         (include_hidden or not _running_job.hidden)) else None)
+        running = shown_running.full() if shown_running else None
         waiting = []
         for position, job in enumerate(_pending, start=1):
+            if job.hidden and not include_hidden:
+                continue
             entry = job.summary()
             entry['position'] = position
             waiting.append(entry)
-        recent_images = _recent_images_locked()
+        depth = len(_pending)
+        busy = _running_job is not None or bool(_pending)
+        # Images still to produce: everything queued, plus whatever is left of
+        # the running job's batch.
+        images_ahead = sum(int(j.params.get('batch') or 1) for j in _pending)
+        if _running_job:
+            images_ahead += max(0, int(_running_job.params.get('batch') or 1)
+                                - int(_running_job.current or 0))
+        recent_images = _recent_images_locked(include_hidden=include_hidden)
         # Only completed jobs carry a trustworthy duration; canceled ones
         # stopped early and would bias the estimate downward.
         samples = [(j.generation_time, len(j.images)) for j in _recent_done
@@ -1829,21 +1948,15 @@ def _api_queue_view():
 
     per_image = (sum(t / n for t, n in samples) / len(samples)) if samples else None
 
-    # Images still to produce: everything queued, plus whatever is left of the
-    # running job's batch.
-    images_ahead = sum(int(j.get('batch') or 1) for j in waiting)
-    if running:
-        images_ahead += max(0, int(running.get('batch') or 1) - int(running.get('current') or 0))
-
     return {
         'running': running,
         'waiting': waiting,
-        'depth': len(waiting),
+        'depth': depth,
         'capacity': QUEUE_MAX_SIZE,
         # The running job does not occupy a pending slot, so a full queue can
         # still have one job generating.
-        'accepting': len(waiting) < QUEUE_MAX_SIZE,
-        'busy': running is not None or bool(waiting),
+        'accepting': depth < QUEUE_MAX_SIZE,
+        'busy': busy,
         'images_pending': images_ahead,
         'seconds_per_image': round(per_image, 2) if per_image else None,
         'estimated_wait_s': round(per_image * images_ahead, 1) if per_image else None,
@@ -1890,7 +2003,7 @@ def serve_image(filename):
 
 @app.route('/status')
 def status():
-    snapshot = _api_queue_snapshot()
+    snapshot = _api_queue_snapshot(_hidden_requested(request.args.get('hidden')))
     snapshot.update({
         'queue_max_size': QUEUE_MAX_SIZE,
         'power_w': _gpu_power_watts(),
@@ -2297,13 +2410,16 @@ def _api_start_critique(data):
     job id to poll; raises ApiError on bad input."""
     direction = (data.get('direction') or '').strip()
     prompt = (data.get('prompt') or direction).strip()
-    out_filename = os.path.basename(data.get('output_filename') or '')
+    raw_out = data.get('output_filename') or ''
+    # A hidden-mode image is named `.hidden/<file>`; every other name is
+    # reduced to its basename, as before.
+    out_filename = raw_out if raw_out.startswith(HIDDEN_PREFIX) else os.path.basename(raw_out)
     ref_b64 = data.get('ref_image') or ''
     if not direction or not out_filename or not ref_b64:
         raise ApiError('direction, ref_image, and output_filename are required',
                        400, 'invalid_request')
 
-    out_path = os.path.join(OUTPUT_DIR, out_filename)
+    out_path = _resolve_output_name(out_filename)
     if not os.path.exists(out_path):
         raise ApiError(f'unknown output image {out_filename}', 404, 'not_found')
     try:
@@ -2851,10 +2967,15 @@ def loop_strip():
 
 def _api_build_loop_strip(data):
     """Preserve an edit loop's iterations in .saved and compose the film strip.
-    Returns {filename, kept}."""
+    Returns {filename, kept}. A loop run in hidden mode keeps both the
+    preserved copies and the strip inside .hidden/."""
     from edit_loop import build_film_strip
 
-    filenames = [os.path.basename(f or '') for f in (data.get('filenames') or [])]
+    hidden = _hidden_requested(data.get('hidden'))
+    # Only the `.hidden/` prefix survives normalization; anything else is
+    # reduced to a bare name, as it always was.
+    filenames = [f if (f or '').startswith(HIDDEN_PREFIX) else os.path.basename(f or '')
+                 for f in (data.get('filenames') or [])]
     filenames = [f for f in filenames if f.endswith('.png')]
     if not filenames:
         raise ApiError('filenames is required', 400, 'invalid_request')
@@ -2871,55 +2992,61 @@ def _api_build_loop_strip(data):
         except Exception:
             raise ApiError('ref_image is not a decodable base64 image', 400, 'invalid_request')
 
-    saved_dir = os.path.join(OUTPUT_DIR, '.saved')
+    out_dir = _output_dir(hidden)
+    saved_dir = os.path.join(out_dir, '.saved')
     os.makedirs(saved_dir, exist_ok=True)
     for i, fn in enumerate(filenames, start=1):
-        path = os.path.join(OUTPUT_DIR, fn)
+        path = _resolve_output_name(fn)
         if not os.path.isfile(path):
             raise ApiError(f'unknown image {fn}', 404, 'not_found')
+        name = os.path.basename(fn)
         frames.append((str(i), Image.open(path).convert('RGB')))
-        shutil.copy2(path, os.path.join(saved_dir, fn))
-        sidecar = fn.rsplit('.', 1)[0] + '.prompt'
-        if os.path.isfile(os.path.join(OUTPUT_DIR, sidecar)):
-            shutil.copy2(os.path.join(OUTPUT_DIR, sidecar), os.path.join(saved_dir, sidecar))
+        shutil.copy2(path, os.path.join(saved_dir, name))
+        sidecar = name.rsplit('.', 1)[0] + '.prompt'
+        src_sidecar = os.path.join(os.path.dirname(path), sidecar)
+        if os.path.isfile(src_sidecar):
+            shutil.copy2(src_sidecar, os.path.join(saved_dir, sidecar))
 
     strip = build_film_strip(frames)
     strip_name = f"{_output_prefix()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_editloop_strip.png"
-    strip.save(os.path.join(OUTPUT_DIR, strip_name))
-    sidecar_path = os.path.join(OUTPUT_DIR, strip_name.rsplit('.', 1)[0] + '.prompt')
+    strip_path = os.path.join(out_dir, strip_name)
+    strip.save(strip_path)
+    sidecar_path = os.path.join(out_dir, strip_name.rsplit('.', 1)[0] + '.prompt')
     with open(sidecar_path, 'w') as f:
         f.write(f"# Prompt: Edit loop film strip: {direction}\n")
         for i, fn in enumerate(filenames):
             p = prompts[i] if i < len(prompts) else ''
             f.write(f"# Iteration {i + 1}: {fn} — {p}\n")
     # The strip itself survives housekeeping too.
-    shutil.copy2(os.path.join(OUTPUT_DIR, strip_name), os.path.join(saved_dir, strip_name))
+    shutil.copy2(strip_path, os.path.join(saved_dir, strip_name))
     shutil.copy2(sidecar_path, os.path.join(saved_dir, os.path.basename(sidecar_path)))
 
-    return {'filename': strip_name, 'kept': filenames}
+    return {'filename': _output_name(strip_name, hidden), 'kept': filenames}
 
 
 @app.route('/history')
 def history():
     """Return today's generated images, newest first."""
-    return jsonify({'images': _api_history()})
+    return jsonify({'images': _api_history(_hidden_requested(request.args.get('hidden')))})
 
 
-def _api_history():
+def _api_history(hidden=False):
     """Today's top-level generated PNGs, newest first, each with the prompt
     read from its .prompt sidecar. Read errors are logged, not raised — a
-    listing is best-effort."""
+    listing is best-effort. `hidden` lists the .hidden subdir instead, which is
+    the only way its contents ever reach a client."""
     today = datetime.now().strftime("%Y%m%d")
+    source_dir = _output_dir(hidden)
     images = []
     try:
-        for filename in os.listdir(OUTPUT_DIR):
+        for filename in os.listdir(source_dir):
             if not filename.endswith('.png'): continue
             parts = filename.split('_')
             if len(parts) >= 3 and parts[1] == today:
                 time_str = parts[2]
                 display_time = f"{time_str[:2]}:{time_str[2:4]}:{time_str[4:6]}" if len(time_str) == 6 else time_str
                 prompt = None
-                prompt_file = os.path.join(OUTPUT_DIR, filename.rsplit('.', 1)[0] + '.prompt')
+                prompt_file = os.path.join(source_dir, filename.rsplit('.', 1)[0] + '.prompt')
                 if os.path.exists(prompt_file):
                     try:
                         with open(prompt_file, 'r') as f:
@@ -2928,7 +3055,7 @@ def _api_history():
                                     prompt = line[10:].strip()
                                     break
                     except Exception: pass
-                images.append({'filename': filename, 'time': display_time, 'prompt': prompt, 'sort_key': parts[2] if len(parts) >= 3 else '000000'})
+                images.append({'filename': _output_name(filename, hidden), 'time': display_time, 'prompt': prompt, 'sort_key': parts[2] if len(parts) >= 3 else '000000'})
         images.sort(key=lambda x: x['sort_key'], reverse=True)
         for img in images: del img['sort_key']
     except Exception as e:
@@ -2939,7 +3066,8 @@ def _api_history():
 @app.route('/archive', methods=['POST'])
 def archive_today():
     try:
-        moved = _api_archive_today()
+        moved = _api_archive_today(
+            _hidden_requested((request.get_json(silent=True) or {}).get('hidden')))
     except ApiError as e:
         # Legacy quirk preserved: this route has always answered 200 with
         # success:false on an I/O failure. The REST layer returns a real 500.
@@ -2947,16 +3075,18 @@ def archive_today():
     return jsonify({'success': True, 'moved': moved})
 
 
-def _api_archive_today():
+def _api_archive_today(hidden=False):
     """Move today's top-level files into web-generated/archive/. Returns the
-    number moved."""
+    number moved. In hidden mode both sides stay inside .hidden/ — archiving
+    must not lift concealed output into the visible tree."""
     today = datetime.now().strftime("%Y%m%d")
-    archive_dir = os.path.join(OUTPUT_DIR, "archive")
+    source_dir = _output_dir(hidden)
+    archive_dir = os.path.join(source_dir, "archive")
     os.makedirs(archive_dir, exist_ok=True)
     moved = 0
     try:
-        for filename in os.listdir(OUTPUT_DIR):
-            filepath = os.path.join(OUTPUT_DIR, filename)
+        for filename in os.listdir(source_dir):
+            filepath = os.path.join(source_dir, filename)
             if not os.path.isfile(filepath): continue
             parts = filename.split('_')
             if len(parts) >= 3 and parts[1] == today:
@@ -2974,8 +3104,10 @@ def delete_today():
     If a single filename is provided in the JSON body, only that image (and its
     sidecar .prompt) is deleted. Otherwise all of today's files are removed.
     """
+    body = request.get_json(silent=True) or {}
     try:
-        deleted = _api_delete_today((request.get_json(silent=True) or {}).get('filename'))
+        deleted = _api_delete_today(body.get('filename'),
+                                    _hidden_requested(body.get('hidden')))
     except ApiError as e:
         if e.status == 500:
             # Legacy quirk preserved: I/O failures answered 200 here.
@@ -2984,35 +3116,36 @@ def delete_today():
     return jsonify({'success': True, 'deleted': deleted})
 
 
-def _api_delete_today(target=None):
+def _api_delete_today(target=None, hidden=False):
     """Permanently delete one of today's images (plus its sidecar), or all of
-    today's files when `target` is None. Returns the count of files removed."""
+    today's files when `target` is None. Returns the count of files removed.
+    A `.hidden/`-prefixed target deletes from the hidden subdir; `hidden`
+    scopes the delete-everything case to it."""
     today = datetime.now().strftime("%Y%m%d")
     deleted = 0
 
-    def _remove_pair(png_name):
+    def _remove_pair(png_path):
         nonlocal deleted
-        png_path = os.path.join(OUTPUT_DIR, png_name)
         if os.path.isfile(png_path):
             os.remove(png_path)
             deleted += 1
-        prompt_path = os.path.join(OUTPUT_DIR, png_name.rsplit('.', 1)[0] + '.prompt')
+        prompt_path = png_path.rsplit('.', 1)[0] + '.prompt'
         if os.path.isfile(prompt_path):
             os.remove(prompt_path)
 
     if target:
         # Guard against path traversal and ensure it's a today image
-        if '/' in target or '\\' in target or not target.endswith('.png'):
-            raise ApiError('Invalid filename', 400, 'invalid_request')
-        parts = target.split('_')
+        target_path = _resolve_output_name(target)
+        parts = os.path.basename(target).split('_')
         if len(parts) < 3 or parts[1] != today:
             raise ApiError('Not a today image', 400, 'invalid_request')
     try:
         if target:
-            _remove_pair(target)
+            _remove_pair(target_path)
         else:
-            for filename in os.listdir(OUTPUT_DIR):
-                filepath = os.path.join(OUTPUT_DIR, filename)
+            source_dir = _output_dir(hidden)
+            for filename in os.listdir(source_dir):
+                filepath = os.path.join(source_dir, filename)
                 if not os.path.isfile(filepath): continue
                 parts = filename.split('_')
                 if len(parts) >= 3 and parts[1] == today:
@@ -3040,20 +3173,19 @@ def save_hidden():
 
 def _api_save_hidden(target):
     """Copy an output image and its sidecar into .saved/, out of reach of
-    archive and delete-today. Returns the filename."""
-    if not target or '/' in target or '\\' in target or not target.endswith('.png'):
-        raise ApiError('Invalid filename', 400, 'invalid_request')
-
-    src = os.path.join(OUTPUT_DIR, target)
+    archive and delete-today. Returns the filename. A hidden image is saved
+    into .hidden/.saved/ — surviving housekeeping must not mean surfacing."""
+    src = _resolve_output_name(target)
     if not os.path.isfile(src):
         raise ApiError('File not found', 404, 'not_found')
 
-    saved_dir = os.path.join(OUTPUT_DIR, '.saved')
+    name = os.path.basename(target)
+    saved_dir = os.path.join(os.path.dirname(src), '.saved')
     os.makedirs(saved_dir, exist_ok=True)
     try:
-        shutil.copy2(src, os.path.join(saved_dir, target))
-        sidecar = target.rsplit('.', 1)[0] + '.prompt'
-        src_sidecar = os.path.join(OUTPUT_DIR, sidecar)
+        shutil.copy2(src, os.path.join(saved_dir, name))
+        sidecar = name.rsplit('.', 1)[0] + '.prompt'
+        src_sidecar = os.path.join(os.path.dirname(src), sidecar)
         if os.path.isfile(src_sidecar):
             shutil.copy2(src_sidecar, os.path.join(saved_dir, sidecar))
     except Exception as e:

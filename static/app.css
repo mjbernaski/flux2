@@ -8,7 +8,11 @@ body {
     background: #1a1a2e;
     color: #eee;
 }
-h1 { color: #00d4ff; margin-bottom: 5px; }
+h1 { color: #00d4ff; margin-bottom: 5px; -webkit-user-select: none; user-select: none; }
+/* Hidden mode (see app.js): the only tell on the page, and deliberately a
+   quiet one — a shift in the title's colour reads as a theme detail, not as a
+   mode anyone would go looking for. */
+body.hidden-mode h1 { color: #8a7fd4; }
 .header-info { display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px; }
 .model-hover { position: fixed; top: env(safe-area-inset-top, 0); left: 0; width: 60px; height: 60px; z-index: 1000; }
 .model-hover-name {

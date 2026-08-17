@@ -155,6 +155,26 @@ diffusers, transformers, flask, python-dotenv, huggingface_hub, requests.
   queue worker's `finally`, and reset on restart, which means they are
   per-config totals (a model switch is a restart). Post failures are non-fatal
   and logged once. `NOTE_URL=off` disables it.
+- **Hidden mode**: `hidden: true` on a generation request sends everything the
+  job writes — images, `.prompt` sidecars, composites, the live preview, saved
+  step frames — to `web-generated/.hidden/` (`_output_dir`), and the job's
+  filenames come back prefixed with `.hidden/` (`_output_name`) so `/images/`,
+  delete, save and use-as-reference keep working off one identifier;
+  `_resolve_output_name` is the single validator that accepts that prefix and
+  nothing else that traverses. Hidden jobs are also dropped from
+  `_api_queue_snapshot`, `_api_queue_view` and `_recent_images_locked` unless
+  the caller asks for them, so a second tab or the shared `/api/v1/queue.html`
+  never shows them (queue *counts* stay honest — `accepting` must not lie).
+  Callers opt in per request (`hidden` field, or `?hidden=1` on `/history`,
+  `/status`, `/archive`, `/delete`) or per session via the `X-Flux-Hidden`
+  header, which `_hidden_requested` reads; the web UI sends that header from
+  `getAuthHeaders`, so one switch covers every call it makes. The UI toggle is
+  five clicks on the `<h1>` inside two seconds — deliberately undiscoverable,
+  session-only (no localStorage, no URL state), with the title's color as the
+  only tell. It is concealment, not security: the API key still reaches
+  everything. The reference-image folder browser skips dotfiles and
+  `image_manager.py`'s folder tree skips `.hidden` by name, which is what keeps
+  the directory out of sight in the other two UIs.
 - **Output convention**: `flux{1|2}_{YYYYMMDD_HHMMSS}_{8hex}.png` plus a
   `.prompt` sidecar with the generation metadata, in `web-generated/` (server)
   or the CWD (CLI). `image_manager.py` parses the `# Prompt:` sidecar line —

@@ -116,6 +116,103 @@ def _check_expansion_composite():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _check_hidden_mode(client):
+    """Hidden mode: output written to .hidden/, invisible to a normal client.
+
+    Exercised without a GPU by writing files where a hidden job would have left
+    them and asking both API dialects what they can see.
+    """
+    tmp = tempfile.mkdtemp(prefix='flux-hidden-test-')
+    real_output = ws.OUTPUT_DIR
+    ws.OUTPUT_DIR = tmp
+    today = ws.datetime.now().strftime('%Y%m%d')
+    try:
+        plain = f'flux2_{today}_101010_aaaaaaaa.png'
+        secret = f'flux2_{today}_202020_bbbbbbbb.png'
+        ws.Image.new('RGB', (16, 16), (10, 10, 10)).save(os.path.join(tmp, plain))
+        hidden_dir = ws._output_dir(True)
+        ws.Image.new('RGB', (16, 16), (200, 10, 10)).save(os.path.join(hidden_dir, secret))
+        check('a hidden generation writes into web-generated/.hidden/',
+              os.path.basename(hidden_dir) == '.hidden' and os.path.isdir(hidden_dir))
+
+        listed = [i['filename'] for i in ws._api_history()]
+        check('the normal listing never shows hidden output',
+              listed == [plain], f"got {listed}")
+        listed = [i['filename'] for i in ws._api_history(True)]
+        check('the hidden listing shows it, prefixed with .hidden/',
+              listed == ['.hidden/' + secret], f"got {listed}")
+
+        r = client.get(f'{PREFIX}/images', headers=AUTH)
+        names = [i['filename'] for i in (r.get_json() or {}).get('images', [])]
+        check('GET /images stays on the visible side by default',
+              names == [plain], f"got {names}")
+        r = client.get(f'{PREFIX}/images?hidden=1', headers=AUTH)
+        names = [i['filename'] for i in (r.get_json() or {}).get('images', [])]
+        check('GET /images?hidden=1 opts in', names == ['.hidden/' + secret], f"got {names}")
+        r = client.get(f'{PREFIX}/images', headers=dict(AUTH, **{'X-Flux-Hidden': '1'}))
+        names = [i['filename'] for i in (r.get_json() or {}).get('images', [])]
+        check("the UI's session header opts in the same way",
+              names == ['.hidden/' + secret], f"got {names}")
+
+        r = client.get(f'/images/.hidden/{secret}')
+        served = (r.status_code, len(r.get_data()))
+        r.close()  # Windows won't unlink a file the response still holds open.
+        check('a hidden image is still servable by its prefixed name',
+              served[0] == 200 and served[1] > 0, f"got {served}")
+
+        # The prefix is the only path component the name resolver accepts.
+        refused = []
+        for bad in ('../../etc/passwd', '.hidden/../../etc/passwd', 'steps/x.png',
+                    '.saved/x.png', '.hidden/.saved/x.png'):
+            try:
+                ws._resolve_output_name(bad)
+            except ws.ApiError as e:
+                refused.append(e.status == 400)
+            else:
+                refused.append(False)
+        check('the name resolver accepts .hidden/ and nothing else that traverses',
+              all(refused), f"got {refused}")
+
+        # Housekeeping stays inside whichever side asked for it.
+        ws._api_delete_today(None)
+        check('delete-today leaves hidden output alone',
+              os.path.isfile(os.path.join(hidden_dir, secret))
+              and not os.path.isfile(os.path.join(tmp, plain)))
+        ws._api_delete_today('.hidden/' + secret)
+        check('a hidden image can be deleted by its prefixed name',
+              not os.path.isfile(os.path.join(hidden_dir, secret)))
+
+        # Queue visibility: the prompt is the thing being concealed.
+        job = ws.Job(id='hiddenjob01', params={'prompt': 'a secret', 'hidden': True},
+                     submitted_at=0.0)
+        job.state = 'done'
+        job.images = [{'filename': '.hidden/' + secret}]
+        ws._recent_done.insert(0, job)
+        snap = ws._api_queue_snapshot()
+        check('a hidden job is absent from the default queue snapshot',
+              not snap['recent_done'], f"got {snap['recent_done']}")
+        snap = ws._api_queue_snapshot(True)
+        check('asking for hidden jobs returns them',
+              [j['id'] for j in snap['recent_done']] == ['hiddenjob01'])
+        view = ws._api_queue_view()
+        check('the shared queue view lists no hidden images',
+              not view['recent_images'], f"got {view['recent_images']}")
+
+        ws._pending.append(ws.Job(id='hiddenjob02',
+                                  params={'prompt': 'another secret', 'hidden': True},
+                                  submitted_at=0.0))
+        view = ws._api_queue_view()
+        check('a queued hidden job is hidden from the waiting list',
+              not view['waiting'], f"got {view['waiting']}")
+        check('but the queue depth it occupies is still reported honestly',
+              view['depth'] == 1 and view['busy'], f"got depth={view['depth']}")
+    finally:
+        ws.OUTPUT_DIR = real_output
+        del ws._recent_done[:]
+        del ws._pending[:]
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _multi_run_state(results, configs=(9, 10)):
     """A multi-model run's state file, as the worker would have left it."""
     return {'id': 'run-under-test', 'created': 0.0, 'prompt': 'a red fox in snow',
@@ -611,6 +708,9 @@ def main():
 
     print("\nmulti-model comparison sheet")
     _check_multi_run_composite()
+
+    print("\nhidden mode")
+    _check_hidden_mode(client)
 
     print("\nimages")
     r = client.get(f'{PREFIX}/images', headers=AUTH)

@@ -278,6 +278,26 @@ which is deliberately open so the UI's `<img>` tags work. Use
 Both delete endpoints are permanent. `POST /archive` is the non-destructive
 way to clear the day.
 
+#### Hidden mode
+
+`hidden: true` on `POST /jobs` writes everything that job produces — images,
+sidecars, composites, previews — into `web-generated/.hidden/` instead, and
+keeps the job itself out of `GET /jobs`, `GET /queue` and the queue page. Its
+images are named `.hidden/<file>` and work with every route above under that
+name.
+
+Nothing shows it unless you ask: pass `?hidden=1` to `GET /images`,
+`GET /jobs`, `GET /queue`, `DELETE /images` and `POST /archive` to act on the
+hidden side instead of the visible one. `POST /archive` and `DELETE /images`
+stay inside `.hidden/` in that mode rather than lifting anything back out.
+
+A request may also carry the `X-Flux-Hidden: 1` header, which applies to every
+route at once — that is how the web UI puts a whole session in the mode. An
+explicit field or query parameter wins over the header.
+
+This is concealment, not access control: the API key still reaches everything,
+and the files are ordinary PNGs on disk.
+
 ### Reference images
 
 | | |

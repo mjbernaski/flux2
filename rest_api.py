@@ -92,6 +92,16 @@ def _body():
     return request.get_json(silent=True) or {}
 
 
+def _hidden():
+    """Whether this request is in hidden mode: `?hidden=1` (or a `hidden` field
+    in the body) if the caller said so, otherwise web_server's session header.
+    Off means the .hidden subdir is invisible here, same as everywhere else."""
+    explicit = request.args.get('hidden')
+    if explicit is None:
+        explicit = _body().get('hidden')
+    return ws._hidden_requested(explicit)
+
+
 def _job_url(job_id):
     return url_for('rest.get_job', job_id=job_id, _external=False)
 
@@ -232,7 +242,7 @@ def create_job():
 def list_jobs():
     """The whole queue in one call: what's running, what's waiting, what
     recently finished (bounded by RECENT_DONE_MAX)."""
-    snapshot = ws._api_queue_snapshot()
+    snapshot = ws._api_queue_snapshot(_hidden())
     return jsonify({
         'running': snapshot['running'],
         'queued': snapshot['queued'],
@@ -253,7 +263,7 @@ def get_queue():
     from recently completed jobs and is null until at least one has finished.
     `recent_images` is the last few finished PNGs, newest first.
     """
-    return jsonify(ws._api_queue_view())
+    return jsonify(ws._api_queue_view(_hidden()))
 
 
 @rest.route('/queue.html', methods=['GET'])
@@ -345,8 +355,9 @@ def job_previews(job_id):
 @rest.route('/images', methods=['GET'])
 @endpoint
 def list_images():
-    """Today's generated images, newest first."""
-    images = ws._api_history()
+    """Today's generated images, newest first. `?hidden=1` lists the .hidden
+    subdir written by hidden-mode generations instead."""
+    images = ws._api_history(_hidden())
     return jsonify({'images': images, 'count': len(images)})
 
 
@@ -354,8 +365,8 @@ def list_images():
 @endpoint
 def delete_all_images():
     """Permanently delete all of today's output. Irreversible — archive first
-    if the files still matter."""
-    return jsonify({'deleted': ws._api_delete_today(None)})
+    if the files still matter. `?hidden=1` clears the .hidden subdir instead."""
+    return jsonify({'deleted': ws._api_delete_today(None, _hidden())})
 
 
 @rest.route('/images/<path:filename>', methods=['GET'])
@@ -367,14 +378,16 @@ def get_image(filename):
     return send_from_directory(ws.OUTPUT_DIR, filename)
 
 
-@rest.route('/images/<filename>', methods=['DELETE'])
+# <path:> so a hidden image's `.hidden/<name>` identifier round-trips; the
+# name is validated against OUTPUT_DIR before anything is unlinked.
+@rest.route('/images/<path:filename>', methods=['DELETE'])
 @endpoint
 def delete_image(filename):
     """Delete one of today's images and its .prompt sidecar."""
     return jsonify({'deleted': ws._api_delete_today(filename), 'filename': filename})
 
 
-@rest.route('/images/<filename>/save', methods=['POST'])
+@rest.route('/images/<path:filename>/save', methods=['POST'])
 @endpoint
 def save_image(filename):
     """Copy an image into .saved/, where archive and delete-today can't reach
@@ -385,8 +398,9 @@ def save_image(filename):
 @rest.route('/archive', methods=['POST'])
 @endpoint
 def archive():
-    """Move today's output into web-generated/archive/."""
-    return jsonify({'moved': ws._api_archive_today()})
+    """Move today's output into web-generated/archive/. In hidden mode both
+    ends stay inside .hidden/."""
+    return jsonify({'moved': ws._api_archive_today(_hidden())})
 
 
 @rest.route('/filmstrips', methods=['POST'])
@@ -641,6 +655,13 @@ def _openapi_document():
                               'description': 'Sweep guidance/strength into a matrix.'},
             'spectrum_same_seed': {'type': 'boolean', 'default': True},
             'selected_cells': {'type': 'array', 'items': {'type': 'integer'}},
+            'hidden': {
+                'type': 'boolean', 'default': False,
+                'description': 'Write everything this job produces into '
+                               'web-generated/.hidden/ and keep the job out of '
+                               'job/queue listings. Its images are named '
+                               '.hidden/<file>; pass ?hidden=1 (or the '
+                               'X-Flux-Hidden header) to list them.'},
             'expansion_same_seed': {
                 'type': 'boolean', 'default': True,
                 'description': 'When a `{a|b}` prompt expands to several jobs and no '

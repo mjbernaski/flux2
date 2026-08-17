@@ -84,6 +84,10 @@ def folder_tree(abs_dir, rel=""):
     children = []
     try:
         for item in sorted(os.listdir(abs_dir), key=str.lower):
+            # web_server's hidden mode writes generations into .hidden/; this
+            # gallery is one of the places that folder is meant to stay out of.
+            if item == ".hidden":
+                continue
             full = os.path.join(abs_dir, item)
             if os.path.isdir(full):
                 children.append(folder_tree(full, (rel + "/" + item) if rel else item))

@@ -36,12 +36,36 @@
     readyPollTimer = setInterval(checkReady, 1500);
 })();
 
+// ---- Hidden mode ----
+// While it is on, the server writes every generation into web-generated/.hidden/
+// and keeps those jobs out of anything a normal client asks for. The switch is
+// the X-Flux-Hidden header added below: it rides on getAuthHeaders, which every
+// request in this file already uses, so generate, status, history, archive,
+// delete and the edit loop all follow the mode without their own flag.
+//
+// Deliberately session-only — nothing in localStorage, nothing in the URL — so
+// a reload leaves no trace of it and starts back in normal mode. Toggled by the
+// five-click gesture on the page title further down; there is no visible
+// control, by design.
+let hiddenMode = false;
+
+function isHiddenMode() { return hiddenMode; }
+
+function imageSrc(filename) {
+    // Hidden output is named `.hidden/<file>`, so the path separator has to
+    // survive: encode the segments, not the slash between them.
+    return '/images/' + String(filename).split('/').map(encodeURIComponent).join('/');
+}
+
 // Security helpers
 function getAuthHeaders(extraHeaders = {}) {
     const apiKey = localStorage.getItem('flux_api_key');
     const headers = { ...extraHeaders };
     if (apiKey) {
         headers['X-API-Key'] = apiKey;
+    }
+    if (hiddenMode) {
+        headers['X-Flux-Hidden'] = '1';
     }
     return headers;
 }
@@ -2108,15 +2132,15 @@ function addImageToGrid(img, index) {
         </div>
     `;
     const cardImg = card.querySelector('img');
-    cardImg.src = `/images/${encodeURIComponent(img.filename)}?t=${t}`;
+    cardImg.src = imageSrc(img.filename) + `?t=${t}`;
     // The entry (not its index) is captured: deleting a card splices the list,
     // so every other card's position shifts and must be looked up at click time.
-    const lbEntry = { src: `/images/${encodeURIComponent(img.filename)}`, caption: `Seed ${img.seed}` };
+    const lbEntry = { src: imageSrc(img.filename), caption: `Seed ${img.seed}` };
     resultLbItems.push(lbEntry);
     cardImg.addEventListener('click', () =>
         openLightbox(resultLbItems, Math.max(0, resultLbItems.indexOf(lbEntry))));
     const dl = card.querySelector('.download-btn');
-    dl.href = `/images/${encodeURIComponent(img.filename)}`;
+    dl.href = imageSrc(img.filename);
     dl.setAttribute('download', img.filename);
     card.querySelector('.seed-btn').addEventListener('click', (e) => { e.preventDefault(); useSeed(img.seed); });
     card.querySelector('.ref-btn').addEventListener('click', (e) => { e.preventDefault(); useAsReference(img.filename); });
@@ -2141,7 +2165,7 @@ function addImageToGrid(img, index) {
 // in knownImageFilenames, so /status polling won't re-add the card for a job
 // that still lists the image.
 function removeResultCard(filename) {
-    const src = `/images/${encodeURIComponent(filename)}`;
+    const src = imageSrc(filename);
     const lbIdx = resultLbItems.findIndex(it => it.src === src);
     if (lbIdx >= 0) resultLbItems.splice(lbIdx, 1);
     if (!imageGrid) return;
@@ -2596,7 +2620,7 @@ function cmpLoadPixels(filename) {
             resolve(ctx.getImageData(0, 0, c.width, c.height));
         };
         img.onerror = () => reject(new Error('failed to load ' + filename));
-        img.src = `/images/${encodeURIComponent(filename)}`;
+        img.src = imageSrc(filename);
     });
 }
 
@@ -2651,7 +2675,7 @@ async function loadHistory() {
             return;
         }
         const lbList = data.images.map(im => ({
-            src: `/images/${encodeURIComponent(im.filename)}`,
+            src: imageSrc(im.filename),
             caption: (im.time ? im.time + ' — ' : '') + (im.prompt || im.filename)
         }));
         if (latestThumb && latestThumbImg) {
@@ -2676,7 +2700,7 @@ async function loadHistory() {
             // Prompt and filename are set via DOM APIs so user-typed prompt
             // text can't break out of the markup.
             const thumb = item.querySelector('img');
-            thumb.src = `/images/${encodeURIComponent(img.filename)}`;
+            thumb.src = imageSrc(img.filename);
             thumb.alt = img.prompt || 'Generated image';
             item.querySelector('.time').textContent = img.time;
             item.title = img.prompt || img.filename;
@@ -2782,6 +2806,37 @@ if (promptAutoGrow) {
 }
 
 loadHistory();
+
+// ---- Hidden-mode gesture ----
+// Five clicks on the page title inside two seconds toggles hidden mode. No
+// button, no label, no tooltip, no cursor change: a stray double-click can't
+// reach it and nothing on the page suggests it is there. Feedback is the
+// title's own colour (see .hidden-mode in app.css).
+function setHiddenMode(on) {
+    hiddenMode = !!on;
+    document.body.classList.toggle('hidden-mode', hiddenMode);
+    // The two modes are separate galleries. Switching means the page is now
+    // looking at a different set of images, so clear what's on screen and
+    // reload in the new mode instead of leaving the other one's results up.
+    clearRecentResults();
+    loadHistory();
+    schedulePoll(0);
+}
+
+(function () {
+    const title = document.querySelector('h1');
+    if (!title) return;
+    const NEEDED = 5, WINDOW_MS = 2000;
+    let clicks = [];
+    title.addEventListener('click', () => {
+        const now = Date.now();
+        clicks = clicks.filter(t => now - t < WINDOW_MS);
+        clicks.push(now);
+        if (clicks.length < NEEDED) return;
+        clicks = [];
+        setHiddenMode(!hiddenMode);
+    });
+})();
 
 // ---- Edit loop ----
 // Iteratively: generate an edit from the first reference image, ask the
