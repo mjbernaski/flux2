@@ -1,0 +1,18 @@
+torch
+torchvision
+diffusers
+transformers
+accelerate
+peft  # required by diffusers' load_lora_weights (turbo + uncensored LoRAs)
+safetensors
+huggingface_hub
+requests
+bitsandbytes
+gguf>=0.10.0
+sentencepiece
+protobuf
+flask
+pillow
+rawpy  # LibRaw bindings: camera RAW (NEF etc.) reference uploads via /convert-raw
+python-dotenv
+# nvidia-modelopt  # installed for future NVFP4 support (currently blocked by diffusers Flux2 converter)

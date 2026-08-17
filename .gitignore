@@ -48,4 +48,36 @@ wheels/
 
 # OS
 .DS_Store
+._.DS_Store
 Thumbs.db
+
+# Runtime artifacts
+nohup.out
+server.log
+image_manager.log
+server.pid
+.next_config
+.multi_run.json
+
+# Generated image artifacts
+web-generated/
+server_smoke_test/
+debug-gallery/
+edit-loop-sessions/
+ollama.log
+ollama.err.log
+.last_config
+
+# Editor/log artifacts (siblings of the entries above)
+image_manager.err.log
+
+# API guide build intermediates; the PDFs in docs/ are the deliverable
+docs/*.html
+
+# Compact UI (port 3333) supervisor output
+new_ui.log
+new_ui.err.log
+
+# f14.ps1's detached run_server.ps1 output (server.log gets the real logging)
+supervisor.out.log
+supervisor.err.log

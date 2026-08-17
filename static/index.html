@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="theme-color" content="#1a1a2e">
+    <title>flux</title>
+    <script>document.title = window.location.hostname + ' flux';</script>
+    <link rel="stylesheet" href="/static/app.css?v=14">
+</head>
+<body>
+    <div class="loading-overlay" id="loadingOverlay">
+        <div class="spinner"></div>
+        <h2 id="loadingTitle">Loading model…</h2>
+        <div class="loading-progress" id="loadingProgress" style="display: none;"></div>
+        <div class="loading-status" id="loadingStatus">starting</div>
+        <div class="loading-elapsed" id="loadingElapsed">0s</div>
+    </div>
+
+    <!-- Invisible top-left hover zone: reveals the running model name. -->
+    <div class="model-hover" id="modelHover">
+        <span class="model-hover-name" id="modelHoverName"></span>
+    </div>
+
+    <div class="header-info">
+        <span class="hostname" id="hostname"></span>
+        <span class="vlm-badge" id="vlmBadge" style="display: none;"></span>
+        <span class="version" id="version"></span>
+        <a href="/api/v1/queue.html" class="top-link" target="_blank" rel="noopener"
+           title="Live view of what is generating and what is waiting">&#9635; Queue</a>
+        <!-- href is set per-job by renderPreviewsLink on each /status poll. -->
+        <a id="previewsLink" class="top-link" target="_blank" rel="noopener"
+           style="display: none;">&#9707; Previews</a>
+        <a href="/alternate" class="top-link" title="Denser sidebar + main dashboard layout">&#9776; Dense view</a>
+    </div>
+    <h1>FLUX Image Generator</h1>
+    <!-- Model name intentionally not displayed; /model-info still drives
+         capability toggles (inpaint, negative prompt, schnell) in app.js. -->
+    <p class="subtitle" id="modelInfo" style="display: none;"></p>
+
+    <!-- Model switcher: populated from /configs. Hidden unless the server was
+         launched via run_server.sh (its supervisor performs the restart). -->
+    <div class="model-switch" id="modelSwitch" style="display: none;">
+        <label for="modelSelect">Model</label>
+        <select id="modelSelect"></select>
+        <span class="model-switch-hint">Switching restarts the server and loads the selected model.</span>
+    </div>
+
+    <!-- Security UI -->
+    <div class="security-section">
+        <div class="security-header" onclick="document.getElementById('securityContent').style.display = document.getElementById('securityContent').style.display === 'none' ? 'block' : 'none'">
+            <div class="security-title">
+                <span>🔒 Security Settings</span>
+            </div>
+            <span style="font-size: 12px; color: #888;">Click to toggle</span>
+        </div>
+        <div id="securityContent" style="display: none; padding-top: 10px;">
+            <label for="apiKey">API Access Key:</label>
+            <input type="password" id="apiKeyInput" placeholder="Enter API Key (REQUIRED)..." oninput="localStorage.setItem('flux_api_key', this.value)">
+            <p style="font-size: 11px; color: #666; margin-top: 5px;">Stored in browser local storage for convenience. Always required to use this server.</p>
+        </div>
+    </div>
+
+    <form id="generateForm" action="#">
+        <div class="form-group">
+            <div class="prompt-label-row">
+                <label for="prompt">Prompt</label>
+                <div class="prompt-history-nav">
+                    <button type="button" id="promptPrevBtn" title="Previous prompt">&#9664;</button>
+                    <span id="promptHistoryPos"></span>
+                    <button type="button" id="promptNextBtn" title="Next prompt (forward to your draft)">&#9654;</button>
+                    <button type="button" id="promptCopyBtn" class="prompt-copy-btn" title="Copy the prompt to the clipboard">Copy</button>
+                    <button type="button" id="promptClearBtn" class="prompt-clear-btn" title="Clear the prompt">Clear</button>
+                </div>
+            </div>
+            <textarea id="prompt" name="prompt" rows="5" placeholder="A majestic mountain landscape at sunset..." required></textarea>
+            <div class="boost-control">
+                <button type="button" id="boostBtn" class="describe-btn boost-btn"
+                        title="The local vision model rewrites your prompt to suit the loaded model's prompting style (and, with references attached, its editing idiom)">&#10024; Boost prompt</button>
+                <select id="boostLevel" title="How far the rewrite may depart from your draft">
+                    <option value="1">1 &middot; polish wording only</option>
+                    <option value="2">2 &middot; tidy + a detail or two</option>
+                    <option value="3" selected>3 &middot; enhance</option>
+                    <option value="4">4 &middot; enrich generously</option>
+                    <option value="5">5 &middot; reimagine boldly</option>
+                </select>
+                <label class="boost-think" for="boostThink"
+                       title="On: the VLM deliberates before rewriting — better results, slower. Off: instant-ish shallow rewrite.">
+                    <input type="checkbox" id="boostThink"> think
+                </label>
+            </div>
+            <div class="boost-control boost-variants-control">
+                <button type="button" id="boostVariantsBtn" class="describe-btn boost-btn"
+                        title="Rewrites your prompt N separate times, each pushed in a different direction, and generates from each one the moment it lands — the rewrites are listed as they arrive">&#10024; Boost &times;N &amp; generate</button>
+                <select id="boostVariantCount" title="How many distinct rewrites to produce">
+                    <option value="2">2 rewrites</option>
+                    <option value="3" selected>3 rewrites</option>
+                    <option value="4">4 rewrites</option>
+                    <option value="5">5 rewrites</option>
+                    <option value="6">6 rewrites</option>
+                </select>
+            </div>
+            <div id="boostOptions" class="boost-options" style="display:none"></div>
+            <div class="boost-control evolve-control">
+                <button type="button" id="evolveBtn" class="describe-btn boost-btn"
+                        title="Evolves your prompt into N independent variations (each boosted separately with the settings above, nudged in different directions) and queues one generation per variation">&#129516; Evolve &amp; generate</button>
+                <select id="evolveCount" title="How many separately evolved variations to generate">
+                    <option value="2">2 variations</option>
+                    <option value="3">3 variations</option>
+                    <option value="4" selected>4 variations</option>
+                    <option value="5">5 variations</option>
+                    <option value="6">6 variations</option>
+                    <option value="8">8 variations</option>
+                </select>
+            </div>
+        </div>
+
+        <!-- SDXL only (shown when the server reports negative-prompt support) -->
+        <div class="form-group" id="negativePromptGroup" style="display: none;">
+            <label for="negativePrompt">Negative prompt (what to avoid — leave empty for a sensible default)</label>
+            <textarea id="negativePrompt" name="negativePrompt" rows="2" placeholder="worst quality, low quality, watermark, extra limbs..."></textarea>
+        </div>
+
+        <div class="form-group">
+            <label>Reference Images (optional — up to 3; the first sets the output aspect)</label>
+            <div class="image-input-container">
+                <div class="ref-strip" id="refStrip">
+                    <div class="ref-thumbs" id="refThumbs"></div>
+                    <div class="image-upload-area" id="uploadArea">
+                        <input type="file" id="inputImage" accept="image/*,.nef,.nrw,.dng,.cr2,.cr3,.arw,.raf,.orf,.rw2" multiple style="display: none;">
+                        <div class="upload-placeholder" id="uploadPlaceholder">
+                            <span>Tap or click to add up to 3 images</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="url-import-row" id="urlImportRow">
+                    <input type="text" id="imageUrlInput" placeholder="…or paste an image URL (https://…) or a server file path" autocomplete="off">
+                    <button type="button" id="addUrlBtn">Add</button>
+                    <button type="button" id="browseArchiveBtn">Browse server files…</button>
+                </div>
+                <div class="multi-ref-hint" id="multiRefHint" style="display: none;">
+                    Multiple references: FLUX.2 uses each image directly. The Kontext
+                    editor stitches them side-by-side — write the instruction using
+                    positions, e.g. "give the person in the left image the jacket
+                    from the right image", and add "produce one single unified image"
+                    so the side-by-side layout doesn't appear in the result.
+                </div>
+                <div class="describe-control" id="describeControl" style="display: none; margin-top: 10px;">
+                    <div class="describe-row">
+                        <button type="button" id="describeBtn" class="describe-btn">&#8646; Reverse: photo &rarr; prompt &rarr; new image</button>
+                        <label class="boost-think" for="describeThink"
+                               title="On: the vision model deliberates before writing the prompt — better results, slower. Off: faster, shallower description.">
+                            <input type="checkbox" id="describeThink"> think
+                        </label>
+                    </div>
+                    <div class="strength-hint">
+                        The local vision model writes a detailed prompt from the
+                        attached reference(s) — combined into one scene when several
+                        are attached; it lands in the prompt box and a fresh image is
+                        generated from the prompt alone (the photos are not sent).
+                    </div>
+                </div>
+                <div class="strength-control" id="strengthControl" style="display: none;">
+                    <label for="strength">Reference following (strength): <span id="strengthValue">0.5</span></label>
+                    <input type="range" id="strength" name="strength" min="0" max="1" step="0.1" value="0.5">
+                    <div class="strength-hint">0 = closest to original, 0.5 = default, 1 = most change</div>
+                </div>
+                <div class="aspect-mode-control" id="aspectModeControl" style="display: none; margin-top: 10px;">
+                    <label for="aspectMode">Image aspect ratio mode:</label>
+                    <select id="aspectMode" name="aspectMode">
+                        <option value="keep" selected>Keep original aspect ratio (auto-scale)</option>
+                        <option value="stretch">Stretch/Squash to match Orientation selection</option>
+                    </select>
+                </div>
+                <div class="inpaint-control" id="inpaintControl" style="display: none;">
+                    <label class="inpaint-toggle">
+                        <input type="checkbox" id="inpaintMode"> Inpaint &mdash; paint the area to regenerate (FLUX.2 / SDXL)
+                    </label>
+                    <div class="inpaint-tools" id="inpaintTools" style="display: none;">
+                        <div class="inpaint-stage" id="inpaintStage">
+                            <img id="inpaintBaseImg" src="" alt="Inpaint base">
+                            <canvas id="inpaintCanvas"></canvas>
+                        </div>
+                        <div class="inpaint-buttons">
+                            <label>Brush <input type="range" id="brushSize" min="5" max="150" value="40"></label>
+                            <button type="button" id="inpaintEraser">Eraser</button>
+                            <button type="button" id="inpaintClear">Clear mask</button>
+                        </div>
+                        <div class="strength-hint">Paint over what should be regenerated; everything else stays unchanged. Your prompt describes the new content for the painted area. On SDXL, the strength slider sets how strongly the painted area is repainted (~0.4&ndash;0.7 for edits, higher to fully replace).</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="row">
+            <div class="form-group">
+                <label for="orientation">Orientation</label>
+                <select id="orientation" name="orientation">
+                    <option value="square">Square</option>
+                    <option value="landscape" selected>Landscape (16:9)</option>
+                    <option value="portrait">Portrait</option>
+                    <option value="widescreen">Extra-wide (21:9)</option>
+                    <option value="extra-tall">Extra-tall (9:21)</option>
+                </select>
+                <label class="checkbox-label all-orientations-label" style="display: flex; align-items: center; gap: 6px; cursor: pointer; margin-top: 6px; font-size: 12px; color: #aaa;">
+                    <input type="checkbox" id="allOrientations" style="width: auto;">
+                    Queue one per orientation (5 jobs)
+                </label>
+            </div>
+            <div class="form-group">
+                <label for="size">Size</label>
+                <select id="size" name="size">
+                    <option value="0.25mp">0.25 MP</option>
+                    <option value="0.5mp">0.5 MP</option>
+                    <option value="0.75mp">0.75 MP</option>
+                    <option value="1mp" selected>1 MP</option>
+                    <option value="1.25mp">1.25 MP</option>
+                    <option value="1.5mp">1.5 MP</option>
+                    <option value="1.75mp">1.75 MP</option>
+                    <option value="2mp">2 MP</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="steps">Steps</label>
+                <select id="steps" name="steps">
+                    <option value="4">4</option>
+                    <option value="8">8</option>
+                    <option value="10">10</option>
+                    <option value="15">15</option>
+                    <option value="20">20</option>
+                    <option value="25" selected>25</option>
+                    <option value="30">30</option>
+                    <option value="40">40</option>
+                    <option value="50">50</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="row">
+            <div class="form-group">
+                <label for="seed">Seed (optional)</label>
+                <input type="text" id="seed" name="seed" placeholder="Random if empty">
+            </div>
+            <div class="form-group">
+                <label for="guidance">Guidance Scale</label>
+                <select id="guidance" name="guidance">
+                    <option value="" selected>Auto (model default: FLUX 2.5&ndash;4, SDXL 6)</option>
+                    <option value="1">1.0 (high variety)</option>
+                    <option value="1.5">1.5</option>
+                    <option value="2">2.0</option>
+                    <option value="2.5">2.5</option>
+                    <option value="3">3.0</option>
+                    <option value="3.5">3.5</option>
+                    <option value="4">4.0</option>
+                    <option value="4.5">4.5</option>
+                    <option value="5">5.0</option>
+                    <option value="5.5">5.5</option>
+                    <option value="6">6.0</option>
+                    <option value="6.5">6.5</option>
+                    <option value="7">7.0 (strict)</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="batch">Batch Size</label>
+                <select id="batch" name="batch">
+                    <option value="1" selected>1 image</option>
+                    <option value="2">2 images</option>
+                    <option value="4">4 images</option>
+                    <option value="8">8 images</option>
+                    <option value="16">16 images</option>
+                    <option value="32">32 images</option>
+                    <option value="64">64 images</option>
+                    <option value="128">128 images</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="row">
+            <div class="form-group spectrum-option">
+                <label class="checkbox-label">
+                    <input type="checkbox" id="spectrumGrid" name="spectrum_grid" value="1">
+                    Generate spectrum grid (interactive 4×4 matrix)
+                </label>
+                <div id="gridContainer" style="display: none; margin-top: 10px;">
+                    <div style="font-size: 11px; color: #888; margin-bottom: 4px;">Select combinations (Guidance →, Strength ↓)</div>
+                    <div class="spectrum-grid-selector" id="gridSelector">
+                        <!-- 16 cells added via JS -->
+                    </div>
+                    <div class="grid-labels">
+                        <span>Min G/S</span>
+                        <span>Max G/S</span>
+                    </div>
+                </div>
+                <div class="spectrum-hint" id="spectrumHint">Guidance: 1, 3, 5, 7. Strength (img2img): 0.2, 0.4, 0.6, 0.8.</div>
+                <label class="checkbox-label" style="margin-top: 6px;">
+                    <input type="checkbox" id="spectrumSameSeed">
+                    Use same seed for all grid images
+                </label>
+            </div>
+        </div>
+
+        <div class="row">
+            <div class="form-group">
+                <label class="checkbox-label">
+                    <input type="checkbox" id="showPreview" checked>
+                    Show live preview (slower — decodes each step)
+                </label>
+                <label class="checkbox-label" id="savePreviewsLabel" style="margin-top: 6px;">
+                    <input type="checkbox" id="savePreviews">
+                    Save each preview frame (kept in web-generated/steps/)
+                </label>
+            </div>
+        </div>
+
+        <div class="button-row">
+            <button type="submit" id="submitBtn">Generate Image</button>
+            <button type="button" class="reset-btn" id="resetBtn">Reset</button>
+        </div>
+    </form>
+
+    <div class="edit-loop-section" id="editLoopSection">
+        <div class="edit-loop-header" onclick="document.getElementById('editLoopContent').style.display = document.getElementById('editLoopContent').style.display === 'none' ? 'block' : 'none'">
+            <div class="edit-loop-title">
+                <span>&#8635; Edit Loop</span>
+            </div>
+            <span style="font-size: 12px; color: #888;">Click to toggle</span>
+        </div>
+        <div id="editLoopContent" style="display: none; padding-top: 10px;">
+            <p class="edit-loop-hint">
+                Iteratively refine an edit. Uses the <strong>first reference image
+                above</strong>: applies your direction, has a local vision model
+                compare input and output, then retries with a revised instruction.
+                Pause between rounds to steer, or let it run.
+            </p>
+            <div class="form-group">
+                <label for="loopDirection">Edit direction</label>
+                <input type="text" id="loopDirection" placeholder="e.g. give the woman round black-rimmed glasses">
+            </div>
+            <div class="row">
+                <div class="form-group">
+                    <label for="loopIterations">Max iterations</label>
+                    <select id="loopIterations">
+                        <option value="1">1</option>
+                        <option value="2">2</option>
+                        <option value="3">3</option>
+                        <option value="5" selected>5</option>
+                        <option value="8">8</option>
+                        <option value="10">10</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label class="checkbox-label row-checkbox-offset">
+                        <input type="checkbox" id="loopAuto">
+                        Auto-continue (no pause)
+                    </label>
+                </div>
+                <div class="form-group">
+                    <label class="checkbox-label row-checkbox-offset">
+                        <input type="checkbox" id="loopChain">
+                        Chain outputs (edit previous result, not the original)
+                    </label>
+                </div>
+            </div>
+            <div class="button-row">
+                <button type="button" id="loopStartBtn">Start Edit Loop</button>
+                <button type="button" class="reset-btn" id="loopStopBtn" style="display: none;">Stop loop</button>
+            </div>
+            <div class="edit-loop-status" id="loopStatus" style="display: none;"></div>
+            <div id="loopCards"></div>
+            <div class="edit-loop-controls" id="loopControls" style="display: none;">
+                <label for="loopNextPrompt">Next instruction (edit before continuing)</label>
+                <textarea id="loopNextPrompt" rows="2"></textarea>
+                <div class="button-row">
+                    <button type="button" id="loopContinueBtn">Continue</button>
+                    <button type="button" class="reset-btn" id="loopBaseOriginalBtn" title="Backtrack: next iteration edits the original image again">⏮ Base: original</button>
+                    <button type="button" class="reset-btn" id="loopAcceptBtn">Accept &amp; finish</button>
+                </div>
+                <div class="edit-loop-hint" style="margin-top: 8px;">
+                    Backtrack: click "⏪ Base for next iteration" on any earlier
+                    result (or "⏮ Base: original") to continue from that version
+                    instead of the latest one.
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="edit-loop-section" id="multiRunSection">
+        <div class="edit-loop-header" onclick="document.getElementById('multiRunContent').style.display = document.getElementById('multiRunContent').style.display === 'none' ? 'block' : 'none'">
+            <div class="edit-loop-title">
+                <span>&#8645; Multi-Model Comparison</span>
+            </div>
+            <span style="font-size: 12px; color: #888;">Click to toggle</span>
+        </div>
+        <div id="multiRunContent" style="display: none; padding-top: 10px;">
+            <p class="edit-loop-hint">
+                Generate the prompt above on several models back to back, with
+                the same seed and settings, and compare the results. Each model
+                change restarts the server (a model-load wait between results).
+                Text-to-image only.
+            </p>
+            <div class="multi-run-configs" id="multiRunConfigs"></div>
+            <div class="button-row">
+                <button type="button" id="multiRunStartBtn" disabled>Run on selected models</button>
+                <button type="button" class="reset-btn" id="multiRunCancelBtn" style="display: none;">Cancel run</button>
+            </div>
+            <div class="edit-loop-status" id="multiRunStatus" style="display: none;"></div>
+            <div id="multiRunRows"></div>
+        </div>
+    </div>
+
+    <div class="status" id="status">
+        <span class="spinner"></span>
+        <span id="statusText">Generating...</span>
+        <div class="progress-tracker" id="progressTracker" style="display: none;">
+            <div class="progress-bar-wrap">
+                <div class="progress-bar" id="progressBar" style="width: 0%;"></div>
+            </div>
+            <span class="progress-text" id="progressText">0 / 0</span>
+        </div>
+        <button type="button" class="interrupt-btn" id="interruptBtn" style="display: none;">■ Interrupt</button>
+        <div class="preview-wrap" id="previewWrap" style="display: none; margin-top: 12px;">
+            <img id="previewImgLive" alt="Live preview" style="max-width: 512px; width: 100%; border-radius: 6px; display: block;">
+        </div>
+        <button type="button" class="watch-btn" id="watchBtn" style="display: none;">⛶ Watch live</button>
+    </div>
+
+    <div class="watch-overlay" id="watchOverlay">
+        <button type="button" class="watch-close" id="watchClose">✕ Exit (Esc)</button>
+        <img id="watchImg" class="hidden" alt="Live generation preview">
+        <div class="watch-waiting" id="watchWaiting">Waiting for first preview…</div>
+        <div class="watch-info">
+            <div class="watch-progress-wrap">
+                <div class="watch-progress" id="watchProgress"></div>
+            </div>
+            <div class="watch-text" id="watchText">Starting…</div>
+            <button type="button" class="interrupt-btn watch-interrupt" id="watchInterruptBtn" style="display: none;">■ Interrupt</button>
+        </div>
+    </div>
+
+    <!-- In-page image viewer: history/result/loop images open here instead of
+         a new tab. Pinch-zoom, pan, and swipe are pointer-gesture driven in
+         app.js (native pinch on fixed overlays zooms the page on iOS). -->
+    <div class="lightbox" id="lightbox">
+        <div class="lightbox-stage" id="lightboxStage"><img id="lightboxImg" alt=""></div>
+        <button type="button" class="lightbox-close" id="lightboxClose">✕</button>
+        <button type="button" class="lightbox-nav lightbox-prev" id="lightboxPrev">‹</button>
+        <button type="button" class="lightbox-nav lightbox-next" id="lightboxNext">›</button>
+        <div class="lightbox-caption" id="lightboxCaption"></div>
+    </div>
+
+    <!-- Server file browser: navigate folders on the server's filesystem and
+         click a thumbnail to attach it as a reference image (goes through
+         the same /fetch-image-path path as typing a path into the URL
+         import row). Opens rooted at the archive folder. -->
+    <div class="archive-picker" id="archivePicker">
+        <div class="archive-picker-panel">
+            <div class="archive-picker-header">
+                <button type="button" class="archive-picker-up" id="archivePickerUp" title="Up one folder">&uarr;</button>
+                <div class="archive-picker-path" id="archivePickerPath"></div>
+                <button type="button" class="archive-picker-close" id="archivePickerClose">✕</button>
+            </div>
+            <div class="archive-picker-jump-row">
+                <input type="text" id="archivePickerJumpInput" placeholder="Jump to a folder path (absolute, ~, or relative to web-generated/)…" autocomplete="off">
+                <button type="button" id="archivePickerJumpBtn">Go</button>
+            </div>
+            <div class="archive-picker-grid" id="archivePickerGrid"></div>
+        </div>
+    </div>
+
+    <div class="queue-panel" id="queuePanel" style="display: none;">
+        <div class="queue-header">
+            <h3>Queue</h3>
+            <span class="queue-count" id="queueCount"></span>
+        </div>
+        <div class="queue-list" id="queueList"></div>
+    </div>
+
+    <div class="result" id="result">
+        <details class="result-details" id="resultDetails">
+            <summary>Generated images <span class="result-count" id="resultCount"></span>
+                <button type="button" class="clear-inline-btn" id="clearRecentInline"
+                        title="Clear these results (the images themselves are kept)">Clear</button>
+            </summary>
+            <div class="image-grid" id="imageGrid"></div>
+            <p class="generation-info" id="generationInfo"></p>
+            <div class="step-frames" id="stepFrames" style="display: none;"></div>
+            <div class="clear-recent-row">
+                <button type="button" class="clear-recent-btn" id="clearRecentBtn">Clear recent</button>
+            </div>
+        </details>
+    </div>
+
+    <!-- GPU power draw, refreshed with the /status poll. -->
+    <div class="power-badge" id="powerBadge" style="display: none;">⚡ <span id="powerWatts"></span><span class="pending" id="powerPending" style="display: none;"></span></div>
+
+    <!-- Always-visible thumbnail of the newest image (rides loadHistory). -->
+    <button type="button" class="latest-thumb" id="latestThumb" style="display: none;">
+        <img id="latestThumbImg" alt="Latest generation">
+    </button>
+
+    <div class="history-section" id="historySection">
+        <details class="history-details" id="historyDetails">
+            <summary><h2>Today's Generations <span class="result-count" id="historyCount"></span></h2></summary>
+            <div class="history-header">
+                <div class="history-actions">
+                    <button type="button" class="archive-btn" id="archiveBtn" style="display: none;">Archive Today</button>
+                    <button type="button" class="delete-btn" id="deleteAllBtn" style="display: none;">Delete Today</button>
+                </div>
+            </div>
+            <div class="history-grid" id="historyGrid"></div>
+        </details>
+    </div>
+
+    <script src="/static/app.js?v=14"></script>
+</body>
+</html>
