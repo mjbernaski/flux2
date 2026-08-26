@@ -171,8 +171,12 @@ diffusers, transformers, flask, python-dotenv, huggingface_hub, requests.
   `getAuthHeaders`, so one switch covers every call it makes. The UI toggle is
   five clicks on the `<h1>` inside two seconds — deliberately undiscoverable,
   session-only (no localStorage, no URL state), with the title's color as the
-  only tell. It is concealment, not security: the API key still reaches
-  everything. The reference-image folder browser skips dotfiles and
+  only tell. While it is on, `recordPromptHistory` records nothing, so the
+  localStorage prompt list the ◀ ▶ buttons walk — which a normal-mode visitor to
+  the same browser can read — never learns about a hidden generation. (Pressing
+  Reset twice inside two seconds wipes that list outright.) It is concealment,
+  not security: the API key still reaches everything. The reference-image
+  folder browser skips dotfiles and
   `image_manager.py`'s folder tree skips `.hidden` by name, which is what keeps
   the directory out of sight in the other two UIs.
 - **Output convention**: `flux{1|2}_{YYYYMMDD_HHMMSS}_{8hex}.png` plus a

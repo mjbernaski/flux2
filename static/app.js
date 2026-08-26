@@ -1620,7 +1620,25 @@ if (allOrientationsEl && orientationSelectEl) {
     });
 }
 
+// Reset pressed twice within two seconds also wipes the recalled prompt list
+// (the ◀ ▶ history). One press is the ordinary "start over on the form";
+// the second is the deliberate escalation, so an accidental double-click on a
+// button people hit often can't silently discard 100 prompts.
+let lastResetAt = 0;
+function noteResetPress() {
+    const now = Date.now();
+    const second = now - lastResetAt < 2000;
+    lastResetAt = second ? 0 : now;   // a third press starts a fresh pair
+    if (!second) return;
+    clearPromptHistory();
+    if (resetBtn) {
+        resetBtn.textContent = 'History cleared';
+        setTimeout(function() { resetBtn.textContent = 'Reset'; }, 1200);
+    }
+}
+
 if (resetBtn) resetBtn.addEventListener('click', async function() {
+    noteResetPress();
     try {
         await fetch('/reset', { method: 'POST', headers: getAuthHeaders() });
     } catch (e) { console.warn('Reset request failed:', e); }
@@ -2451,6 +2469,12 @@ function promptHistoryGo(delta) {
 function recordPromptHistory(text) {
     text = (text || '').trim();
     if (!text) return;
+    // Hidden mode leaves no trace on this machine either: the server keeps the
+    // job out of the normal gallery, so a prompt sitting in localStorage —
+    // readable by the next person to open the page in normal mode — would be
+    // the one thing that gave it away. Navigation through prompts recorded
+    // before the mode was entered still works; nothing new joins them.
+    if (isHiddenMode()) return;
     if (promptHistory[promptHistory.length - 1] !== text) {
         promptHistory.push(text);
         if (promptHistory.length > PROMPT_HISTORY_MAX) promptHistory = promptHistory.slice(-PROMPT_HISTORY_MAX);
@@ -2458,6 +2482,16 @@ function recordPromptHistory(text) {
     }
     promptHistoryIdx = promptHistory.length;
     promptDraft = '';
+    syncPromptNav();
+}
+
+// Drop the whole recalled list (the Reset-twice gesture above). The draft in
+// the box is left alone — Reset itself has already emptied it.
+function clearPromptHistory() {
+    promptHistory = [];
+    promptHistoryIdx = 0;
+    promptDraft = '';
+    try { localStorage.removeItem(PROMPT_HISTORY_KEY); } catch (e) {}
     syncPromptNav();
 }
 
