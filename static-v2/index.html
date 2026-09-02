@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0b0f">
+<title>flux</title>
+<link rel="stylesheet" href="ui.css">
+</head>
+<body>
+
+<!-- Blocks the app until /health says the model is up. -->
+<div class="boot" id="boot">
+  <div class="boot-card">
+    <div class="boot-ring"></div>
+    <h2 id="bootTitle">Loading model</h2>
+    <div class="boot-bar" id="bootBar" hidden><i id="bootFill"></i></div>
+    <p class="boot-status" id="bootStatus">connecting…</p>
+    <p class="boot-elapsed" id="bootElapsed"></p>
+  </div>
+</div>
+
+<!-- ─── top bar ─────────────────────────────────────────────────────────── -->
+<header class="topbar">
+  <div class="brand"><span class="brand-mark"></span>flux</div>
+
+  <select id="modelSelect" class="model-select" title="Switching restarts the server"></select>
+
+  <div class="chips">
+    <span class="chip" id="chipState"><i class="dot"></i><span id="chipStateText">…</span></span>
+    <span class="chip" id="chipPower" hidden>⚡ <span id="chipPowerText"></span></span>
+    <span class="chip" id="chipVlm" hidden></span>
+    <span class="chip chip-quiet" id="chipHost"></span>
+  </div>
+
+  <div class="topbar-actions">
+    <button class="icon-btn" id="themeBtn" title="Toggle light / dark">◐</button>
+    <button class="icon-btn" id="keyBtn" title="API key">🔑</button>
+    <a class="icon-btn" id="queueLink" href="/api/v1/queue.html" target="_blank" rel="noopener" title="Live queue view">▤</a>
+  </div>
+</header>
+
+<div class="shell">
+
+  <!-- ─── left rail: generation parameters ──────────────────────────────── -->
+  <aside class="rail" id="rail">
+    <div class="rail-scroll">
+
+      <section class="grp">
+        <h3>Format</h3>
+        <div class="field">
+          <label for="orientation">Orientation</label>
+          <select id="orientation">
+            <option value="square">Square</option>
+            <option value="landscape" selected>Landscape 16:9</option>
+            <option value="portrait">Portrait</option>
+            <option value="widescreen">Extra-wide 21:9</option>
+            <option value="extra-tall">Extra-tall 9:21</option>
+          </select>
+        </div>
+        <label class="check"><input type="checkbox" id="allOrientations"> Queue one per orientation <b>(5 jobs)</b></label>
+        <div class="field">
+          <label for="size">Size</label>
+          <select id="size">
+            <option value="0.25mp">0.25 MP</option><option value="0.5mp">0.5 MP</option>
+            <option value="0.75mp">0.75 MP</option><option value="1mp" selected>1 MP</option>
+            <option value="1.25mp">1.25 MP</option><option value="1.5mp">1.5 MP</option>
+            <option value="1.75mp">1.75 MP</option><option value="2mp">2 MP</option>
+          </select>
+        </div>
+      </section>
+
+      <section class="grp">
+        <h3>Sampling</h3>
+        <div class="pair">
+          <div class="field">
+            <label for="steps">Steps</label>
+            <select id="steps">
+              <option>4</option><option>8</option><option>10</option><option>15</option>
+              <option>20</option><option value="25" selected>25</option><option>30</option>
+              <option>40</option><option>50</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="batch">Batch</label>
+            <select id="batch">
+              <option value="1" selected>1</option><option value="2">2</option>
+              <option value="4">4</option><option value="8">8</option>
+              <option value="16">16</option><option value="32">32</option>
+              <option value="64">64</option><option value="128">128</option>
+            </select>
+          </div>
+        </div>
+        <div class="field">
+          <label for="guidance">Guidance</label>
+          <select id="guidance">
+            <option value="" selected>Auto (model default)</option>
+            <option value="1">1.0 · high variety</option><option value="1.5">1.5</option>
+            <option value="2">2.0</option><option value="2.5">2.5</option>
+            <option value="3">3.0</option><option value="3.5">3.5</option>
+            <option value="4">4.0</option><option value="4.5">4.5</option>
+            <option value="5">5.0</option><option value="5.5">5.5</option>
+            <option value="6">6.0</option><option value="6.5">6.5</option>
+            <option value="7">7.0 · strict</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="seed">Seed</label>
+          <input type="text" id="seed" placeholder="Random if empty" autocomplete="off">
+        </div>
+      </section>
+
+      <section class="grp">
+        <h3>Spectrum</h3>
+        <label class="check"><input type="checkbox" id="spectrumGrid"> Interactive 4×4 matrix</label>
+        <div id="spectrumBox" hidden>
+          <div class="spectrum-axes"><span>Guidance →</span><span>Strength ↓</span></div>
+          <div class="spectrum" id="spectrumCells"></div>
+          <label class="check"><input type="checkbox" id="spectrumSameSeed"> Same seed for every cell</label>
+        </div>
+        <p class="hint" id="spectrumHint">Guidance 1/3/5/7 · Strength 0.2/0.4/0.6/0.8</p>
+      </section>
+
+      <section class="grp">
+        <h3>Previews</h3>
+        <label class="check"><input type="checkbox" id="showPreview" checked> Live preview <b>slower</b></label>
+        <label class="check"><input type="checkbox" id="savePreviews"> Keep every frame</label>
+        <label class="check"><input type="checkbox" id="expansionSameSeed" checked> Share one seed across <code>{a|b}</code></label>
+      </section>
+
+    </div>
+
+    <div class="rail-foot">
+      <button class="btn btn-ghost" id="resetBtn">Reset</button>
+    </div>
+  </aside>
+
+  <!-- ─── main column ───────────────────────────────────────────────────── -->
+  <main class="main">
+
+    <!-- composer -->
+    <section class="composer">
+      <div class="composer-head">
+        <div class="ph-nav">
+          <button class="mini" id="promptPrev" title="Previous prompt">‹</button>
+          <span id="promptPos"></span>
+          <button class="mini" id="promptNext" title="Next prompt">›</button>
+        </div>
+        <div class="spacer"></div>
+        <button class="mini" id="promptCopy">Copy</button>
+        <button class="mini" id="promptClear">Clear</button>
+      </div>
+
+      <textarea id="prompt" rows="3" placeholder="Describe the image…  ⌘/Ctrl+Enter to generate.  Use {a|b} to queue one job per alternative."></textarea>
+
+      <div class="field" id="negativeField" hidden>
+        <label for="negativePrompt">Negative prompt <span class="tag">SDXL</span></label>
+        <textarea id="negativePrompt" rows="2" placeholder="worst quality, watermark, extra limbs…"></textarea>
+      </div>
+
+      <!-- reference images -->
+      <div class="refs">
+        <div class="ref-thumbs" id="refThumbs"></div>
+        <button class="ref-add" id="refAddBtn" title="Add up to 3 reference images">
+          <span>＋</span><small>reference</small>
+        </button>
+        <input type="file" id="refFile" accept="image/*,.nef,.nrw,.dng,.cr2,.cr3,.arw,.raf,.orf,.rw2" multiple hidden>
+        <div class="ref-import">
+          <input type="text" id="refUrl" placeholder="Paste an image URL or a server path…" autocomplete="off">
+          <button class="btn btn-ghost" id="refUrlAdd">Add</button>
+          <button class="btn btn-ghost" id="browseBtn">Browse…</button>
+        </div>
+      </div>
+
+      <p class="hint" id="multiRefHint" hidden>
+        Multiple references: FLUX.2 uses each directly; Kontext stitches them
+        side by side — write positional instructions ("the jacket from the right
+        image") and ask for "one single unified image".
+      </p>
+
+      <!-- reference-dependent controls -->
+      <div class="ref-controls" id="refControls" hidden>
+        <div class="field inline">
+          <label for="strength">Reference following <output id="strengthOut">0.5</output></label>
+          <input type="range" id="strength" min="0" max="1" step="0.1" value="0.5">
+          <p class="hint">0 = closest to original · 1 = most change</p>
+        </div>
+        <div class="field">
+          <label for="aspectMode">Aspect</label>
+          <select id="aspectMode">
+            <option value="keep" selected>Keep reference aspect</option>
+            <option value="stretch">Stretch to orientation</option>
+          </select>
+        </div>
+        <label class="check" id="inpaintToggleWrap" hidden>
+          <input type="checkbox" id="inpaintMode"> Inpaint — paint the area to regenerate
+        </label>
+      </div>
+
+      <!-- inpaint canvas -->
+      <div class="inpaint" id="inpaintTools" hidden>
+        <div class="inpaint-stage" id="inpaintStage">
+          <img id="inpaintBase" alt="">
+          <canvas id="inpaintCanvas"></canvas>
+        </div>
+        <div class="inpaint-bar">
+          <label>Brush <input type="range" id="brushSize" min="5" max="150" value="40"></label>
+          <button class="btn btn-ghost" id="inpaintEraser">Eraser</button>
+          <button class="btn btn-ghost" id="inpaintClear">Clear mask</button>
+        </div>
+      </div>
+
+      <!-- prompt tools -->
+      <div class="tools">
+        <button class="btn btn-tool" id="boostBtn">✨ Boost</button>
+        <select id="boostLevel" class="tool-select" title="How far the rewrite may depart from your draft">
+          <option value="1">1 · polish</option><option value="2">2 · tidy</option>
+          <option value="3" selected>3 · enhance</option><option value="4">4 · enrich</option>
+          <option value="5">5 · reimagine</option>
+        </select>
+        <label class="check tight"><input type="checkbox" id="boostThink"> think</label>
+        <span class="sep"></span>
+        <button class="btn btn-tool" id="boostNBtn">✨ Boost ×N</button>
+        <select id="boostN" class="tool-select">
+          <option>2</option><option value="3" selected>3</option><option>4</option>
+          <option>5</option><option>6</option>
+        </select>
+        <span class="sep"></span>
+        <button class="btn btn-tool" id="evolveBtn">🧬 Evolve</button>
+        <select id="evolveN" class="tool-select">
+          <option>2</option><option>3</option><option value="4" selected>4</option>
+          <option>5</option><option>6</option><option>8</option>
+        </select>
+        <span class="sep"></span>
+        <button class="btn btn-tool" id="describeBtn" disabled title="Attach a reference first">⇄ Describe</button>
+        <label class="check tight"><input type="checkbox" id="describeThink"> think</label>
+      </div>
+
+      <div class="boost-options" id="boostOptions" hidden></div>
+
+      <div class="composer-foot">
+        <button class="btn btn-primary" id="generateBtn">Generate</button>
+        <span class="kbd">⌘⏎</span>
+        <div class="spacer"></div>
+        <span class="hint" id="composerHint"></span>
+      </div>
+    </section>
+
+    <!-- live status strip -->
+    <section class="live" id="live" hidden>
+      <div class="live-head">
+        <span class="live-dot"></span>
+        <span id="liveText">Generating…</span>
+        <div class="spacer"></div>
+        <button class="mini" id="watchBtn">⛶ Watch</button>
+        <button class="mini danger" id="interruptBtn">■ Interrupt</button>
+      </div>
+      <div class="live-bar"><i id="liveFill"></i></div>
+      <img id="livePreview" class="live-preview" hidden alt="Live preview">
+    </section>
+
+    <!-- tabs -->
+    <nav class="tabs" role="tablist">
+      <button class="tab active" data-tab="gallery">Gallery</button>
+      <button class="tab" data-tab="queue">Queue <span class="badge" id="queueBadge" hidden>0</span></button>
+      <button class="tab" data-tab="loop">Edit loop</button>
+      <button class="tab" data-tab="compare">Compare models</button>
+    </nav>
+
+    <!-- gallery -->
+    <section class="pane active" id="pane-gallery">
+      <div class="pane-bar">
+        <span id="galleryCount" class="muted"></span>
+        <div class="spacer"></div>
+        <button class="btn btn-ghost" id="clearRecentBtn">Clear recent</button>
+        <button class="btn btn-ghost" id="archiveBtn">Archive today</button>
+        <button class="btn btn-ghost danger" id="deleteAllBtn">Delete today</button>
+      </div>
+      <div class="grid" id="galleryGrid"></div>
+      <div class="empty" id="galleryEmpty">Nothing generated yet today.</div>
+    </section>
+
+    <!-- queue -->
+    <section class="pane" id="pane-queue">
+      <div class="pane-bar">
+        <span id="queueSummary" class="muted"></span>
+      </div>
+      <div class="queue-list" id="queueList"></div>
+      <div class="empty" id="queueEmpty">The queue is empty.</div>
+    </section>
+
+    <!-- edit loop -->
+    <section class="pane" id="pane-loop">
+      <p class="hint">
+        Iteratively refine an edit on the <b>first reference image</b>: apply your
+        direction, let the vision model compare input and output, retry with a
+        revised instruction. Pause between rounds to steer, or let it run.
+      </p>
+      <div class="loop-form">
+        <div class="field grow">
+          <label for="loopDirection">Edit direction</label>
+          <input type="text" id="loopDirection" placeholder="e.g. give her round black-rimmed glasses">
+        </div>
+        <div class="field">
+          <label for="loopIterations">Max rounds</label>
+          <select id="loopIterations">
+            <option>1</option><option>2</option><option>3</option>
+            <option value="5" selected>5</option><option>8</option><option>10</option>
+          </select>
+        </div>
+      </div>
+      <div class="tools">
+        <label class="check tight"><input type="checkbox" id="loopAuto"> auto-continue</label>
+        <label class="check tight"><input type="checkbox" id="loopChain"> chain outputs</label>
+        <span class="spacer"></span>
+        <button class="btn btn-primary" id="loopStart">Start loop</button>
+        <button class="btn btn-ghost danger" id="loopStop" hidden>Stop</button>
+      </div>
+      <div class="loop-status" id="loopStatus" hidden></div>
+      <div class="loop-cards" id="loopCards"></div>
+      <div class="loop-controls" id="loopControls" hidden>
+        <div class="field">
+          <label for="loopNext">Next instruction</label>
+          <textarea id="loopNext" rows="2"></textarea>
+        </div>
+        <div class="tools">
+          <button class="btn btn-primary" id="loopContinue">Continue</button>
+          <button class="btn btn-ghost" id="loopBaseOriginal">⏮ Base: original</button>
+          <button class="btn btn-ghost" id="loopAccept">Accept &amp; finish</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- multi-model compare -->
+    <section class="pane" id="pane-compare">
+      <p class="hint">
+        Generate the prompt above on several models back to back with one shared
+        seed. Each model change restarts the server, so expect a load wait
+        between results. Text-to-image only.
+      </p>
+      <div class="config-grid" id="configGrid"></div>
+      <div class="tools">
+        <button class="btn btn-primary" id="compareStart" disabled>Run on selected</button>
+        <button class="btn btn-ghost danger" id="compareCancel" hidden>Cancel run</button>
+      </div>
+      <div class="loop-status" id="compareStatus" hidden></div>
+      <div class="grid" id="compareRows"></div>
+    </section>
+
+  </main>
+</div>
+
+<!-- ─── overlays ────────────────────────────────────────────────────────── -->
+
+<div class="watch" id="watch" hidden>
+  <button class="watch-close" id="watchClose">✕ Exit</button>
+  <img id="watchImg" alt="">
+  <p class="watch-waiting" id="watchWaiting">Waiting for the first preview…</p>
+  <div class="watch-info">
+    <div class="live-bar"><i id="watchFill"></i></div>
+    <span id="watchText">Starting…</span>
+    <button class="mini danger" id="watchInterrupt">■ Interrupt</button>
+  </div>
+</div>
+
+<div class="lightbox" id="lightbox" hidden>
+  <div class="lightbox-stage" id="lightboxStage"><img id="lightboxImg" alt=""></div>
+  <button class="lightbox-close" id="lightboxClose">✕</button>
+  <button class="lightbox-nav prev" id="lightboxPrev">‹</button>
+  <button class="lightbox-nav next" id="lightboxNext">›</button>
+  <div class="lightbox-bar">
+    <span id="lightboxCaption"></span>
+    <div class="spacer"></div>
+    <button class="mini" id="lbUseRef">Use as reference</button>
+    <button class="mini" id="lbSave">Save</button>
+    <button class="mini danger" id="lbDelete">Delete</button>
+  </div>
+</div>
+
+<dialog class="modal" id="browseModal">
+  <div class="modal-head">
+    <button class="mini" id="browseUp" title="Up one folder">↑</button>
+    <code class="modal-path" id="browsePath"></code>
+    <button class="mini" id="browseClose">✕</button>
+  </div>
+  <div class="modal-jump">
+    <input type="text" id="browseJump" placeholder="Jump to a folder (absolute, ~, or relative to web-generated/)">
+    <button class="btn btn-ghost" id="browseGo">Go</button>
+  </div>
+  <div class="browse-grid" id="browseGrid"></div>
+</dialog>
+
+<dialog class="modal small" id="keyModal">
+  <div class="modal-head"><b>API key</b><div class="spacer"></div><button class="mini" id="keyClose">✕</button></div>
+  <p class="hint">
+    The server on 3333 already sends its own key. Set one here only if it was
+    started without <code>FLUX_API_KEY</code>, or to override it. Stored in this
+    browser's local storage.
+  </p>
+  <input type="password" id="keyInput" placeholder="X-API-Key" autocomplete="off">
+  <div class="tools"><div class="spacer"></div><button class="btn btn-primary" id="keySave">Save</button></div>
+</dialog>
+
+<div class="toasts" id="toasts"></div>
+
+<script type="module" src="ui.js"></script>
+</body>
+</html>

@@ -1,0 +1,31 @@
+# FLUX web server as a systemd user unit, so the service survives reboots
+# and comes back with the last model used (`run_server.sh last` reads
+# .last_config, which every launch/switch records).
+#
+# Install (once):
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now /home/mjbernaski/projects/flux2/flux-server.service
+#   sudo loginctl enable-linger mjbernaski   # start at boot without a login
+#
+# Day to day:
+#   systemctl --user {start,stop,status,restart} flux-server
+#   ./kill_flux.sh   # also stops this unit (stays stopped until reboot/start)
+#
+# run_server.sh is itself the crash supervisor (5 retries, model-switch
+# relaunch); systemd sits above it and only restarts if the supervisor
+# itself dies or gives up.
+
+[Unit]
+Description=FLUX Image Generator web server (last-used model)
+
+[Service]
+Type=simple
+WorkingDirectory=/home/mjbernaski/projects/flux2
+ExecStart=/home/mjbernaski/projects/flux2/run_server.sh last
+Restart=on-failure
+RestartSec=15
+# Model load can take minutes; don't let systemd think startup hung.
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=default.target

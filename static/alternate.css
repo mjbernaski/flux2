@@ -1,0 +1,137 @@
+/* Layout-only overrides for the /alternate dashboard view.
+   Same components, IDs, and app.js as the classic page — this file just
+   changes flow (sticky sidebar of controls + independently-scrolling main
+   pane, instead of one long top-to-bottom form) and density (tighter
+   spacing, smaller type, more visible per screen). Loaded after app.css. */
+
+body {
+    max-width: 100%;
+    padding: 12px max(12px, env(safe-area-inset-right)) 24px max(12px, env(safe-area-inset-left));
+}
+
+.db-shell {
+    display: grid;
+    grid-template-columns: minmax(300px, 400px) minmax(0, 1fr);
+    grid-template-areas:
+        "topbar topbar"
+        "sidebar main";
+    column-gap: 20px;
+    row-gap: 10px;
+    max-width: 1700px;
+    margin: 0 auto;
+    align-items: start;
+}
+
+.db-topbar {
+    grid-area: topbar;
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 6px 16px;
+    border-bottom: 1px solid #2a3a5a;
+    padding-bottom: 8px;
+    margin-bottom: 4px;
+}
+.db-topbar h1 { font-size: 20px; margin: 0; }
+.db-topbar .header-info { margin-bottom: 0; }
+.db-topbar .subtitle { display: none; }
+.db-dense-tag {
+    font-size: 10px;
+    font-weight: normal;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: #00d4ff;
+    border: 1px solid #00d4ff;
+    border-radius: 4px;
+    padding: 1px 5px;
+    vertical-align: middle;
+    margin-left: 6px;
+}
+.db-view-toggle {
+    margin-left: auto;
+    font-size: 12px;
+    color: #888;
+    text-decoration: none;
+    border: 1px solid #333;
+    border-radius: 4px;
+    padding: 4px 10px;
+    white-space: nowrap;
+}
+.db-view-toggle:hover { color: #00d4ff; border-color: #00d4ff; }
+
+/* Sidebar: sticky, independently scrolling control column. */
+.db-sidebar {
+    grid-area: sidebar;
+    position: sticky;
+    top: 8px;
+    max-height: calc(100vh - 16px);
+    overflow-y: auto;
+    padding-right: 10px;
+    padding-bottom: 20px;
+}
+.db-main {
+    grid-area: main;
+    min-width: 0;
+}
+
+/* Denser controls throughout the sidebar. */
+.db-sidebar .form-group { margin-bottom: 10px; }
+.db-sidebar label { font-size: 12px; margin-bottom: 3px; }
+.db-sidebar input[type="text"],
+.db-sidebar input[type="password"],
+.db-sidebar select,
+.db-sidebar textarea {
+    padding: 8px;
+    font-size: 14px;
+}
+.db-sidebar textarea { min-height: 70px; }
+.db-sidebar .row { gap: 8px; }
+.db-sidebar button { padding: 10px; font-size: 14px; }
+.db-sidebar .boost-control, .db-sidebar .evolve-control { margin-top: 6px; }
+.db-sidebar .security-section,
+.db-sidebar .model-switch,
+.db-sidebar .edit-loop-section {
+    margin-bottom: 10px;
+    padding: 10px 12px;
+}
+
+/* Generate/Reset stays reachable at the bottom of the visible sidebar
+   scroll area without hunting for it after a long form. */
+.db-sticky-actions {
+    position: sticky;
+    bottom: -20px;
+    background: #1a1a2e;
+    padding: 8px 0 4px;
+    margin-top: 4px;
+}
+
+/* Main pane: denser result/history thumbnails so more fits per screen. */
+.db-main .image-grid {
+    grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr));
+    gap: 10px;
+}
+.db-main .history-grid {
+    grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+    gap: 6px;
+}
+.db-main .status { margin-bottom: 10px; }
+.db-main .queue-panel { margin: 0 0 10px; }
+.db-main .history-section { margin-top: 10px; }
+
+@media (max-width: 900px) {
+    .db-shell {
+        display: block;
+    }
+    .db-sidebar {
+        position: static;
+        max-height: none;
+        overflow-y: visible;
+        padding-right: 0;
+        margin-bottom: 16px;
+    }
+    .db-sticky-actions {
+        position: static;
+        background: none;
+    }
+    .db-topbar .db-view-toggle { margin-left: 0; }
+}

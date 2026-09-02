@@ -1,0 +1,23 @@
+# Image Manager (gallery/crop tool) as a systemd user unit, so it survives
+# reboots and comes back automatically like flux-server.service.
+#
+# Install (once):
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now /home/mjbernaski/projects/flux2/flux-image-manager.service
+#   sudo loginctl enable-linger mjbernaski   # start at boot without a login (shared with flux-server)
+#
+# Day to day:
+#   systemctl --user {start,stop,status,restart} flux-image-manager
+
+[Unit]
+Description=FLUX Image Manager (gallery/crop tool, port 2223)
+
+[Service]
+Type=simple
+WorkingDirectory=/home/mjbernaski/projects/flux2
+ExecStart=/home/mjbernaski/projects/flux2/run_image_manager.sh
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=default.target
