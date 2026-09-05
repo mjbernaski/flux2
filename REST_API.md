@@ -37,7 +37,7 @@ Branch on `code` — it is stable. Messages are written for humans and may chang
 | `model_loading` | 503 | The model is not up yet — poll `/health` |
 | `no_supervisor` | 400 | Started without `run_server`, so it cannot restart itself |
 | `undecodable_image` | 400 | A reference image or mask could not be decoded |
-| `fetch_failed` | 400 | A remote URL could not be retrieved |
+| `fetch_failed` | 400/502 | A remote URL could not be retrieved, or a Wikimedia search failed |
 | `too_large` | 400/413 | Body or fetched image over the 64MB cap |
 | `vlm_failed` | 502 | The vision model failed (usually ollama not running) |
 | `io_error` | 500 | A filesystem operation failed |
@@ -305,8 +305,23 @@ and the files are ordinary PNGs on disk.
 | `POST /imports/raw` | Camera RAW → JPEG data URL (`multipart/form-data`, field `file`) |
 | `POST /imports/url` | Fetch a remote image server-side |
 | `POST /imports/path` | Load from the server's filesystem |
+| `GET /imports/search` | Search Wikidata + Commons for reference images |
+| `GET /imports/search/thumbnail` | Proxied thumbnail of a search result |
 | `GET /files` | Browse a server-side directory |
 | `GET /files/thumbnail` | JPEG thumbnail of a server-side image |
+
+`GET /imports/search?q=...&limit=24` finds candidates rather than importing
+one: it searches Wikidata for entities with an image (`P18`, falling back to
+logo/flag/coat-of-arms/locator-map) and Wikimedia Commons for matching files,
+and returns `{query, results}` where each result is
+`{source, id, title, description, file, thumb, url, page}`. Nothing is
+downloaded — `thumb` points at this server's
+`/imports/search/thumbnail` proxy for a picker grid, and `url` is the
+full-size Commons URL to hand to `POST /imports/url` once a result is chosen.
+Thumbnails are proxied rather than hotlinked so that a client which can reach
+this server but not Wikimedia still sees the results; they are LRU-cached, and
+`file` identifies the image if you would rather fetch Commons yourself.
+Upstream failures come back as `502 fetch_failed`.
 
 All three import routes return `{image, width, height}` where `image` is a
 JPEG data URL bounded to 2048px — pass it straight into `input_images`. RAW

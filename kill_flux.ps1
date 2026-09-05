@@ -217,6 +217,16 @@ if ($procs) {
         ForEach-Object { [int]$_.ProcessId })
 }
 
+# The FluxServerWatchdog scheduled task (install_watchdog.ps1) restarts the
+# server whenever it finds port $Port down, which would undo this script within
+# minutes. Drop a sentinel so a deliberate stop stays stopped; run_server.ps1
+# clears it on the next start, so nothing has to be un-done by hand.
+if (-not $WhatIfPreference) {
+    Set-Content -Path ".flux_stopped" -Value "stopped by kill_flux.ps1 at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" `
+        -Encoding ascii -ErrorAction SilentlyContinue
+    Write-Verbose "Wrote .flux_stopped - the watchdog will leave the server down"
+}
+
 # --- Kill: supervisors first, then the python they would otherwise respawn ----
 Stop-Pids $supervisors "supervisor" | Out-Null
 Stop-Pids $targets "flux server" | Out-Null

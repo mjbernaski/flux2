@@ -444,6 +444,28 @@ def import_path():
     return jsonify(ws._api_reference_payload(image))
 
 
+@rest.route('/imports/search', methods=['GET'])
+@endpoint
+def import_search():
+    """Search Wikidata entities and Wikimedia Commons for reference-image
+    candidates. Query: `q` (required), `limit` (1-40, default 24). Returns
+    only metadata and URLs — feed a chosen result's `url` to
+    POST /imports/url to actually pull the image in."""
+    return jsonify(ws._api_wikidata_search(request.args.get('q'),
+                                           request.args.get('limit')))
+
+
+@rest.route('/imports/search/thumbnail', methods=['GET'])
+@endpoint
+def import_search_thumbnail():
+    """A Wikimedia Commons thumbnail, proxied by this server so a client that
+    cannot reach Wikimedia can still show search results. Query: `file` (a
+    bare Commons filename from /imports/search), `width` (64-1024)."""
+    data, content_type = ws._api_wiki_thumb(request.args.get('file'),
+                                            request.args.get('width'))
+    return Response(data, mimetype=content_type)
+
+
 @rest.route('/files', methods=['GET'])
 @endpoint
 def browse_files():
@@ -833,6 +855,17 @@ def _openapi_document():
                 body={'type': 'object', 'required': ['path'],
                       'properties': {'path': {'type': 'string'}}},
                 responses={'200': {'description': 'OK'}, '400': err})},
+            '/imports/search': {'get': _op(
+                'Search Wikidata and Wikimedia Commons for reference images.',
+                tag='imports',
+                params=[('q', 'query', True, 'string', 'Search text'),
+                        ('limit', 'query', False, 'integer', '1-40, default 24')],
+                responses={'200': {'description': 'OK'}, '400': err, '502': err})},
+            '/imports/search/thumbnail': {'get': _op(
+                'Proxied Wikimedia thumbnail for a search result.', tag='imports',
+                params=[('file', 'query', True, 'string', 'Bare Commons filename'),
+                        ('width', 'query', False, 'integer', '64-1024, default 320')],
+                responses={'200': {'description': 'Image bytes'}, '400': err, '502': err})},
             '/files': {'get': _op(
                 'Browse a server-side directory for reference images.', tag='imports',
                 params=[('dir', 'query', False, 'string',

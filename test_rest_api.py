@@ -750,6 +750,24 @@ def main():
     r = client.post(f'{PREFIX}/imports/raw', headers=AUTH, data={})
     check('a raw import with no file is 400', r.status_code == 400)
 
+    # Validation only: a well-formed query would reach Wikimedia over the
+    # network, which this suite deliberately never does.
+    r = client.get(f'{PREFIX}/imports/search', headers=AUTH)
+    check('a wikimedia search with no query is 400',
+          r.status_code == 400 and err_code(r) == 'invalid_request')
+
+    r = client.get(f'{PREFIX}/imports/search?q=cat&limit=999', headers=AUTH)
+    check('an out-of-range search limit is 400',
+          r.status_code == 400 and err_code(r) == 'invalid_request')
+
+    r = client.get(f'{PREFIX}/imports/search/thumbnail', headers=AUTH)
+    check('a wikimedia thumbnail with no file is 400',
+          r.status_code == 400 and err_code(r) == 'invalid_request')
+
+    r = client.get(f'{PREFIX}/imports/search/thumbnail?file=../../etc/passwd', headers=AUTH)
+    check('a wikimedia thumbnail filename with a path separator is 400',
+          r.status_code == 400 and err_code(r) == 'invalid_request')
+
     r = client.get(f'{PREFIX}/files?dir=definitely-not-a-real-directory', headers=AUTH)
     check('browsing a missing directory is 400',
           r.status_code == 400 and err_code(r) == 'not_found')

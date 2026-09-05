@@ -11,6 +11,7 @@ import io
 import math
 import socket
 import shutil
+from collections import OrderedDict
 import traceback
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -2729,6 +2730,284 @@ def _api_load_path_image(raw_path):
     if err:
         raise ApiError(err, 400, 'undecodable_image')
     return image
+
+
+# ------------------------------------------------------- Wikimedia search --
+#
+# Reference-image search over Wikimedia. Two sources, because they answer
+# different questions: Wikidata knows *entities* ("Douglas Adams", "Golden
+# Gate Bridge") and carries a curated image on each, while Commons is the
+# actual photo library and is the only one of the two that returns anything
+# for a descriptive query like "red barn in snow". Wikidata hits come first
+# (an entity match is almost always what the searcher meant), then Commons
+# files fill the rest of the page.
+WIKIDATA_API = 'https://www.wikidata.org/w/api.php'
+COMMONS_API = 'https://commons.wikimedia.org/w/api.php'
+# Image-valued Wikidata properties in preference order: image, logo, flag,
+# coat of arms, locator map. The first one an entity has wins.
+WIKIDATA_IMAGE_PROPS = ('P18', 'P154', 'P41', 'P94', 'P242')
+WIKI_SEARCH_MAX = 40
+# Wikimedia's API policy asks clients to identify themselves; a default
+# python-requests UA is rate-limited hard.
+WIKI_USER_AGENT = ('flux2-image-generator/1.0 (self-hosted FLUX reference-image '
+                   'search; https://github.com/mjbernaski/flux2)')
+# Optional Wikimedia OAuth 2 access token (env WIKIMEDIA_TOKEN). Anonymous
+# limits are per-IP, and proxying the thumbnails put every request behind this
+# one address, so a token with the `highvolume` scope is what keeps a busy
+# picker from being throttled. Absent, everything still works anonymously.
+WIKIMEDIA_TOKEN = os.getenv('WIKIMEDIA_TOKEN', '').strip()
+
+
+def _wiki_headers(accept):
+    """Request headers for a Wikimedia call, carrying the OAuth token when one
+    is configured. requests drops Authorization when a redirect crosses to a
+    different host, which is what keeps the token off upload.wikimedia.org
+    when Special:FilePath hands a thumbnail over to the CDN."""
+    headers = {'User-Agent': WIKI_USER_AGENT, 'Accept': accept,
+               'Accept-Language': 'en-US,en;q=0.5'}
+    if WIKIMEDIA_TOKEN:
+        headers['Authorization'] = 'Bearer ' + WIKIMEDIA_TOKEN
+    return headers
+# Thumbnails are proxied by /wiki-thumb rather than hotlinked from the page:
+# whatever can reach this server must then be able to see the grid, even on a
+# LAN client with no route to Wikimedia. The import is a normal
+# /fetch-image-url call, which bounds to MAX_RAW_EDGE anyway, so asking for
+# more than that is waste.
+WIKI_THUMB_WIDTH = 320
+WIKI_FULL_WIDTH = MAX_RAW_EDGE
+# A search re-run, a second tab and a back-and-forth between two queries all
+# ask for the same thumbnails, and each one is a WAN round trip. Small enough
+# to keep many: a 320px thumbnail is tens of KB.
+WIKI_THUMB_CACHE_MAX = 300
+WIKI_THUMB_MAX_BYTES = 8 * 1024 * 1024
+_wiki_thumb_cache = OrderedDict()
+_wiki_thumb_lock = threading.Lock()
+
+
+def _wiki_file_url(filename, width):
+    """A rendered-thumbnail URL for a Commons file at a given pixel width.
+    Special:FilePath rasterizes SVG/TIFF originals when a width is given, so
+    this one URL shape works for every file type the search can return."""
+    from urllib.parse import quote
+    name = (filename or '').replace(' ', '_')
+    return ('https://commons.wikimedia.org/wiki/Special:FilePath/'
+            + quote(name, safe='') + f'?width={width}')
+
+
+def _wiki_thumb_path(filename):
+    """This server's proxy URL for a Commons thumbnail — what a result's
+    `thumb` points at. Relative, so it works from whatever host or port the
+    client reached the server on."""
+    from urllib.parse import quote
+    return '/wiki-thumb?file=' + quote(filename or '', safe='')
+
+
+def _wiki_get(url, params):
+    """One Wikimedia API call, returned as parsed JSON. Raises ApiError(502)
+    on any transport or HTTP failure — the caller's query was fine, the
+    upstream wasn't."""
+    import requests
+    try:
+        resp = requests.get(url, params=dict(params, format='json', formatversion=2),
+                            timeout=20, headers=_wiki_headers('application/json'))
+        resp.raise_for_status()
+        return resp.json()
+    except requests.RequestException as e:
+        raise ApiError(f'Wikimedia search failed: {e}', 502, 'fetch_failed')
+    except ValueError as e:
+        raise ApiError(f'Wikimedia returned a non-JSON response: {e}', 502, 'fetch_failed')
+
+
+def _wikidata_image_file(claims):
+    """The filename of the first image-valued property an entity has, or None.
+    Novalue/somevalue snaks carry no datavalue, hence the snaktype check."""
+    for prop in WIKIDATA_IMAGE_PROPS:
+        for claim in claims.get(prop) or []:
+            snak = claim.get('mainsnak') or {}
+            if snak.get('snaktype') != 'value':
+                continue
+            value = (snak.get('datavalue') or {}).get('value')
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _wikidata_hits(query, limit):
+    """Wikidata entities matching `query` that have an image, in the search's
+    own relevance order."""
+    found = _wiki_get(WIKIDATA_API, {
+        'action': 'wbsearchentities', 'search': query,
+        'language': 'en', 'uselang': 'en', 'type': 'item', 'limit': limit,
+    }).get('search') or []
+    order = [h.get('id') for h in found if h.get('id')]
+    if not order:
+        return []
+    meta_by_id = {h['id']: h for h in found if h.get('id')}
+    entities = _wiki_get(WIKIDATA_API, {
+        'action': 'wbgetentities', 'ids': '|'.join(order),
+        'props': 'claims', 'languages': 'en',
+    }).get('entities') or {}
+    hits = []
+    # wbgetentities answers with an unordered dict, so walk `order` instead of
+    # it to keep the relevance ranking the search gave us.
+    for qid in order:
+        filename = _wikidata_image_file((entities.get(qid) or {}).get('claims') or {})
+        if not filename:
+            continue
+        meta = meta_by_id.get(qid) or {}
+        hits.append({
+            'source': 'wikidata',
+            'id': qid,
+            'title': meta.get('label') or qid,
+            'description': meta.get('description') or '',
+            'file': filename,
+            'thumb': _wiki_thumb_path(filename),
+            'url': _wiki_file_url(filename, WIKI_FULL_WIDTH),
+            'page': f'https://www.wikidata.org/wiki/{qid}',
+        })
+    return hits
+
+
+def _commons_hits(query, limit):
+    """Wikimedia Commons files matching `query`. Filtered to bitmap/vector
+    images by MIME type — namespace 6 also holds audio, video and PDFs."""
+    pages = ((_wiki_get(COMMONS_API, {
+        'action': 'query', 'generator': 'search', 'gsrsearch': query,
+        'gsrnamespace': 6, 'gsrlimit': limit,
+        'prop': 'imageinfo', 'iiprop': 'mime|url',
+    }).get('query') or {}).get('pages')) or []
+    # The generator's relevance rank survives only in `index`.
+    pages.sort(key=lambda p: p.get('index', 0))
+    hits = []
+    for page in pages:
+        info = (page.get('imageinfo') or [{}])[0]
+        if not (info.get('mime') or '').startswith('image/'):
+            continue
+        title = page.get('title') or ''
+        filename = title.split(':', 1)[1] if ':' in title else title
+        hits.append({
+            'source': 'commons',
+            'id': title,
+            'title': os.path.splitext(filename)[0].replace('_', ' '),
+            'description': '',
+            'file': filename,
+            'thumb': _wiki_thumb_path(filename),
+            'url': _wiki_file_url(filename, WIKI_FULL_WIDTH),
+            'page': info.get('descriptionurl') or '',
+        })
+    return hits
+
+
+def _api_wikidata_search(raw_query, raw_limit=None):
+    """Search Wikimedia for candidate reference images. Returns
+    {query, results} where each result carries a `thumb` for a picker grid and
+    a `url` to hand to /fetch-image-url (or straight to `input_paths`' sibling
+    `input_images` after fetching) once one is chosen.
+
+    Only the search runs here — no image is downloaded — so a picker can show
+    a page of candidates without spending a 64MB fetch on each."""
+    query = (raw_query or '').strip()
+    if not query:
+        raise ApiError('query is required', 400, 'invalid_request')
+    try:
+        limit = int(raw_limit) if raw_limit not in (None, '') else 24
+    except (TypeError, ValueError):
+        raise ApiError('limit must be an integer', 400, 'invalid_request')
+    if not 1 <= limit <= WIKI_SEARCH_MAX:
+        raise ApiError(f'limit must be between 1 and {WIKI_SEARCH_MAX}', 400, 'invalid_request')
+    results, seen = [], set()
+    for hit in _wikidata_hits(query, min(limit, 20)) + _commons_hits(query, limit):
+        key = hit['file'].replace(' ', '_').lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append(hit)
+        if len(results) >= limit:
+            break
+    return {'query': query, 'results': results}
+
+
+def _api_wiki_thumb(raw_file, raw_width=None):
+    """(bytes, content-type) of a Commons thumbnail, fetched server-side and
+    LRU-cached. The picker goes through this instead of pointing an <img> at
+    commons.wikimedia.org so that a client which can reach this server but not
+    Wikimedia still sees its results — the box doing the searching is the box
+    that has the WAN route, and a search that returns hits it cannot show is
+    worse than no search.
+
+    Only the filename crosses the wire; the URL is built here, so this can
+    never be pointed at a host other than Commons."""
+    import requests
+    filename = (raw_file or '').strip()
+    if not filename:
+        raise ApiError('file is required', 400, 'invalid_request')
+    if '/' in filename or '\\' in filename or '\n' in filename:
+        raise ApiError('file must be a bare Commons filename', 400, 'invalid_request')
+    try:
+        width = int(raw_width) if raw_width not in (None, '') else WIKI_THUMB_WIDTH
+    except (TypeError, ValueError):
+        raise ApiError('width must be an integer', 400, 'invalid_request')
+    width = max(64, min(width, 1024))
+    key = (filename.replace(' ', '_'), width)
+    with _wiki_thumb_lock:
+        hit = _wiki_thumb_cache.get(key)
+        if hit is not None:
+            _wiki_thumb_cache.move_to_end(key)
+            return hit
+    try:
+        resp = requests.get(_wiki_file_url(filename, width), timeout=20, stream=True,
+                            allow_redirects=True,
+                            headers=_wiki_headers(
+                                'image/avif,image/webp,image/png,image/*;q=0.8'))
+        resp.raise_for_status()
+        chunks, total = [], 0
+        for chunk in resp.iter_content(256 * 1024):
+            total += len(chunk)
+            if total > WIKI_THUMB_MAX_BYTES:
+                raise ApiError('thumbnail is implausibly large', 502, 'too_large')
+            chunks.append(chunk)
+        data = b''.join(chunks)
+    except requests.RequestException as e:
+        raise ApiError(f'could not fetch thumbnail: {e}', 502, 'fetch_failed')
+    content_type = (resp.headers.get('Content-Type') or '').split(';')[0].strip()
+    if not content_type.startswith('image/') or not data:
+        raise ApiError(f'{filename} did not render to an image', 502, 'undecodable_image')
+    entry = (data, content_type)
+    with _wiki_thumb_lock:
+        _wiki_thumb_cache[key] = entry
+        while len(_wiki_thumb_cache) > WIKI_THUMB_CACHE_MAX:
+            _wiki_thumb_cache.popitem(last=False)
+    return entry
+
+
+@app.route('/wiki-thumb')
+def wiki_thumb():
+    """Proxy one Wikimedia Commons thumbnail. Query params: `file` (a bare
+    Commons filename, as returned by /wikidata-search) and optional `width`.
+    Mirrors /browse-thumb: an empty body on failure, since the caller renders
+    this straight into an <img>."""
+    try:
+        data, content_type = _api_wiki_thumb(request.args.get('file'),
+                                             request.args.get('width'))
+    except ApiError as e:
+        return '', 400 if e.status == 400 else 502
+    # Commons filenames are content-addressed in practice (a changed image is
+    # a new upload), so this is safe to hold on to.
+    return Response(data, mimetype=content_type,
+                    headers={'Cache-Control': 'public, max-age=86400'})
+
+
+@app.route('/wikidata-search')
+def wikidata_search():
+    """Search Wikidata entities and Wikimedia Commons for reference-image
+    candidates. Query params: `q` (required) and `limit` (1-40, default 24).
+    Returns thumbnail + full-size URLs; importing one is then a normal
+    /fetch-image-url call with the chosen result's `url`."""
+    try:
+        found = _api_wikidata_search(request.args.get('q'), request.args.get('limit'))
+    except ApiError as e:
+        return jsonify({'success': False, 'error': e.message}), e.status
+    return jsonify(dict(found, success=True))
 
 
 @app.route('/browse-files')

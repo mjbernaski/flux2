@@ -6,7 +6,7 @@
     <meta name="theme-color" content="#1a1a2e">
     <title>flux</title>
     <script>document.title = window.location.hostname + ' flux';</script>
-    <link rel="stylesheet" href="/static/app.css?v=14">
+    <link rel="stylesheet" href="/static/app.css?v=17">
 </head>
 <body>
     <div class="loading-overlay" id="loadingOverlay">
@@ -137,6 +137,7 @@
                     <input type="text" id="imageUrlInput" placeholder="…or paste an image URL (https://…) or a server file path" autocomplete="off">
                     <button type="button" id="addUrlBtn">Add</button>
                     <button type="button" id="browseArchiveBtn">Browse server files…</button>
+                    <button type="button" id="wikiSearchOpenBtn">Search Wikidata…</button>
                 </div>
                 <div class="multi-ref-hint" id="multiRefHint" style="display: none;">
                     Multiple references: FLUX.2 uses each image directly. The Kontext
@@ -467,6 +468,28 @@
         </div>
     </div>
 
+    <!-- Wikimedia reference search: look up a subject on Wikidata (entities
+         carry a curated image) with Wikimedia Commons files filling out the
+         page, and click any result to attach it as a reference. The results
+         are Commons URLs, so attaching one is the same server-side
+         /fetch-image-url import as pasting a link into the row above. -->
+    <div class="archive-picker" id="wikiPicker">
+        <div class="archive-picker-panel">
+            <div class="archive-picker-header">
+                <div class="wiki-picker-title">Search Wikidata &amp; Wikimedia Commons</div>
+                <button type="button" class="archive-picker-close" id="wikiPickerClose">&#10005;</button>
+            </div>
+            <div class="archive-picker-jump-row">
+                <input type="text" id="wikiSearchInput" placeholder="A person, place, building, animal, artwork…" autocomplete="off">
+                <button type="button" id="wikiSearchBtn">Search</button>
+            </div>
+            <div class="wiki-picker-note" id="wikiPickerNote">Click a result to add it as a reference image.</div>
+            <div class="wiki-picker-grid" id="wikiPickerGrid">
+                <div class="archive-picker-empty">Type a subject above and press Enter.</div>
+            </div>
+        </div>
+    </div>
+
     <div class="queue-panel" id="queuePanel" style="display: none;">
         <div class="queue-header">
             <h3>Queue</h3>
@@ -511,6 +534,6 @@
         </details>
     </div>
 
-    <script src="/static/app.js?v=14"></script>
+    <script src="/static/app.js?v=17"></script>
 </body>
 </html>

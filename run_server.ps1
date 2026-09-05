@@ -17,6 +17,19 @@ $env:HF_HUB_DISABLE_SYMLINKS = "1"
 # segments lets the allocator reuse blocks across differing shapes.
 $env:PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
 
+# torch ships Intel's OpenMP runtime (torch\lib\libiomp5md.dll), which installs
+# a Windows console control handler. When the console this server is attached to
+# gets CTRL_CLOSE_EVENT (terminal window/tab closed) or CTRL_LOGOFF_EVENT (user
+# logs off), that handler kills the process outright:
+#   forrtl: error (200): program aborting due to window-CLOSE event
+# It is not a crash - the server was healthy and serving requests the second
+# before - and it is unrecoverable, because the same console event also takes
+# down this supervisor, so the auto-restart loop below never gets to run. These
+# two vars stop the Intel runtimes from installing their handlers at all, which
+# leaves Python's own (SIGINT -> KeyboardInterrupt) as the only one.
+$env:FOR_DISABLE_CONSOLE_CTRL_HANDLER = "1"
+$env:KMP_HANDLE_SIGNALS = "0"
+
 $SwitchExitCode = 86
 $SwitchConfigFile = ".next_config"
 $LastConfigFile = ".last_config"
@@ -210,6 +223,11 @@ function Start-FluxServer([int]$Config, [string[]]$ExtraArgs = @()) {
     Stop-ExistingServer
     Confirm-Ollama
     Confirm-ImageManager
+
+    # kill_flux.ps1 leaves .flux_stopped behind so the FluxServerWatchdog task
+    # does not resurrect a deliberate stop. Starting again is the intent that
+    # cancels it - clear it here so the watchdog guards this run too.
+    Remove-Item ".flux_stopped" -Force -ErrorAction SilentlyContinue
 
     $PID | Out-File "server.pid" -Encoding ascii
     try {

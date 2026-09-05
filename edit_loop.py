@@ -369,10 +369,11 @@ def _openai_body(payload):
     /v1/chat/completions body.
 
     Base64 `images` on a message become `image_url` data-URL content parts,
-    the `format` JSON schema becomes `response_format` (guided decoding), and
-    the ollama-only knobs drop out: `think` has no OpenAI equivalent, and
-    `keep_alive`/`num_ctx` are the serving process's business, not the
-    client's, once the model lives on another host.
+    the `format` JSON schema becomes `response_format` (guided decoding),
+    `think` becomes the chat template's `enable_thinking` (see below), and
+    the rest of the ollama-only knobs drop out: `keep_alive`/`num_ctx` are
+    the serving process's business, not the client's, once the model lives
+    on another host.
     """
     messages = []
     for m in payload.get("messages", []):
@@ -395,6 +396,23 @@ def _openai_body(payload):
     options = payload.get("options") or {}
     if "temperature" in options:
         body["temperature"] = options["temperature"]
+    # Thinking is a chat-template switch on this side, not a request field.
+    # Qwen-style templates default it ON, which is wrong for us twice over:
+    # the server needs a matching reasoning parser to split the reasoning out
+    # of `content`, and under guided decoding the grammar forbids the
+    # thinking preamble outright — the model, unable to think and unable to
+    # say so, emits the shortest string satisfying the schema, which is the
+    # input echoed back. That is what made every /boost return the draft
+    # verbatim at every level. So: thinking off whenever a schema is in
+    # play, and follows `think` otherwise. A template that doesn't take the
+    # kwarg ignores it; a server that rejects the field 400s, and
+    # _chat_text's retry drops `think` from the payload, which drops this
+    # with it.
+    if "think" in payload:
+        body["chat_template_kwargs"] = {
+            "enable_thinking": bool(payload["think"])
+                               and "response_format" not in body
+        }
     return body
 
 

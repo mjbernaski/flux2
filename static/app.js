@@ -743,10 +743,14 @@ function handleRawFile(file) {
 // server path and goes through /fetch-image-path (absolute, ~, or relative
 // to web-generated/). Both return a JPEG data URL that then behaves like any
 // uploaded reference.
-function addImageSource(value) {
+function addImageSource(value, done) {
     value = (value || '').trim();
-    if (!value) return;
-    if (currentInputImages.length >= MAX_REFERENCE_IMAGES) return;
+    if (!value) { if (done) done('nothing to import'); return; }
+    if (currentInputImages.length >= MAX_REFERENCE_IMAGES) {
+        if (done) done('already holding ' + MAX_REFERENCE_IMAGES + ' reference images');
+        return;
+    }
+    var failure = null;
     var isUrl = /^https?:\/\//i.test(value);
     var span = uploadPlaceholder ? uploadPlaceholder.querySelector('span') : null;
     if (span) span.textContent = isUrl ? 'Fetching image from URL…' : 'Loading image from server path…';
@@ -764,9 +768,15 @@ function addImageSource(value) {
             });
         })
         .catch(function(err) {
-            alert((isUrl ? 'Could not fetch image URL: ' : 'Could not load server image: ') + err.message);
+            failure = err.message;
+            // A caller watching the outcome reports it in place; the bare
+            // paste/drop paths have nowhere else to show a failure.
+            if (!done) alert((isUrl ? 'Could not fetch image URL: ' : 'Could not load server image: ') + err.message);
         })
-        .then(function() { syncRefUI(); }); // also restores the placeholder label
+        .then(function() {
+            syncRefUI(); // also restores the placeholder label
+            if (done) done(failure);
+        });
 }
 
 // Server file browser: navigate folders on the server's filesystem (starting
@@ -881,6 +891,179 @@ if (archivePickerJumpInput) archivePickerJumpInput.addEventListener('keydown', f
 });
 if (archivePicker) archivePicker.addEventListener('click', function(e) {
     if (e.target === archivePicker) closeArchivePicker();
+});
+
+// Wikimedia reference search: type a subject, get back Wikidata entity images
+// (P18 and friends) followed by Wikimedia Commons files, and click one to
+// attach it. Thumbnails come through this server's /wiki-thumb proxy, not
+// straight from Wikimedia -- same blob-into-object-URL dance as the server
+// file browser, because an authenticated route can't be an <img src>, and
+// worth the hop so a client with no route to Wikimedia still sees the grid.
+// Attaching a result is an ordinary /fetch-image-url import of its full-size
+// URL, which is also what bounds it to 2048px and re-encodes it as a JPEG.
+const wikiPicker = document.getElementById('wikiPicker');
+const wikiPickerGrid = document.getElementById('wikiPickerGrid');
+const wikiPickerNote = document.getElementById('wikiPickerNote');
+const wikiPickerClose = document.getElementById('wikiPickerClose');
+const wikiSearchInput = document.getElementById('wikiSearchInput');
+const wikiSearchBtn = document.getElementById('wikiSearchBtn');
+const wikiSearchOpenBtn = document.getElementById('wikiSearchOpenBtn');
+
+function setWikiNote(text) {
+    if (wikiPickerNote) wikiPickerNote.textContent = text;
+}
+
+function wikiSlotsLeft() {
+    return MAX_REFERENCE_IMAGES - currentInputImages.length;
+}
+
+let wikiThumbUrls = [];
+
+function revokeWikiThumbUrls() {
+    wikiThumbUrls.forEach(function(u) { URL.revokeObjectURL(u); });
+    wikiThumbUrls = [];
+}
+
+function closeWikiPicker() {
+    if (wikiPicker) wikiPicker.classList.remove('visible');
+    revokeWikiThumbUrls();
+}
+
+// A thumbnail that won't load is not a reason to drop the card: the full-size
+// import runs server-side and can still succeed, so the result stays pickable
+// and just says so. The <img> stays hidden until its blob is in hand --
+// an <img> with no src renders as a broken-image icon next to full-size alt
+// text, which is a wall of wreckage across a grid that is still loading.
+function loadWikiThumb(thumb, img, hit) {
+    fetch('/wiki-thumb?file=' + encodeURIComponent(hit.file), { headers: getAuthHeaders() })
+        .then(function(res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.blob(); })
+        .then(function(blob) {
+            const url = URL.createObjectURL(blob);
+            wikiThumbUrls.push(url);
+            // Reveal on decode, not on assignment: a blob that turns out not
+            // to be a picture would otherwise flash a broken-image icon.
+            img.onload = function() {
+                img.hidden = false;
+                thumb.classList.remove('loading');
+            };
+            img.onerror = function() {
+                thumb.classList.remove('loading');
+                thumb.classList.add('failed');
+            };
+            img.src = url;
+        })
+        .catch(function() {
+            thumb.classList.remove('loading');
+            thumb.classList.add('failed');
+        });
+}
+
+function attachWikiHit(hit, btn) {
+    if (wikiSlotsLeft() <= 0) {
+        setWikiNote('Already holding ' + MAX_REFERENCE_IMAGES + ' reference images \u2014 remove one first.');
+        return;
+    }
+    btn.classList.add('picked');
+    setWikiNote('Fetching ' + hit.title + '\u2026');
+    addImageSource(hit.url, function(err) {
+        if (err) {
+            btn.classList.remove('picked');
+            setWikiNote('Could not fetch ' + hit.title + ': ' + err);
+            return;
+        }
+        const left = wikiSlotsLeft();
+        setWikiNote('Added ' + hit.title + '. ' + (left > 0
+            ? left + ' reference slot' + (left === 1 ? '' : 's') + ' still free \u2014 keep picking, or close this.'
+            : 'That is all ' + MAX_REFERENCE_IMAGES + ' references.'));
+    });
+}
+
+function renderWikiHits(results) {
+    wikiPickerGrid.innerHTML = '';
+    revokeWikiThumbUrls();
+    if (!results.length) {
+        wikiPickerGrid.innerHTML = '<div class="archive-picker-empty">Nothing with an image matched that.</div>';
+        return;
+    }
+    results.forEach(function(hit) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'wiki-hit';
+        btn.title = (hit.title || '') + (hit.description ? ' \u2014 ' + hit.description : '') + '\n' + hit.file;
+        // The picture sits in a fixed-height box that carries the loading and
+        // failed states, so a card is the same size before and after its
+        // thumbnail lands and the grid never reflows under the pointer.
+        const thumb = document.createElement('div');
+        thumb.className = 'wiki-hit-thumb loading';
+        const img = document.createElement('img');
+        img.alt = '';  // decorative: the title below says the same thing
+        img.hidden = true;
+        thumb.appendChild(img);
+        btn.appendChild(thumb);
+        loadWikiThumb(thumb, img, hit);
+        const source = document.createElement('div');
+        source.className = 'wiki-hit-source';
+        source.textContent = hit.source === 'wikidata' ? 'Wikidata \u00b7 ' + hit.id : 'Commons';
+        btn.appendChild(source);
+        const title = document.createElement('div');
+        title.className = 'wiki-hit-title';
+        title.textContent = hit.title || hit.file;
+        btn.appendChild(title);
+        // Always present, even when empty: a Commons file has no description
+        // and a Wikidata entity does, and cards of two different heights make
+        // a ragged grid.
+        const desc = document.createElement('div');
+        desc.className = 'wiki-hit-desc';
+        desc.textContent = hit.description || '';
+        btn.appendChild(desc);
+        btn.addEventListener('click', function() { attachWikiHit(hit, btn); });
+        wikiPickerGrid.appendChild(btn);
+    });
+}
+
+function runWikiSearch() {
+    if (!wikiPickerGrid || !wikiSearchInput) return;
+    const q = wikiSearchInput.value.trim();
+    if (!q) return;
+    wikiPickerGrid.innerHTML = '<div class="archive-picker-empty">Searching Wikimedia\u2026</div>';
+    setWikiNote('Searching for ' + q + '\u2026');
+    fetch('/wikidata-search?q=' + encodeURIComponent(q), { headers: getAuthHeaders() })
+        .then(function(res) {
+            return res.json().catch(function() { return {}; }).then(function(data) {
+                if (!res.ok || !data.success) throw new Error(data.error || ('HTTP ' + res.status));
+                return data.results || [];
+            });
+        })
+        .then(function(results) {
+            renderWikiHits(results);
+            setWikiNote(results.length
+                ? 'Click a result to add it as a reference image.'
+                : 'No results \u2014 try a broader term.');
+        })
+        .catch(function(err) {
+            wikiPickerGrid.innerHTML = '<div class="archive-picker-empty">Search failed: ' + err.message + '</div>';
+            setWikiNote('');
+        });
+}
+
+function openWikiPicker() {
+    if (!wikiPicker) return;
+    wikiPicker.classList.add('visible');
+    setWikiNote('Click a result to add it as a reference image.');
+    if (wikiSearchInput) wikiSearchInput.focus();
+}
+
+if (wikiSearchOpenBtn) wikiSearchOpenBtn.addEventListener('click', openWikiPicker);
+if (wikiPickerClose) wikiPickerClose.addEventListener('click', closeWikiPicker);
+if (wikiSearchBtn) wikiSearchBtn.addEventListener('click', runWikiSearch);
+if (wikiSearchInput) wikiSearchInput.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') { e.preventDefault(); runWikiSearch(); }
+});
+if (wikiPicker) wikiPicker.addEventListener('click', function(e) {
+    if (e.target === wikiPicker) closeWikiPicker();
+});
+document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape' && wikiPicker && wikiPicker.classList.contains('visible')) closeWikiPicker();
 });
 
 function handleImageFile(file) {

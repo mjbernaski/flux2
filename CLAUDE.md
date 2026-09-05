@@ -38,6 +38,29 @@ python flux_cli.py [--flux2|--gguf q8|--schnell|--kontext|--full-model] [--image
 crash/OOM (max 5 retries). SERVER_OPTIONS.md documents each menu number and
 must stay in sync with the `case` statement in `run_server.sh`.
 
+On Windows the same three scripts are `run_server.ps1` / `kill_flux.ps1`, plus
+`f14.ps1 <n>`, which launches the supervisor detached from the calling terminal
+(`Start-Process -WindowStyle Hidden`) and is the preferred way to start it.
+Detaching is not cosmetic: torch ships Intel's OpenMP runtime, which installs a
+Windows console control handler that aborts the process outright when the
+console it is attached to closes or the user logs off (`forrtl: error (200):
+program aborting due to window-CLOSE event`). That killed the supervisor at the
+same instant as the server, so the retry loop above never got to run — every
+recovery was a human relaunching it. `run_server.ps1` now sets
+`FOR_DISABLE_CONSOLE_CTRL_HANDLER=1` and `KMP_HANDLE_SIGNALS=0` to stop those
+handlers being installed at all.
+
+A supervisor that dies for some *other* reason still leaves nothing to restart
+it, so `install_watchdog.ps1` registers a `FluxServerWatchdog` scheduled task
+running `watchdog.ps1` at logon and every 5 minutes. It restarts the last
+config (`.last_config`) when the port is down, and does nothing when the port
+is up, when `server.pid` names a live supervisor (a cold start that has not
+bound the port yet — relaunching over it would make the two fight forever), or
+when `.flux_stopped` exists. That sentinel is what keeps a deliberate stop
+stopped: `kill_flux.ps1` writes it and `run_server.ps1` clears it on the next
+start, so "down" and "wanted down" stay distinguishable. Restarts are logged to
+`watchdog.log`; the no-op path stays silent.
+
 ## Testing
 
 ```bash
@@ -112,6 +135,26 @@ diffusers, transformers, flask, python-dotenv, huggingface_hub, requests.
   `input_paths` (server-side file paths, resolved against `web-generated/`
   when relative) are normalized into it at validation. `/fetch-image-path`
   serves the UI's "server path → data URL" import (mirrors `/fetch-image-url`).
+- **Wikimedia reference search**: `/wikidata-search?q=` (REST:
+  `GET /api/v1/imports/search`) hunts for reference images without leaving the
+  UI. It searches Wikidata entities and takes the first image-valued property
+  each one has (`WIKIDATA_IMAGE_PROPS` — image, logo, flag, coat of arms,
+  locator map), then fills the rest of the page with Wikimedia Commons files,
+  because an entity search alone returns nothing for a descriptive query like
+  "red barn in snow". A result's `url` is a full-size Commons
+  `Special:FilePath` link and picking one is an ordinary `/fetch-image-url`
+  import of it, so the 2048px/JPEG bounding still happens in exactly one
+  place. Its `thumb`, though, points back here at `/wiki-thumb` (LRU-cached,
+  `_api_wiki_thumb`) rather than at Commons: the box that can search is by
+  definition the box with the WAN route, and a phone on the LAN that can reach
+  the UI but not Wikimedia would otherwise get a grid of broken images. Only
+  the bare filename crosses that boundary — the URL is rebuilt server-side, so
+  the proxy cannot be aimed anywhere but Commons. Wikimedia's anonymous rate
+  limits are per-IP and the proxy puts every request behind this one address,
+  so `WIKIMEDIA_TOKEN` (an OAuth 2 access token, `highvolume` scope) is sent as
+  a bearer token when set — `_wiki_headers`; unset, everything still works
+  anonymously. `requests` strips Authorization when a redirect crosses hosts,
+  so it never reaches the upload.wikimedia.org CDN.
 - **Web queue**: one worker thread, `QUEUE_MAX_SIZE=10`, jobs carry progress
   state polled by the UI via `/status`. `/generate` validates all params at the
   API boundary and returns 400s.

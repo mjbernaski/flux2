@@ -81,3 +81,8 @@ new_ui.err.log
 # f14.ps1's detached run_server.ps1 output (server.log gets the real logging)
 supervisor.out.log
 supervisor.err.log
+
+# watchdog.ps1's restart log, and the sentinel kill_flux.ps1 leaves behind so
+# the watchdog does not undo a deliberate stop
+watchdog.log
+.flux_stopped
