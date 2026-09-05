@@ -4,7 +4,8 @@ body {
     max-width: 900px;
     margin: 0 auto;
     /* Side padding respects the iPhone notch in landscape (viewport-fit=cover). */
-    padding: 20px max(20px, env(safe-area-inset-right)) 20px max(20px, env(safe-area-inset-left));
+    padding: 20px max(20px, env(safe-area-inset-right))
+             calc(86px + env(safe-area-inset-bottom, 0px)) max(20px, env(safe-area-inset-left));
     background: #1a1a2e;
     color: #eee;
 }
@@ -104,6 +105,25 @@ input[type="text"]:focus, select:focus, textarea:focus {
     display: flex;
     gap: 10px;
 }
+/* Generate/Reset own the bottom of the window at every size: the form is
+   long and the history below it is longer, so anywhere you happen to be
+   scrolled, the button that acts on the form is one tap away. Out of flow,
+   hence the body's bottom padding above — nothing must hide underneath. */
+#generateForm > .button-row {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 50;
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 10px max(20px, env(safe-area-inset-right))
+             calc(10px + env(safe-area-inset-bottom, 0px)) max(20px, env(safe-area-inset-left));
+    background: rgba(26, 26, 46, 0.92);
+    border-top: 1px solid #2a2a44;
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+}
 button {
     flex: 1;
     padding: 15px;
@@ -144,7 +164,7 @@ button:disabled {
 .watch-interrupt { margin-top: 10px; font-size: 14px; padding: 8px 18px; }
 .power-badge {
     position: fixed;
-    bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+    bottom: calc(80px + env(safe-area-inset-bottom, 0px));
     right: calc(12px + env(safe-area-inset-right, 0px));
     padding: 6px 12px;
     border: 1px solid #333;
@@ -171,7 +191,7 @@ button:disabled {
 }
 .latest-thumb {
     position: fixed;
-    bottom: calc(48px + env(safe-area-inset-bottom, 0px));
+    bottom: calc(118px + env(safe-area-inset-bottom, 0px));
     right: calc(12px + env(safe-area-inset-right, 0px));
     width: 96px;
     padding: 0;
@@ -1574,28 +1594,15 @@ button:disabled {
     .inpaint-buttons button { padding: 10px 16px; }
     .loop-base-btn { padding: 8px 14px; }
     button, a { -webkit-tap-highlight-color: rgba(0, 212, 255, 0.15); }
-
-    /* Generate/Reset float at the viewport bottom while any part of the form
-       is still below the fold, then scroll away with the form. */
-    #generateForm .button-row {
-        position: sticky;
-        bottom: 0;
-        z-index: 50;
-        padding: 10px 0 calc(10px + env(safe-area-inset-bottom, 0px));
-        background: rgba(26, 26, 46, 0.92);
-        backdrop-filter: blur(6px);
-        -webkit-backdrop-filter: blur(6px);
-    }
-
-    /* The sticky Generate/Reset row owns the viewport bottom on touch
-       devices; lift the wattage badge and latest-image thumb clear of it. */
-    .power-badge { bottom: calc(80px + env(safe-area-inset-bottom, 0px)); }
-    .latest-thumb { bottom: calc(118px + env(safe-area-inset-bottom, 0px)); }
 }
 
 /* ==== Responsive layout ==== */
 @media (max-width: 700px) {
     body {
+        padding-left: max(12px, env(safe-area-inset-left));
+        padding-right: max(12px, env(safe-area-inset-right));
+    }
+    #generateForm > .button-row {
         padding-left: max(12px, env(safe-area-inset-left));
         padding-right: max(12px, env(safe-area-inset-right));
     }
