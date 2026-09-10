@@ -750,7 +750,7 @@ def _run_job(job: Job):
     hidden = job.hidden
     out_dir = _output_dir(hidden)
     prompt = (data.get('prompt') or '').strip()
-    orientation = data.get('orientation', 'landscape')
+    orientation = data.get('orientation', 'square')
     size = data.get('size', '1mp')
     steps = int(data.get('steps', 25))
     seed = data.get('seed')
@@ -797,7 +797,7 @@ def _run_job(job: Job):
         width = int(round(in_w * factor / 8) * 8)
         height = int(round(in_h * factor / 8) * 8)
     else:
-        base_w, base_h = ORIENTATIONS_1K.get(orientation, ORIENTATIONS_1K['landscape'])
+        base_w, base_h = ORIENTATIONS_1K.get(orientation, ORIENTATIONS_1K['square'])
         width, height = int(base_w * scale), int(base_h * scale)
 
     # Inpainting regenerates only the painted region of the input image, so the

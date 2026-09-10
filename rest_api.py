@@ -651,7 +651,7 @@ def _openapi_document():
             'guidance': {'type': ['number', 'null'], 'minimum': 0},
             'strength': {'type': 'number', 'default': 0.5, 'minimum': 0, 'maximum': 1,
                          'description': 'img2img denoising strength; ignored without a reference.'},
-            'orientation': {'type': 'string', 'default': 'landscape',
+            'orientation': {'type': 'string', 'default': 'square',
                             'enum': sorted(ws.ORIENTATIONS_1K)},
             'size': {'type': 'string', 'default': '1mp', 'enum': sorted(ws.SIZES)},
             'negative_prompt': {'type': ['string', 'null'],

@@ -745,7 +745,7 @@ def build_parser():
     p.add_argument('--seed', type=int)
     p.add_argument('--guidance', type=float)
     p.add_argument('--size', default='1mp')
-    p.add_argument('--orientation', default='landscape')
+    p.add_argument('--orientation', default='square')
 
     p = add('batch', demo_batch, 'several images from one prompt')
     p.add_argument('prompt')

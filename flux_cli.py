@@ -100,7 +100,7 @@ def main():
         '2k': 2.0,
         '4k': 4.0,
     }
-    orientation = 'landscape'
+    orientation = 'square'
     size = '1k'
     base_w, base_h = orientations_1k[orientation]
     width, height = int(base_w * sizes[size]), int(base_h * sizes[size])

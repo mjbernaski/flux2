@@ -1826,7 +1826,7 @@ if (resetBtn) resetBtn.addEventListener('click', async function() {
         await fetch('/reset', { method: 'POST', headers: getAuthHeaders() });
     } catch (e) { console.warn('Reset request failed:', e); }
     var p = document.getElementById('prompt'); if (p) { p.value = ''; p.dispatchEvent(new Event('input')); }
-    var o = document.getElementById('orientation'); if (o) { o.value = 'landscape'; o.disabled = false; o.style.opacity = ''; }
+    var o = document.getElementById('orientation'); if (o) { o.value = 'square'; o.disabled = false; o.style.opacity = ''; }
     var ao = document.getElementById('allOrientations'); if (ao) ao.checked = false;
     var s = document.getElementById('size'); if (s) s.value = '1mp';
     var st = document.getElementById('steps'); if (st) st.value = '25';
@@ -2423,7 +2423,7 @@ function buildGenerateFormData() {
         prompt: promptEl ? promptEl.value : '',
         // SDXL only; the field is hidden (and stays empty) on FLUX servers.
         negative_prompt: negativeEl && negativeEl.value.trim() ? negativeEl.value.trim() : null,
-        orientation: orientationEl ? orientationEl.value : 'landscape',
+        orientation: orientationEl ? orientationEl.value : 'square',
         size: sizeEl ? sizeEl.value : '1mp',
         steps: stepsEl ? parseInt(stepsEl.value, 10) : 25,
         seed: seedValue ? parseInt(seedValue, 10) : null,

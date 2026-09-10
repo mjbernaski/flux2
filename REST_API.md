@@ -128,7 +128,7 @@ Request body — only `prompt` is required:
 | `seed` | int\|null | null | Omit for a fresh random seed per image |
 | `guidance` | float\|null | null | ≥ 0 |
 | `strength` | float | 0.5 | 0–1; img2img only |
-| `orientation` | string | `landscape` | `square`, `portrait`, `landscape`, `widescreen`, `extra-tall` |
+| `orientation` | string | `square` | `square`, `portrait`, `landscape`, `widescreen`, `extra-tall` |
 | `size` | string | `1mp` | `0.25mp` … `2mp` |
 | `negative_prompt` | string | — | SDXL only |
 | `input_images` | string[] | `[]` | Base64 or data URLs, up to 3 |
