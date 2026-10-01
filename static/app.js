@@ -110,6 +110,21 @@ if (apiKeyInput) {
                 var np = document.getElementById('negativePromptGroup');
                 if (np) np.style.display = 'block';
             }
+            window.__transparentCapable = !!data.transparent;
+            if (data.transparent) {
+                var tg = document.getElementById('transparentGroup');
+                if (tg) tg.style.display = 'block';
+            }
+            // How many references this backend takes is a property of the
+            // model (FLUX.1 one, Kontext/FLUX.2 three, Qwen ten), so the UI
+            // follows the server rather than carrying its own limit.
+            if (data.max_reference_images) {
+                MAX_REFERENCE_IMAGES = data.max_reference_images;
+                var rl = document.getElementById('refImagesLabel');
+                if (rl) rl.textContent = 'Reference Images (optional — up to '
+                    + MAX_REFERENCE_IMAGES + '; the first sets the output aspect)';
+                if (typeof syncRefUI === 'function') syncRefUI();
+            }
         })
         .catch(function() { clearTimeout(timeout); el.textContent = 'Model info unavailable (use server URL, e.g. http://localhost:2222)'; });
 })();
@@ -290,7 +305,9 @@ const uploadPlaceholder = document.getElementById('uploadPlaceholder');
 const refThumbs = document.getElementById('refThumbs');
 const multiRefHint = document.getElementById('multiRefHint');
 
-const MAX_REFERENCE_IMAGES = 3;
+// Default for the FLUX backends; /model-info raises it on a backend that
+// takes more (Qwen takes ten), which is why this is not a const.
+let MAX_REFERENCE_IMAGES = 3;
 // Data URLs of the uploaded references, in order. The first is the primary
 // (drives output aspect ratio and inpainting). currentInputImage mirrors the
 // primary for the inpaint code paths, which only ever work on one image.
@@ -673,7 +690,7 @@ function syncRefUI() {
     if (uploadPlaceholder) {
         const span = uploadPlaceholder.querySelector('span');
         if (span) span.textContent = n === 0
-            ? 'Tap or click to add up to 3 images'
+            ? `Tap or click to add up to ${MAX_REFERENCE_IMAGES} images`
             : `+ Add image (${n}/${MAX_REFERENCE_IMAGES})`;
     }
     // Strength only applies to single-image FLUX.1 img2img; multi-reference
@@ -2419,9 +2436,10 @@ function buildGenerateFormData() {
     const savePreviews = showPreview && (savePreviewsEl ? savePreviewsEl.checked : false);
 
     const negativeEl = document.getElementById('negativePrompt');
+    const transparentEl = document.getElementById('transparentMode');
     const baseFormData = {
         prompt: promptEl ? promptEl.value : '',
-        // SDXL only; the field is hidden (and stays empty) on FLUX servers.
+        // SDXL and Qwen only; the field is hidden (and stays empty) elsewhere.
         negative_prompt: negativeEl && negativeEl.value.trim() ? negativeEl.value.trim() : null,
         orientation: orientationEl ? orientationEl.value : 'square',
         size: sizeEl ? sizeEl.value : '1mp',
@@ -2435,6 +2453,13 @@ function buildGenerateFormData() {
         save_previews: savePreviews,
         selected_cells: Array.from(selectedCells)
     };
+    // Qwen only; sending it to a backend without RGBA support is a 400. The
+    // capability flag rather than the checkbox decides, because a browser that
+    // restores form state across the reload a model switch does would
+    // otherwise carry a ticked box onto a FLUX backend.
+    if (window.__transparentCapable && transparentEl && transparentEl.checked) {
+        baseFormData.transparent = true;
+    }
     if (currentInputImages.length > 0) {
         baseFormData.input_images = currentInputImages.slice(0, MAX_REFERENCE_IMAGES);
         // Legacy single-image field too, so this UI still works against an

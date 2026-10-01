@@ -1,6 +1,10 @@
 torch
 torchvision
-diffusers
+# Qwen-Image 2.1 (config 15) needs QwenImage21Pipeline, merged upstream
+# 2026-09-18 and not in the 0.40.0 release. Pinned to a commit so the
+# build is reproducible; swap back to a version spec once a release
+# carries the pipeline. Every FLUX config works on a plain release.
+diffusers @ git+https://github.com/huggingface/diffusers@256e9fbc0bf9447aab4ec58cb74b419a4586e7b8
 transformers
 accelerate
 peft  # required by diffusers' load_lora_weights (turbo + uncensored LoRAs)

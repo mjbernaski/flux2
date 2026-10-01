@@ -32,6 +32,7 @@
         <a id="previewsLink" class="top-link" target="_blank" rel="noopener"
            style="display: none;">&#9707; Previews</a>
         <a href="/alternate" class="top-link" title="Denser sidebar + main dashboard layout">&#9776; Dense view</a>
+        <a href="/simple" class="top-link" title="Prompt, Generate, image — everything else at its default">&#9679; Simple view</a>
     </div>
     <h1>FLUX Image Generator</h1>
     <!-- Model name intentionally not displayed; /model-info still drives
@@ -121,8 +122,19 @@
             <textarea id="negativePrompt" name="negativePrompt" rows="2" placeholder="worst quality, low quality, watermark, extra limbs..."></textarea>
         </div>
 
+        <div class="form-group" id="transparentGroup" style="display: none;">
+            <label class="checkbox-label">
+                <input type="checkbox" id="transparentMode" style="width: auto;">
+                Transparent background (RGBA PNG)
+            </label>
+            <div class="strength-hint">
+                Qwen generates an alpha channel natively — stickers, logos and cut-out
+                subjects come back with the background actually transparent.
+            </div>
+        </div>
+
         <div class="form-group">
-            <label>Reference Images (optional — up to 3; the first sets the output aspect)</label>
+            <label id="refImagesLabel">Reference Images (optional — up to 3; the first sets the output aspect)</label>
             <div class="image-input-container">
                 <div class="ref-strip" id="refStrip">
                     <div class="ref-thumbs" id="refThumbs"></div>
@@ -175,7 +187,7 @@
                 </div>
                 <div class="inpaint-control" id="inpaintControl" style="display: none;">
                     <label class="inpaint-toggle">
-                        <input type="checkbox" id="inpaintMode"> Inpaint &mdash; paint the area to regenerate (FLUX.2 / SDXL)
+                        <input type="checkbox" id="inpaintMode"> Inpaint &mdash; paint the area to regenerate (FLUX.2 / SDXL / Qwen)
                     </label>
                     <div class="inpaint-tools" id="inpaintTools" style="display: none;">
                         <div class="inpaint-stage" id="inpaintStage">

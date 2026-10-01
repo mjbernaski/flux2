@@ -164,7 +164,8 @@ class FluxClient:
 
     def model(self):
         """Capabilities of the loaded backend: which of negative_prompt,
-        inpaint, kontext and multi-reference this process can actually serve."""
+        transparent, inpaint, kontext and how many references this process can
+        actually serve (max_reference_images)."""
         return self.get('/model')
 
     def models(self):
@@ -192,8 +193,9 @@ class FluxClient:
         """Queue a job and return it immediately, without waiting.
 
         Accepts every generation parameter: steps, batch, seed, guidance,
-        strength, orientation, size, negative_prompt, input_images,
-        input_paths, mask_image, aspect_mode, show_preview, save_previews,
+        strength, orientation, size, negative_prompt, transparent,
+        input_images, input_paths, mask_image, aspect_mode, show_preview,
+        save_previews,
         spectrum_grid, spectrum_same_seed, selected_cells,
         expansion_same_seed. See GET /api/v1/openapi.json for the full schema.
 
@@ -480,8 +482,10 @@ def demo_health(client, args):
     caps = [name for name, on in (('negative prompts', info['negative_prompt']),
                                   ('inpainting', info['inpaint']),
                                   ('kontext editing', info['kontext']),
+                                  ('transparency (RGBA)', info.get('transparent')),
                                   ('turbo LoRA', info['turbo'])) if on]
     print(f"can:    {', '.join(caps) or 'text-to-image only'}")
+    print(f"refs:   up to {info.get('max_reference_images', 3)} reference images")
     tele = client.telemetry()
     if tele.get('power_w'):
         print(f"gpu:    {tele['power_w']}W")

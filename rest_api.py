@@ -655,17 +655,22 @@ def _openapi_document():
                             'enum': sorted(ws.ORIENTATIONS_1K)},
             'size': {'type': 'string', 'default': '1mp', 'enum': sorted(ws.SIZES)},
             'negative_prompt': {'type': ['string', 'null'],
-                                'description': 'SDXL backend only.'},
+                                'description': 'SDXL and Qwen backends only. On Qwen it '
+                                               'turns on true CFG at the guidance value.'},
+            'transparent': {'type': 'boolean', 'default': False,
+                            'description': 'Qwen backend only: ask for a transparent '
+                                           'background and keep the RGBA alpha channel.'},
             'input_images': {'type': 'array', 'items': {'type': 'string'},
                              'maxItems': ws.MAX_REFERENCE_IMAGES,
                              'description': 'Reference images as base64 or data URLs. '
-                                            'More than one requires Kontext or FLUX.2.'},
+                                            'More than one requires Kontext, FLUX.2 or '
+                                            'Qwen (which takes up to 10).'},
             'input_paths': {'type': 'array', 'items': {'type': 'string'},
                             'description': 'Server-side paths, loaded and folded into '
                                            'input_images.'},
             'mask_image': {'type': ['string', 'null'],
                            'description': 'Inpainting mask; requires exactly one input '
-                                          'image and a FLUX.2 or SDXL backend.'},
+                                          'image and a FLUX.2, SDXL or Qwen backend.'},
             'aspect_mode': {'type': 'string', 'default': 'keep',
                             'description': '"keep" derives output dims from the reference.'},
             'show_preview': {'type': 'boolean', 'default': False,

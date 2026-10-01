@@ -35,13 +35,19 @@ load_dotenv()
 VERSION = "1.3.0"
 
 # Import model components from flux_core (model loading + generation).
-# `--sdxl` swaps in sd_core, the uncensored Stable Diffusion XL backend —
-# it mirrors the slice of flux_core's surface this server uses, so every
+# `--sdxl` swaps in sd_core, the uncensored Stable Diffusion XL backend, and
+# `--qwen` swaps in qwen_core, the Qwen-Image 2.1 generator/editor. Each
+# mirrors the slice of flux_core's surface this server uses, so every
 # flux_core.* reference below resolves against whichever core is active.
 import sys
 _SDXL_ACTIVE = '--sdxl' in sys.argv
+_QWEN_ACTIVE = '--qwen' in sys.argv
+if _SDXL_ACTIVE and _QWEN_ACTIVE:
+    sys.exit("--sdxl and --qwen select different backends; pass only one.")
 if _SDXL_ACTIVE:
     import sd_core as flux_core
+elif _QWEN_ACTIVE:
+    import qwen_core as flux_core
 else:
     import flux_core
 load_model = flux_core.load_model
@@ -93,7 +99,7 @@ def check_auth():
 # security; /ready must be reachable before the user can enter their API key.
 # rest_api.PUBLIC_ENDPOINTS adds the REST layer's equivalents (its /health and
 # self-describing documents) for the same reasons.
-PUBLIC_ENDPOINTS = ['index', 'alternate', 'static', 'serve_image', 'ready']
+PUBLIC_ENDPOINTS = ['index', 'alternate', 'simple', 'static', 'serve_image', 'ready']
 
 
 @app.before_request
@@ -202,7 +208,7 @@ def _hidden_requested(explicit=None):
     return False
 
 # Queue configuration
-QUEUE_MAX_SIZE = 10
+QUEUE_MAX_SIZE = 500
 RECENT_DONE_MAX = 10
 # How many finished images the queue view rolls up as "just generated".
 RECENT_IMAGES_MAX = 5
@@ -227,6 +233,7 @@ SERVER_CONFIGS = {
     12: "FLUX.1 Kontext Full + U-LoRA",
     13: "SDXL (photoreal)",
     14: "FLUX.2-klein-4B",
+    15: "Qwen-Image 2.1",
 }
 SWITCH_EXIT_CODE = 86
 SWITCH_CONFIG_FILE = ".next_config"
@@ -278,6 +285,47 @@ def _ollama_call_params(model):
 
 PREVIEW_FILENAME = "_preview_current.png"
 PREVIEW_MIN_INTERVAL_S = 0.75  # throttle: skip decode if last preview was this recent
+
+# ---- Sysmem-fallback detection ("the server froze") ----
+# Symptom: a generation that normally runs at ~0.5s/step instead runs at
+# 47-110s/step, uniformly, from the first step to the last. It is not a stall
+# and not a crash - the HTTP layer keeps answering, the progress bar keeps
+# moving, nothing is logged - so from the UI it reads as a frozen server, and
+# the only evidence is a 20-50 minute job sitting in server.log. Observed 27
+# times in ~6900 generations, at every resolution and every server uptime.
+#
+# The cause is outside this process: the card is shared with a desktop
+# (browsers, Discord, game launchers, overlays), and when their demand pushes
+# total VRAM past the card, the Windows WDDM driver silently pages this
+# process's resident weights out to system RAM. Every step then pays PCIe
+# round-trips, at a steady rate, forever. Note that the
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments run_server.ps1 sets for the
+# *fragmentation* case does nothing for this one - torch logs
+# "expandable_segments not supported on this platform" on Windows at startup.
+#
+# There is nothing to poll: nvidia-smi reports no per-process memory under
+# WDDM and the driver raises no error. Wall-clock per step is the only thing
+# that changes, so that is what we watch. A healthy pace is learned per
+# resolution from the runs themselves, and a job whose steps collapse past
+# SLOW_STEP_FACTOR times that pace is failed with an error saying what
+# happened - which is strictly better than crawling for an hour, because a
+# failed job is visible in /status, in the note, and to the supervisor.
+# FLUX_SLOW_STEP_FACTOR=0 disables the check.
+SLOW_STEP_FACTOR = float(os.environ.get("FLUX_SLOW_STEP_FACTOR", "5.0"))
+# Backstop for the first run at a given size, before any baseline exists.
+# Healthy steps on this box are 0.5-1.7s; nothing legitimately takes 20s at
+# this size, and the observed bad runs were 47s, 83s and 110s.
+SLOW_STEP_ABS_S = float(os.environ.get("FLUX_SLOW_STEP_ABS_S", "20.0"))
+SLOW_STEP_ABS_MAX_MP = 2.0
+# Skip the opening steps: the first carries one-time warmup (lazy kernels,
+# torch.compile under --compile, the first preview decode).
+SLOW_STEP_WARMUP = 2
+# Consecutive slow steps before calling it, so one spike - another process
+# grabbing the card for a moment - does not kill a healthy job.
+SLOW_STEP_STREAK = 3
+# (width, height) -> fastest median s/step seen at that size.
+_step_baseline = {}
+_step_baseline_lock = threading.Lock()
 
 # GPU power draw for the UI's corner wattage badge. nvidia-smi takes ~100ms
 # per call, so the reading is cached and refreshed at most every 2s even
@@ -357,6 +405,109 @@ def _gpu_power_watts():
 class JobCanceled(Exception):
     """Raised inside the generation loop when the user interrupts the running
     job; unwinds out of the diffusers pipeline back to the queue worker."""
+
+
+class GpuDegraded(Exception):
+    """Raised inside the generation loop when steps have collapsed to
+    sysmem-fallback speed; unwinds out of the pipeline so the worker fails the
+    job loudly instead of letting it crawl. See the SLOW_STEP_* block above."""
+
+
+def _baseline_for(width, height):
+    with _step_baseline_lock:
+        return _step_baseline.get((width, height))
+
+
+def _record_baseline(width, height, median_s):
+    """Remember the *fastest* median seen per resolution.
+
+    Taking the minimum rather than an average matters: the degraded runs this
+    baseline exists to catch are themselves samples, and averaging them in
+    would drag the bar up until a 47s/step run looked normal."""
+    if not median_s or median_s <= 0:
+        return
+    with _step_baseline_lock:
+        cur = _step_baseline.get((width, height))
+        if cur is None or median_s < cur:
+            _step_baseline[(width, height)] = median_s
+
+
+def _median(values):
+    vals = sorted(v for v in values if v > 0)
+    if not vals:
+        return None
+    mid = len(vals) // 2
+    return vals[mid] if len(vals) % 2 else (vals[mid - 1] + vals[mid]) / 2
+
+
+def _check_step_pace(job, width, height, dt, state):
+    """Fail the job if this step, and the two before it, ran far slower than
+    this resolution's known-healthy pace. Called once per completed step."""
+    if SLOW_STEP_FACTOR <= 0 or len(job.step_times) <= SLOW_STEP_WARMUP:
+        return
+    baseline = _baseline_for(width, height)
+    if baseline is not None:
+        limit = baseline * SLOW_STEP_FACTOR
+        against = f"a {baseline:.2f}s healthy step at {width}x{height}"
+    elif (width * height) <= SLOW_STEP_ABS_MAX_MP * 1_000_000:
+        limit = SLOW_STEP_ABS_S
+        against = f"the {SLOW_STEP_ABS_S:.0f}s backstop at {width}x{height} (no baseline yet)"
+    else:
+        # Big and unmeasured: no honest threshold to judge it against.
+        return
+    if dt <= limit:
+        state["slow"] = 0
+        return
+    state["slow"] += 1
+    print(f"[gpu] slow step {state['slow']}/{SLOW_STEP_STREAK}: "
+          f"{dt:.1f}s vs {against}", flush=True)
+    if state["slow"] < SLOW_STEP_STREAK:
+        return
+    projected = dt * (job.total_steps or len(job.step_times)) / 60
+    raise GpuDegraded(
+        f"GPU appears to be paging to system RAM: {dt:.1f}s/step against "
+        f"{against}, {SLOW_STEP_STREAK} steps running. This job would take "
+        f"~{projected:.0f} min instead of seconds, so it was stopped. "
+        f"Something else on this box is holding the VRAM this model needs - "
+        f"close GPU-heavy apps (browsers, Discord, game launchers) or restart "
+        f"the server to reclaim the card. Set FLUX_SLOW_STEP_FACTOR=0 to "
+        f"disable this check."
+    )
+
+
+def _gpu_memory_note():
+    """"free/total GB" for the log, or None. torch.cuda.mem_get_info asks the
+    driver directly - unlike nvidia-smi it needs no subprocess, and unlike
+    torch's own allocator counters it sees what *other* processes took, which
+    is the number that decides whether this job is about to get evicted."""
+    try:
+        free, total = flux_core.torch.cuda.mem_get_info()
+        return f"{free / 1024**3:.1f}/{total / 1024**3:.1f}GB free"
+    except Exception:
+        return None
+
+
+def _release_gpu_cache():
+    """Hand the caching allocator's unused blocks back to the driver between
+    jobs.
+
+    PyTorch keeps freed blocks reserved for reuse, so an idle server sits on
+    memory it is not using. On a card shared with a desktop that is the
+    difference between the browser finding room and the driver evicting this
+    process's weights to system RAM. Re-reserving on the next job costs
+    milliseconds; being evicted costs an hour (see GpuDegraded)."""
+    try:
+        torch = flux_core.torch
+        if not torch.cuda.is_available():
+            return
+        before = torch.cuda.memory_reserved()
+        torch.cuda.empty_cache()
+        freed = before - torch.cuda.memory_reserved()
+        if freed > 256 * 1024 * 1024:
+            print(f"[gpu] released {freed / 1024**3:.1f}GB reserved cache "
+                  f"({_gpu_memory_note()})", flush=True)
+    except Exception as e:
+        print(f"[gpu] empty_cache failed: {e}", flush=True)
 
 
 class ApiError(Exception):
@@ -757,22 +908,28 @@ def _run_job(job: Job):
     guidance_scale = data.get('guidance')
     batch = min(max(int(data.get('batch', 1)), 1), 128)
 
-    # negative_prompt is SDXL-only (validated at the boundary); pass it as an
-    # extra kwarg only on cores that take it, so flux_core's signature is
-    # untouched.
+    # negative_prompt (SDXL, Qwen) and transparent (Qwen) are backend-specific
+    # and validated at the boundary; pass each as an extra kwarg only on cores
+    # that take it, so flux_core's signature is untouched.
     _neg_kwargs = {}
     if getattr(flux_core, 'SUPPORTS_NEGATIVE_PROMPT', False):
         _neg_kwargs['negative_prompt'] = (data.get('negative_prompt') or '').strip() or None
+    if getattr(flux_core, 'SUPPORTS_TRANSPARENCY', False):
+        _neg_kwargs['transparent'] = bool(data.get('transparent'))
 
     # Reference images (validated and normalized to `input_images` by /generate).
     # The first is the primary — it drives output dimensions and inpainting;
     # generate_image handles the multi-reference semantics per model family.
     strength = float(data.get('strength', 0.5))
+    # A backend that understands transparency (Qwen) can edit an RGBA layer,
+    # so its references keep their alpha; everywhere else it is flattened as
+    # before, since the FLUX/SDXL pipelines only take 3 channels.
+    _ref_mode = 'RGBA' if getattr(flux_core, 'SUPPORTS_TRANSPARENCY', False) else 'RGB'
     input_images = []
     for b64 in data.get('input_images') or []:
         if ',' in b64:
             b64 = b64.split(',', 1)[1]
-        input_images.append(Image.open(io.BytesIO(base64.b64decode(b64))).convert('RGB'))
+        input_images.append(Image.open(io.BytesIO(base64.b64decode(b64))).convert(_ref_mode))
     input_image = input_images[0] if input_images else None
     gen_input = input_images if len(input_images) > 1 else input_image
 
@@ -857,6 +1014,9 @@ def _run_job(job: Job):
     save_previews = show_preview and bool(data.get('save_previews', False))
     steps_dir = os.path.join(out_dir, 'steps')
     preview_state = {"last_decode": 0.0}
+    # "t" is the clock at the END of the previous callback, so the interval we
+    # measure is the step itself and not the preview decode we just did.
+    step_state = {"t": None, "slow": 0}
 
     def _check_cancel():
         if job.cancel_requested:
@@ -866,6 +1026,17 @@ def _run_job(job: Job):
         # Interrupt point: raising here unwinds out of the denoising loop
         # mid-generation (the worker catches JobCanceled).
         _check_cancel()
+        # Reset here rather than beside each `job.step = 0`: every pipeline
+        # path (batch, spectrum grid, img2img, inpaint) comes through this
+        # callback, and step_times describes the image being made right now.
+        if step_index == 0:
+            job.step_times.clear()
+            step_state["t"] = None
+            step_state["slow"] = 0
+        elif step_state["t"] is not None:
+            dt = time.perf_counter() - step_state["t"]
+            job.step_times.append(round(dt, 3))
+            _check_step_pace(job, width, height, dt, step_state)
         # The scheduler holds the *actual* timesteps for this run. For img2img the
         # pipeline only denoises ~steps*strength of them (and turbo/schnell clamp
         # the count too), so the requested `steps` overstates the work. Read the
@@ -905,6 +1076,13 @@ def _run_job(job: Job):
                             job.saved_previews += 1
                         except Exception as e:
                             print(f"[preview] frame save failed: {e}", flush=True)
+        # Learn this size's healthy pace from the run itself. Reaching the
+        # last step means the run was never failed as degraded, and
+        # _record_baseline keeps the minimum, so a merely-slow run cannot
+        # raise the bar for the next one.
+        if job.total_steps and (step_index + 1) >= job.total_steps:
+            _record_baseline(width, height, _median(job.step_times[SLOW_STEP_WARMUP:]))
+        step_state["t"] = time.perf_counter()
         return callback_kwargs
 
     start_time = time.perf_counter()
@@ -1063,12 +1241,22 @@ def _queue_worker():
             _running_job = job
         job.state = 'running'
         job.started_at = time.time()
+        # Recorded per job because it is the number that explains a GpuDegraded
+        # failure after the fact: how much of the card was actually ours when
+        # this job started.
+        mem = _gpu_memory_note()
+        if mem:
+            print(f"[queue] job {job.id} starting ({mem})", flush=True)
         try:
             _run_job(job)
             job.state = 'done'
         except JobCanceled:
             print(f"[queue] job {job.id} interrupted by user", flush=True)
             job.state = 'canceled'
+        except GpuDegraded as e:
+            print(f"[queue] job {job.id} stopped: {e}", flush=True)
+            job.state = 'failed'
+            job.error = str(e)
         except Exception as e:
             print(f"[queue] job {job.id} failed: {e}", flush=True)
             job.state = 'failed'
@@ -1103,6 +1291,10 @@ def _queue_worker():
                 _multi_run_record(job)
             # Tiles the group's images once this is the last member to finish.
             _expansion_record(job)
+            # Give back what this job reserved but no longer needs, so the
+            # desktop's own GPU clients have somewhere to grow other than into
+            # our resident weights.
+            _release_gpu_cache()
             _multi_run_advance()
 
 
@@ -1428,6 +1620,15 @@ def alternate():
     return app.send_static_file('alternate.html')
 
 
+@app.route('/simple')
+def simple():
+    # A deliberately minimal front end: prompt, Generate, image, and nothing
+    # else. It shares no code with app.js — it talks to /api/v1 directly and
+    # leaves every generation parameter at the server's default — so it stays
+    # small enough to read, and cannot be broken by changes to the full UI.
+    return app.send_static_file('simple.html')
+
+
 @app.route('/ready')
 def ready():
     return jsonify(_api_readiness())
@@ -1596,7 +1797,15 @@ def _validate_generate_params(data):
         if not isinstance(data['negative_prompt'], str):
             return "negative_prompt must be a string"
         if not getattr(flux_core, 'SUPPORTS_NEGATIVE_PROMPT', False):
-            return "negative_prompt requires the SDXL backend (start the server with --sdxl)"
+            return ("negative_prompt requires the SDXL or Qwen backend "
+                    "(start the server with --sdxl or --qwen)")
+
+    if data.get('transparent') is not None:
+        if not isinstance(data['transparent'], bool):
+            return "transparent must be a boolean"
+        if data['transparent'] and not getattr(flux_core, 'SUPPORTS_TRANSPARENCY', False):
+            return ("transparent (RGBA output) requires the Qwen backend "
+                    "(start the server with --qwen)")
 
     if data.get('orientation') is not None and data['orientation'] not in ORIENTATIONS_1K:
         return f"orientation must be one of {sorted(ORIENTATIONS_1K)}"
@@ -1640,7 +1849,8 @@ def _validate_generate_params(data):
         imgs.append(_image_to_data_url(image))
     if len(imgs) > MAX_REFERENCE_IMAGES:
         return f"at most {MAX_REFERENCE_IMAGES} reference images are supported"
-    if len(imgs) > 1 and not (flux_core._kontext_enabled or flux_core._flux_version == 2):
+    if len(imgs) > 1 and not (flux_core._kontext_enabled or flux_core._flux_version == 2
+                              or getattr(flux_core, 'SUPPORTS_MULTI_REFERENCE', False)):
         return ("multiple reference images require the Kontext editor or a "
                 "FLUX.2 server; this server's FLUX.1 img2img takes one image")
     data['input_images'] = imgs
@@ -1652,7 +1862,7 @@ def _validate_generate_params(data):
         if len(imgs) != 1:
             return "inpainting (mask_image) requires exactly one input image"
         if flux_core._flux_version != 2 and not getattr(flux_core, 'SUPPORTS_INPAINT', False):
-            return "inpainting (mask_image) requires a FLUX.2 or SDXL server"
+            return "inpainting (mask_image) requires a FLUX.2, SDXL or Qwen server"
 
     return None
 
@@ -2144,7 +2354,10 @@ def _api_start_multi_run(data):
         raise ApiError('multi-model runs are text-to-image only (remove reference images)',
                        400, 'invalid_request')
     if data.get('negative_prompt'):
-        raise ApiError('negative_prompt is SDXL-only and not supported in multi-model runs',
+        raise ApiError('negative_prompt is backend-specific (SDXL, Qwen) and not '
+                       'supported in multi-model runs', 400, 'invalid_request')
+    if data.get('transparent'):
+        raise ApiError('transparent is Qwen-only and not supported in multi-model runs',
                        400, 'invalid_request')
 
     params = {'prompt': prompt}
@@ -2242,6 +2455,8 @@ def _model_type_string():
         # Deliberately not the checkpoint basename — this string shows in the
         # UI's model-name hover, and checkpoint repo ids can be lurid.
         return "SDXL (photoreal)"
+    if _QWEN_ACTIVE:
+        return f"Qwen-Image 2.1 ({flux_core.model_name()})"
     if _kontext:
         kontext_prec = "full bf16" if _full_model else "4-bit"
         return f"FLUX.1-Kontext (editor, {kontext_prec})"
@@ -2264,6 +2479,7 @@ def _api_model_info():
     prompts, inpainting, Kontext editing) this process can actually serve."""
     model_type = _model_type_string()
     encoder_type = ("local CLIP encoders" if _SDXL_ACTIVE
+                    else "local Qwen3-VL encoder" if _QWEN_ACTIVE
                     else "local encoder" if _local_encoder else "remote encoder")
     turbo_str = " + Turbo" if flux_core._turbo_enabled else ""
     uncensored_str = " + U-LoRA" if flux_core._uncensored_enabled and not _SDXL_ACTIVE else ""
@@ -2276,8 +2492,13 @@ def _api_model_info():
         'kontext': flux_core._kontext_enabled,
         'flux_version': flux_core._flux_version,
         'sd': _SDXL_ACTIVE,
+        'qwen': _QWEN_ACTIVE,
         'negative_prompt': getattr(flux_core, 'SUPPORTS_NEGATIVE_PROMPT', False),
         'inpaint': flux_core._flux_version == 2 or getattr(flux_core, 'SUPPORTS_INPAINT', False),
+        # RGBA generation, and how many references this backend takes — the UI
+        # reads both rather than hardcoding FLUX's limit of 3.
+        'transparent': getattr(flux_core, 'SUPPORTS_TRANSPARENCY', False),
+        'max_reference_images': MAX_REFERENCE_IMAGES,
         'vae_tiling': getattr(flux_core, '_vae_tiling_mode', 'auto'),
         'vae_tiling_threshold_mp': getattr(flux_core, '_vae_tiling_threshold_mp', None),
         'hostname': socket.gethostname(),
@@ -3099,6 +3320,8 @@ def _boost_family(has_image=False):
     never the delta."""
     if _SDXL_ACTIVE:
         return 'sdxl-img2img' if has_image else 'sdxl'
+    if _QWEN_ACTIVE:
+        return 'qwen-edit' if has_image else 'qwen'
     if _kontext:
         return 'kontext'
     if flux_core._flux_version == 2:
@@ -3503,6 +3726,18 @@ if __name__ == '__main__':
                              ".safetensors (e.g. a Civitai download); default is "
                              "a photoreal merge (or the SD_MODEL env var). "
                              "Enables negative prompts; ignores the FLUX model flags.")
+    parser.add_argument("--qwen", nargs='?', const='', default=None, metavar='MODEL',
+                        help="Serve Qwen-Image 2.1 instead of FLUX: one model for "
+                             "text-to-image and instruction editing, up to 10 reference "
+                             "images, native RGBA output. Optional MODEL is an HF repo id "
+                             "or local diffusers dir (default Qwen/Qwen-Image-2.1, or the "
+                             "QWEN_MODEL env var). Enables negative prompts (true CFG) and "
+                             "transparency; ignores the FLUX model flags. Pair with "
+                             "--quantize-encoder on a 32GB card")
+    parser.add_argument("--cpu-offload", action="store_true",
+                        help="Qwen backend: keep only the component in use on the GPU "
+                             "(diffusers model CPU offload). Much slower per step, but it "
+                             "fits where the full pipeline does not")
     parser.add_argument("--compile", action="store_true", help="torch.compile the transformer after load: the first generation per resolution is much slower (compilation), later ones ~10-25%% faster. Best when generating at consistent resolutions")
     parser.add_argument("--port", type=int, default=PORT, help=f"Port (default: {PORT})")
     args = parser.parse_args()
@@ -3518,7 +3753,8 @@ if __name__ == '__main__':
     if args.uncensored and not args.full_model: _full_model = True
     # Turbo LoRA is a FLUX.2-dev LoRA — don't auto-enable for klein (different
     # architecture) or the SDXL backend.
-    _turbo = (args.turbo or (args.flux2 and not _klein)) and not args.no_turbo and not _SDXL_ACTIVE
+    _turbo = ((args.turbo or (args.flux2 and not _klein)) and not args.no_turbo
+              and not _SDXL_ACTIVE and not _QWEN_ACTIVE)
 
     def _load_in_background():
         global _model_ready, _model_load_error, _model_load_status
@@ -3527,6 +3763,13 @@ if __name__ == '__main__':
                 _model_load_status = "loading SDXL model"
                 print("Loading SDXL...")
                 load_model(model_id=args.sdxl or None, vae_tiling=args.vae_tiling)
+            elif _QWEN_ACTIVE:
+                _model_load_status = "loading Qwen-Image 2.1"
+                print("Loading Qwen-Image 2.1...")
+                load_model(model_id=args.qwen or None,
+                           quantize_encoder=args.quantize_encoder,
+                           cpu_offload=args.cpu_offload,
+                           vae_tiling=args.vae_tiling)
             else:
                 _model_name = "FLUX.1-Kontext" if _kontext else ("FLUX.2" if _flux2 else "FLUX.1")
                 _model_load_status = f"loading {_model_name} model"

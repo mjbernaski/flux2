@@ -63,6 +63,11 @@ function Get-ConfigArgs([int]$Config) {
         # bf16 encoder: 31.8/32.6GB resident at 1.25MP, and generations at
         # 1.75MP+ stalled on the last step paging to system RAM.
         14 { @{ Args = @("--klein-4b", "--quantize-encoder");      Desc = "FLUX.2-klein-4B (NF4 encoder)" } }
+        # Qwen-Image 2.1: 7B transformer + Qwen3-VL 8B encoder is ~30GB in
+        # bf16, which is the same trap as configs 9 and 14 on a 32GB card.
+        # NF4 encoder (~5GB) brings the pair to ~20GB and leaves room for a
+        # 2K decode. Drop --quantize-encoder on a bigger card.
+        15 { @{ Args = @("--qwen", "--quantize-encoder");          Desc = "Qwen-Image 2.1 (NF4 encoder)" } }
         default { $null }
     }
 }
@@ -94,6 +99,9 @@ function Show-Menu {
     Write-Host ""
     Write-Host "  Stable Diffusion (SDXL)" -ForegroundColor Yellow
     Write-Host "   13) SDXL photoreal   Photoreal checkpoint, negative prompts"
+    Write-Host ""
+    Write-Host "  Qwen" -ForegroundColor Yellow
+    Write-Host "   15) Qwen-Image 2.1   Generate + edit, 10 refs, transparency"
     Write-Host ""
     Write-Host "    q) Quit" -ForegroundColor Red
     Write-Host ""
@@ -259,7 +267,7 @@ function Start-FluxServer([int]$Config, [string[]]$ExtraArgs = @()) {
                 $newConfig = (Get-Content $SwitchConfigFile -Raw).Trim()
                 Remove-Item $SwitchConfigFile -Force
                 $newCfg = $null
-                if ($newConfig -match '^([1-9]|1[0-4])$') { $newCfg = Get-ConfigArgs ([int]$newConfig) }
+                if ($newConfig -match '^([1-9]|1[0-5])$') { $newCfg = Get-ConfigArgs ([int]$newConfig) }
                 if ($newCfg) {
                     $Config = [int]$newConfig
                     $cfg = $newCfg
@@ -306,11 +314,11 @@ $rest = @($args | Select-Object -Skip 1)
 
 if ($first -eq "last") {
     $lastConfig = Get-Content $LastConfigFile -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($lastConfig -notmatch '^([1-9]|1[0-4])$') { $lastConfig = 9 }
+    if ($lastConfig -notmatch '^([1-9]|1[0-5])$') { $lastConfig = 9 }
     exit (Start-FluxServer ([int]$lastConfig) $rest)
 }
 
-if ($first -match '^([1-9]|1[0-4])$') {
+if ($first -match '^([1-9]|1[0-5])$') {
     exit (Start-FluxServer ([int]$first) $rest)
 }
 
@@ -322,10 +330,10 @@ if (-not $first -and [Console]::IsInputRedirected) {
 
 while ($true) {
     Show-Menu
-    $choice = Read-Host "Select configuration [1-14, default=9, q to quit]"
+    $choice = Read-Host "Select configuration [1-15, default=9, q to quit]"
     if ([string]::IsNullOrWhiteSpace($choice)) { $choice = "9" }
     if ($choice -match '^[qQ]$') { Write-Host "Goodbye!" -ForegroundColor Green; exit 0 }
-    if ($choice -match '^([1-9]|1[0-4])$') {
+    if ($choice -match '^([1-9]|1[0-5])$') {
         exit (Start-FluxServer ([int]$choice))
     }
     Write-Host "Invalid selection. Press Enter to continue..." -ForegroundColor Red

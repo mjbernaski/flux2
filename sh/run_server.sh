@@ -60,6 +60,9 @@ show_menu() {
     echo -e "  ${YELLOW}Stable Diffusion (SDXL)${NC}"
     echo -e "   ${GREEN}13)${NC} SDXL photoreal   Photoreal checkpoint, negative prompts"
     echo ""
+    echo -e "  ${YELLOW}Qwen${NC}"
+    echo -e "   ${GREEN}15)${NC} Qwen-Image 2.1   Generate + edit, 10 refs, transparency"
+    echo ""
     echo -e "    ${RED}q)${NC} Quit"
     echo ""
 }
@@ -130,6 +133,15 @@ set_config_args() {
         14)
             args="--klein-4b"
             desc="FLUX.2-klein-4B"
+            ;;
+        15)
+            # Qwen-Image 2.1 (qwen_core.py backend): one model for text-to-image
+            # and instruction editing, up to 10 references, RGBA output.
+            # Override the checkpoint with QWEN_MODEL=<repo-or-path>. On a
+            # discrete 32GB card add --quantize-encoder; unified memory here
+            # keeps the Qwen3-VL encoder in bf16.
+            args="--qwen"
+            desc="Qwen-Image 2.1"
             ;;
         *)
             echo -e "${RED}Invalid selection${NC}"
@@ -258,7 +270,7 @@ start_server() {
             local new_config
             new_config=$(cat "$SWITCH_CONFIG_FILE")
             rm -f "$SWITCH_CONFIG_FILE"
-            if [[ "$new_config" =~ ^([1-9]|1[0-4])$ ]] && set_config_args "$new_config"; then
+            if [[ "$new_config" =~ ^([1-9]|1[0-5])$ ]] && set_config_args "$new_config"; then
                 config=$new_config
             else
                 echo -e "${RED}Invalid switch request '$new_config' — restarting current model${NC}" | tee -a "$log_file"
@@ -326,7 +338,7 @@ main() {
     if [ "$1" = "last" ]; then
         local last_config
         last_config=$(cat "$LAST_CONFIG_FILE" 2>/dev/null)
-        if ! [[ "$last_config" =~ ^([1-9]|1[0-4])$ ]]; then
+        if ! [[ "$last_config" =~ ^([1-9]|1[0-5])$ ]]; then
             last_config=9
         fi
         shift
@@ -335,7 +347,7 @@ main() {
     fi
 
     # Check if a number was passed as argument
-    if [ -n "$1" ] && [[ "$1" =~ ^([1-9]|1[0-4])$ ]]; then
+    if [ -n "$1" ] && [[ "$1" =~ ^([1-9]|1[0-5])$ ]]; then
         start_server "$@"
         exit $?
     fi
@@ -348,7 +360,7 @@ main() {
 
     while true; do
         show_menu
-        echo -ne "${CYAN}Select configuration [1-14, default=9, q to quit]: ${NC}"
+        echo -ne "${CYAN}Select configuration [1-15, default=9, q to quit]: ${NC}"
         read -r choice
         # Empty input → run default (klein)
         if [ -z "$choice" ]; then
@@ -356,7 +368,7 @@ main() {
         fi
 
         case $choice in
-            [1-9]|1[0-4])
+            [1-9]|1[0-5])
                 start_server "$choice"
                 exit $?
                 ;;

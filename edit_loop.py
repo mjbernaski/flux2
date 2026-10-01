@@ -729,6 +729,24 @@ BOOST_GUIDANCE = {
         "with the subject first and style/quality terms (e.g. "
         "'photorealistic, sharp focus, detailed') at the end."
     ),
+    # Distilled from Qwen's own prompt-rewriting checkpoint (Qwen-Image-2.1-PE-T2I),
+    # which is a 9B VLM we don't run: the shape it was trained to produce is
+    # described here instead, so the boost VLM writes in the same idiom.
+    "qwen": (
+        "The target model is Qwen-Image 2.1, whose encoder is a Qwen3-VL "
+        "language model. Write one long English paragraph that describes the "
+        "FINISHED image as an observer reporting what is in the frame — never "
+        "as an instruction to a renderer. Open with one sentence naming the "
+        "medium and style (photograph, poster, illustration, 3D render...), "
+        "the subject, and the background or palette, then work through the "
+        "frame: subject appearance, placement and scale, setting, "
+        "composition, lighting, colour, mood. The model is unusually strong "
+        "at rendered text, so any words that must appear in the image go in "
+        "double quotes, copied character for character, with their position "
+        "and the look of the lettering stated. Never use negative phrasing "
+        "('no X', 'without Y') — that is what the negative prompt field is "
+        "for. Do not mention aspect ratio, resolution or pixel counts."
+    ),
 }
 
 # When the user has attached reference image(s), the nature of the prompt
@@ -742,6 +760,22 @@ BOOST_GUIDANCE["flux2-edit"] = (
     "what to change, add or remove and the desired result, ending with "
     "what must stay the same. Do NOT describe the whole scene from "
     "scratch; the reference supplies it."
+)
+BOOST_GUIDANCE["qwen-edit"] = (
+    "The target model is Qwen-Image 2.1 editing the user's attached "
+    "reference image(s). Rewrite the instruction so the model cannot have to "
+    "guess: name exactly the attribute(s) to change and how the result should "
+    "look, and push each named change to an unmistakable degree. Everything "
+    "not named must be held at input fidelity — say so in one blanket "
+    "preservation clause naming untouched content by type and position "
+    "rather than describing its appearance, because describing something you "
+    "meant to keep reads as an instruction to repaint it. Faces, product "
+    "markings and the medium of the original (photo, anime, 3D render) "
+    "survive every edit unless the user targeted them; where identity comes "
+    "from a reference image, point at that image instead of describing the "
+    "features in words. When several images are attached, refer to them in "
+    "order as the first, second, third image. Do not describe the whole "
+    "scene from scratch — the reference supplies it."
 )
 BOOST_GUIDANCE["sdxl-img2img"] = (
     BOOST_GUIDANCE["sdxl"] + " The user has attached a starting image "

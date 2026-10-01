@@ -75,7 +75,7 @@ $Config = 9
 $lastConfigFile = Join-Path $FluxRoot ".last_config"
 if (Test-Path $lastConfigFile) {
     $last = (Get-Content $lastConfigFile -ErrorAction SilentlyContinue | Select-Object -First 1)
-    if ($last -match '^([1-9]|1[0-4])$') { $Config = [int]$last }
+    if ($last -match '^([1-9]|1[0-5])$') { $Config = [int]$last }
 }
 
 $launcher = Join-Path $FluxRoot "f14.ps1"

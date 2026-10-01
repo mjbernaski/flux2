@@ -41,8 +41,28 @@ if (-not (Test-Path $watchdog)) {
 
 # PowerShell 7 if present, Windows PowerShell otherwise - watchdog.ps1 runs
 # under both.
-$pwshCmd = Get-Command pwsh.exe -ErrorAction SilentlyContinue
-$shell = if ($pwshCmd) { $pwshCmd.Source } else { (Get-Command powershell.exe).Source }
+#
+# The path recorded here has to outlive PowerShell updates, and Get-Command's
+# .Source alone does not: on a Store install it resolves to the *versioned*
+# package directory (WindowsApps\Microsoft.PowerShell_7.6.5.0_x64__...\pwsh.exe),
+# which the next update deletes. The task then fails every interval with
+# 0x80070002 (file not found), silently - Task Scheduler has no opinion about a
+# task that cannot start - so the server stays down until a human notices. That
+# is exactly what happened between 2026-09-09 and 2026-09-13, across a 7.6.5 ->
+# 7.6.6 update. Prefer paths that carry no version: the per-user execution
+# alias, then an MSI install, then Windows PowerShell in System32.
+$candidates = @(
+    (Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\pwsh.exe'),
+    (Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'),
+    (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe')
+)
+$shell = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $shell) {
+    # Last resort: whatever is on PATH, versioned or not.
+    $pwshCmd = Get-Command pwsh.exe -ErrorAction SilentlyContinue
+    $shell = if ($pwshCmd) { $pwshCmd.Source } else { (Get-Command powershell.exe).Source }
+}
+Write-Host "Task will run: $shell" -ForegroundColor Cyan
 
 $action = New-ScheduledTaskAction -Execute $shell `
     -Argument "-NoProfile -NoLogo -NonInteractive -WindowStyle Hidden -File `"$watchdog`"" `

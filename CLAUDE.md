@@ -28,7 +28,7 @@ entry points share one model core:
 ## Running
 
 ```bash
-./run_server.sh          # interactive menu of 12 model configs (see SERVER_OPTIONS.md)
+./run_server.sh          # interactive menu of 15 model configs (see SERVER_OPTIONS.md)
 ./run_server.sh 9        # launch config 9 (FLUX.2-klein, the default) directly
 ./kill_flux.sh           # stop the supervisor and server
 python flux_cli.py [--flux2|--gguf q8|--schnell|--kontext|--full-model] [--image path]
@@ -64,9 +64,10 @@ start, so "down" and "wanted down" stay distinguishable. Restarts are logged to
 ## Testing
 
 ```bash
-python smoke_test_servers.py        # all 12 configs, isolated subprocesses
+python smoke_test_servers.py        # every menu config, isolated subprocesses
 python smoke_test_servers.py 9 10   # subset
 python test_rest_api.py             # /api/v1 contract checks, no GPU needed
+python test_gpu_pace.py             # sysmem-fallback detector, no GPU needed
 ```
 
 `smoke_test_servers.py` writes a live-updating HTML tracker to
@@ -74,11 +75,19 @@ python test_rest_api.py             # /api/v1 contract checks, no GPU needed
 `test_rest_api.py` runs against Flask's test client with no model loaded, so it
 covers routing/auth/status codes/error envelopes in seconds but never reaches
 the GPU — it is the one test to run after touching either API dialect.
+`test_gpu_pace.py` feeds the step-pace detector timings from real incidents, so
+it also needs no GPU; run it after touching the SLOW_STEP_* logic.
 
 ## Dependencies
 
 Uses `uv pip` against `.venv` with `requirements.txt`. Key deps: torch (CUDA),
 diffusers, transformers, flask, python-dotenv, huggingface_hub, requests.
+
+`diffusers` is pinned to a **git commit, not a release**: config 15 needs
+`QwenImage21Pipeline`, which was merged upstream on 2026-09-18 and is not in
+0.40.0. Dropping back to a release silently removes only that config (the
+import fails at `--qwen`; every FLUX config is unaffected), so the pin can be
+retired for the first release that carries the pipeline.
 
 ## Architecture notes
 
@@ -86,6 +95,34 @@ diffusers, transformers, flask, python-dotenv, huggingface_hub, requests.
   4-bit/full/GGUF/schnell, FLUX.1-Kontext editor (4-bit or full bf16), FLUX.2
   4-bit/full (32B), FLUX.2-klein (9B). Turbo LoRA (FLUX.2-dev only) and
   uncensored LoRA (FLUX.1 only) load on top.
+- **Alternate cores**: two non-FLUX backends each live in a module that mirrors
+  the slice of `flux_core`'s surface the server uses, and `web_server.py` swaps
+  one in at import (`import sd_core as flux_core`) when its flag is present —
+  `--sdxl` → `sd_core.py`, `--qwen` → `qwen_core.py`. Everything downstream
+  goes on calling `flux_core.*`. A core declares what it can do with module
+  flags the server reads by `getattr` — `OUTPUT_PREFIX`, `SUPPORTS_NEGATIVE_PROMPT`,
+  `SUPPORTS_INPAINT`, `SUPPORTS_TRANSPARENCY`, `SUPPORTS_MULTI_REFERENCE`,
+  `MAX_REFERENCE_IMAGES` — and `/model-info` republishes them so the UI shows
+  the matching controls instead of hardcoding a model's limits. `_flux_version`
+  is a *constraints class*, not an identity: `sd_core` sets 1 (one reference,
+  strength applies) and `qwen_core` sets 2 (multi-reference, masked editing, no
+  strength); the model's real name comes from `_model_type_string()`.
+- **Qwen-Image 2.1** (`qwen_core.py`, config 15): one `QwenImage21Pipeline`
+  covers text-to-image and instruction editing — the difference is only whether
+  condition images are passed — so there is no separate editor config. Up to 10
+  references, read by the Qwen3-VL text encoder as vision context as well as by
+  the VAE. Guidance is off (`true_cfg_scale` 1.0) unless a negative prompt is
+  supplied, because the model is trained to sample without CFG and enabling it
+  doubles the per-step cost. The VAE decodes 4 channels, so every result
+  arrives RGBA and `_finalize_alpha` drops the alpha again unless it carries
+  something (asked for, or produced unasked) — otherwise every Qwen output
+  would be an RGBA PNG. **Masked editing is not inpainting here**: the pipeline
+  takes no mask, so `_annotate_edit_region` rings the region in magenta *just
+  outside* the painted area (annotated images are what the model was trained
+  on; drawing outside the mask means the ring lands in pixels the composite
+  step restores from the source, so it can never bleed into the result) and the
+  unpainted region is composited back. Needs diffusers with
+  `QwenImage21Pipeline` — merged upstream 2026-09-18, i.e. newer than 0.40.0.
 - **VLM endpoint**: critique/describe/boost talk to the vision model through
   `edit_loop.py`, which speaks two dialects. `OLLAMA_URL` (the endpoint, name
   kept for compatibility) may point at a local ollama daemon — `/api/chat`,
@@ -127,6 +164,25 @@ diffusers, transformers, flask, python-dotenv, huggingface_hub, requests.
   tiles to bound it, opt-in because tiling can leave faint seams on smooth
   gradients. Symptom it addresses: above ~1MP the job stalls on its last step
   with no error, the driver having silently paged the decode to system RAM.
+- **Sysmem fallback ("the server froze")**: the same silent paging hits the
+  *diffusion steps* too, and tiling does nothing for that case. Every step runs
+  8-200x slow at a steady rate while HTTP keeps answering and the progress bar
+  keeps moving, so it reads as a freeze and leaves nothing in the log but a
+  20-50 minute job. It is caused from outside the process — the card is shared
+  with a desktop, and when total demand exceeds VRAM the Windows WDDM driver
+  pages this process's resident weights out. Note that
+  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments`, which `run_server.ps1` sets
+  for the *fragmentation* case, is a no-op here: torch logs
+  "expandable_segments not supported on this platform" on Windows at every
+  startup. Nothing can be polled for it (nvidia-smi reports no per-process
+  memory under WDDM, the driver raises no error), so `_check_step_pace` watches
+  wall-clock per step against a per-resolution baseline learned from healthy
+  runs (`_record_baseline` keeps the *minimum*, so a degraded run cannot raise
+  the bar) and fails the job with `GpuDegraded` rather than letting it crawl —
+  a failed job is at least visible in `/status`, in the note, and to the
+  supervisor. `FLUX_SLOW_STEP_FACTOR=0` disables it. `_release_gpu_cache`
+  (`torch.cuda.empty_cache` between jobs) shrinks the idle footprint so the
+  desktop's GPU clients have somewhere to grow other than into our weights.
 - **Reference images**: `generate_image` accepts one PIL image or a list of up
   to `MAX_REFERENCE_IMAGES` (3). FLUX.2 pipelines take the list natively;
   Kontext stitches multiple refs side-by-side (`_stitch_references`) since its
@@ -155,7 +211,7 @@ diffusers, transformers, flask, python-dotenv, huggingface_hub, requests.
   a bearer token when set — `_wiki_headers`; unset, everything still works
   anonymously. `requests` strips Authorization when a redirect crosses hosts,
   so it never reaches the upload.wikimedia.org CDN.
-- **Web queue**: one worker thread, `QUEUE_MAX_SIZE=10`, jobs carry progress
+- **Web queue**: one worker thread, `QUEUE_MAX_SIZE=500`, jobs carry progress
   state polled by the UI via `/status`. `/generate` validates all params at the
   API boundary and returns 400s.
 - **Prompt expansion**: `{a|b}` in a prompt queues one job per alternative,

@@ -40,6 +40,12 @@ Run with `./run_server.sh` for an interactive menu, or `./run_server.sh <number>
 |---|------|-------|-------------|
 | **13** | SDXL (photoreal) | `--sdxl` | Uncensored Stable Diffusion XL via the `sd_core.py` backend (default checkpoint `John6666/lustify-sdxl-nsfwsfw-v2-sdxl`, a photorealistic merge, bf16, ~7GB). UI-facing names for this config (menu, model switcher, model-name hover) deliberately avoid the checkpoint's brand name. Unlike FLUX, SDXL checkpoints have no instruction-refusal behavior — but they also have **no instruction understanding**: prompts must *describe the desired final image*, not command an edit. Enables the **negative prompt** field in the UI (a quality-boilerplate default applies when left empty); guidance defaults to 6.0 (real CFG); dimensions snap to SDXL's 64-px training buckets. The shipped scheduler config of auto-converted Civitai repos is corrected at load (EDM → Euler Ancestral; the EDM config produces pure noise). Supports txt2img, single-image img2img via the strength slider, and **masked inpainting** — the paint-a-mask UI works here too, lazy-loading the dedicated inpainting checkpoint (`SD_INPAINT_MODEL`, default `andro-flock/LUSTIFY-SDXL-NSFW-checkpoint-v2-0-INPAINTING`, ~7GB on first masked job); in inpaint mode the strength slider is the denoise level for the painted region (~0.4–0.7 edits, higher replaces). No Kontext-style instruction editing. Override the base checkpoint with `SD_MODEL=<hf-repo-or-path>` or `./run_server.sh 13 --sdxl /path/to/checkpoint.safetensors` (single-file Civitai downloads work). Outputs are named `sdxl_*.png`. |
 
+## Qwen
+
+| # | Name | Flags | Description |
+|---|------|-------|-------------|
+| **15** | Qwen-Image 2.1 | `--qwen` | Qwen-Image 2.1 (`Qwen/Qwen-Image-2.1`, ~31GB) via the `qwen_core.py` backend: a 7B single-stream DiT with a Qwen3-VL 8B text encoder and a 64-channel RGBA VAE. **One model does both jobs** — with no reference it is text-to-image, with references it is an instruction editor, so unlike the FLUX split there is no separate editor config. Takes **up to 10 reference images** (the UI raises its own limit from `/model-info`), and because the *text encoder* sees each reference as vision context, they can be referred to in the prompt ("the hat from the second image"). **Native transparency**: a Transparent background checkbox appears in the UI and returns a real RGBA PNG — alpha is kept only when the result actually uses it, so ordinary jobs stay RGB. **Masked editing** works through the paint-a-mask UI, but not as diffusion inpainting: the pipeline has no mask input, so the painted region is ringed in magenta *just outside the mask* (the model is trained to act on annotated images) and everything outside the mask is composited back from the source, which is what makes unpainted pixels pixel-exact. Enables the **negative prompt** field, which switches on true CFG at the guidance value (default 4.0 via `QWEN_TRUE_CFG`); with the field empty guidance is 1.0 — the model is meant to be sampled without it, and CFG costs a second transformer pass per step. The **strength** slider does nothing here (conditioning is by token, not by partial noising) and is dropped from the request like it is on FLUX.2. One consequence for the **spectrum grid**, which sweeps guidance against strength: with the negative prompt empty neither axis is live, so the cells come back identical — fill in a negative prompt first, or use a batch instead. Dimensions snap to 32px; the model is 2K-native, so `2mp` sizes are in its comfort zone. Prefix KV caching is on (`QWEN_KV_CACHE=0` disables it; a seed only reproduces at a fixed setting). Steps default to 40 in the core. Other env knobs: `QWEN_MODEL` (checkpoint), `QWEN_LORA` (fused at load), `QWEN_CONDITION_RESOLUTION` (reference token budget, default 1024). Outputs are named `qwen_*.png`. **VRAM**: 7B transformer + 8B encoder is ~30GB bf16 — `run_server.ps1` adds `--quantize-encoder` (NF4 encoder, ~20GB total) for 32GB cards, and `--cpu-offload` is the fallback that fits anywhere. Requires a diffusers build with `QwenImage21Pipeline` (merged upstream 2026-09-18, after the 0.40.0 release). |
+
 ## Notes
 
 - All servers launch on **port 2222** with a web UI
@@ -48,9 +54,11 @@ Run with `./run_server.sh` for an interactive menu, or `./run_server.sh <number>
   later ones ~10-25% faster — best for sessions at a consistent resolution
 - Batch jobs encode the prompt once and reuse the embeddings for every image;
   LoRAs (turbo/uncensored) are fused into the base weights at load
-- Up to **3 reference images** per generation: FLUX.2 (6-9) uses them natively;
-  Kontext (10-12) stitches them side-by-side (address them as left/middle/right
-  in the instruction); FLUX.1 img2img (1-5) takes a single reference
+- Reference images per generation are a property of the backend, published by
+  `/model-info` and followed by the UI: **10** on Qwen (15), which reads them
+  through its text encoder; **3** on FLUX.2 (6-9), which uses them natively,
+  and on Kontext (10-12), which stitches them side-by-side (address them as
+  left/middle/right in the instruction); **1** on FLUX.1 img2img (1-5)
 - Auto-restart is enabled (up to 5 retries on crash, including OOM kills)
 - **Switching models on the fly**: when launched via `run_server.sh`, the web
   UI shows a Model dropdown. Picking another config restarts the server under

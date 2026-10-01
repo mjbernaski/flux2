@@ -8,6 +8,8 @@ a client depends on — but not generation itself. For that, queue a real job
     python test_rest_api.py
 """
 
+import base64
+import io
 import os
 import shutil
 import sys
@@ -325,8 +327,9 @@ def main():
           all(k in body for k in ('model', 'flux_version', 'inpaint', 'negative_prompt')))
 
     body = client.get(f'{PREFIX}/models', headers=AUTH).get_json()
-    check('models lists the launcher configs', len(body.get('configs') or []) == 14,
-          f"got {len(body.get('configs') or [])}")
+    check('models lists the launcher configs',
+          len(body.get('configs') or []) == len(ws.SERVER_CONFIGS),
+          f"got {len(body.get('configs') or [])} of {len(ws.SERVER_CONFIGS)}")
 
     r = client.get(f'{PREFIX}/models/current', headers=AUTH)
     check('models/current responds', r.status_code == 200)
@@ -653,9 +656,13 @@ def main():
         check('a backslash escapes the group and is dropped',
               queued == ['escaped {red|blue} literal'], f"got {queued}")
 
-        # 2^4 = 16 combinations against a queue that holds QUEUE_MAX_SIZE.
-        r = client.post(f'{PREFIX}/jobs', headers=AUTH,
-                        json={'prompt': '{a|b} {c|d} {e|f} {g|h}'})
+        # Enough two-way groups that 2^n overflows the queue, whatever
+        # QUEUE_MAX_SIZE is set to.
+        groups = 1
+        while 2 ** groups <= ws.QUEUE_MAX_SIZE:
+            groups += 1
+        overflow = ' '.join('{a%d|b%d}' % (i, i) for i in range(groups))
+        r = client.post(f'{PREFIX}/jobs', headers=AUTH, json={'prompt': overflow})
         check('an expansion larger than the whole queue is 400',
               r.status_code == 400 and err_code(r) == 'invalid_request',
               f"got {r.status_code}/{err_code(r)}")
@@ -805,6 +812,9 @@ def main():
     r = client.post(f'{PREFIX}/multi-runs', headers=AUTH, json={'prompt': 'x'})
     check('a run with no configs is rejected', r.status_code in (400, 503))
 
+    print("\nbackend capability gating")
+    _check_backend_capabilities(client)
+
     print("\nprotocol errors")
     r = client.get(f'{PREFIX}/no-such-endpoint', headers=AUTH)
     check('an unknown REST path is 404 with an envelope',
@@ -834,7 +844,8 @@ def main():
 
     r = client.get('/configs', headers=AUTH)
     check('legacy /configs still works',
-          r.status_code == 200 and len((r.get_json() or {}).get('configs') or []) == 14)
+          r.status_code == 200
+          and len((r.get_json() or {}).get('configs') or []) == len(ws.SERVER_CONFIGS))
 
     r = client.post('/jobs/nope/cancel', headers=AUTH)
     check('legacy cancel still 404s in its own shape',
@@ -847,6 +858,87 @@ def main():
             print(f"  - {f}")
         return 1
     return 0
+
+
+def _tiny_png_b64(size=(8, 8)):
+    """A decodable reference image, small enough to be free to build."""
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new('RGB', size, (120, 30, 200)).save(buf, format='PNG')
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def _check_backend_capabilities(client):
+    """Fields only some backends serve — negative prompts (SDXL, Qwen), RGBA
+    output and more than three reference images (Qwen) — are gated on
+    capability flags the active core declares, not on a model name. Which core
+    is loaded is a launch-flag decision, so the gating is exercised here by
+    standing those flags up on the loaded core and taking them down again.
+    """
+    png = _tiny_png_b64()
+    core = ws.flux_core
+    ws._model_ready = True  # nothing here reaches the GPU; enqueueing needs it
+
+    r = client.post(f'{PREFIX}/jobs', headers=AUTH,
+                    json={'prompt': 'x', 'transparent': True})
+    check('transparent is refused by a backend without it', r.status_code == 400,
+          f"got {r.status_code}")
+
+    r = client.post(f'{PREFIX}/jobs', headers=AUTH,
+                    json={'prompt': 'x', 'transparent': 'yes'})
+    check('a non-boolean transparent is 400', r.status_code == 400)
+
+    body = client.get(f'{PREFIX}/model', headers=AUTH).get_json() or {}
+    check('model-info publishes the transparency and reference limits',
+          'transparent' in body and isinstance(body.get('max_reference_images'), int),
+          f"got {body.get('transparent')!r}/{body.get('max_reference_images')!r}")
+
+    had_transparency = getattr(core, 'SUPPORTS_TRANSPARENCY', None)
+    had_multi = getattr(core, 'SUPPORTS_MULTI_REFERENCE', None)
+    saved_max = ws.MAX_REFERENCE_IMAGES
+    saved_version = core._flux_version
+    try:
+        core.SUPPORTS_TRANSPARENCY = True
+        core.SUPPORTS_MULTI_REFERENCE = True
+        core._flux_version = 1          # multi-reference must not ride on FLUX.2
+        ws.MAX_REFERENCE_IMAGES = 10
+
+        r = client.post(f'{PREFIX}/jobs', headers=AUTH,
+                        json={'prompt': 'x', 'transparent': True})
+        check('transparent is accepted once the backend declares it',
+              r.status_code == 201, f"got {r.status_code}")
+        check('the job carries the transparent flag through to the worker',
+              bool(ws._pending and ws._pending[-1].params.get('transparent')))
+        del ws._pending[:]
+
+        r = client.post(f'{PREFIX}/jobs', headers=AUTH,
+                        json={'prompt': 'x', 'input_images': [png] * 10})
+        check('ten reference images are accepted on a multi-reference backend',
+              r.status_code == 201, f"got {r.status_code}")
+        del ws._pending[:]
+
+        r = client.post(f'{PREFIX}/jobs', headers=AUTH,
+                        json={'prompt': 'x', 'input_images': [png] * 11})
+        check('one over the backend limit is still 400', r.status_code == 400,
+              f"got {r.status_code}")
+        del ws._pending[:]
+    finally:
+        ws.MAX_REFERENCE_IMAGES = saved_max
+        core._flux_version = saved_version
+        if had_transparency is None:
+            del core.SUPPORTS_TRANSPARENCY
+        else:
+            core.SUPPORTS_TRANSPARENCY = had_transparency
+        if had_multi is None:
+            del core.SUPPORTS_MULTI_REFERENCE
+        else:
+            core.SUPPORTS_MULTI_REFERENCE = had_multi
+
+    r = client.post(f'{PREFIX}/multi-runs', headers=AUTH,
+                    json={'prompt': 'x', 'configs': [9], 'transparent': True})
+    check('a multi-model run rejects transparent outright',
+          r.status_code == 400, f"got {r.status_code}")
+    ws._model_ready = False
 
 
 def _rejects_bad_tiling_mode(flux_core):

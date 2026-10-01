@@ -12,7 +12,7 @@ elapsed time) / pass / fail. When the sweep finishes the page becomes a static
 report.
 
 Usage:
-    python smoke_test_servers.py                # test all 13 menu options
+    python smoke_test_servers.py                # test every menu option below
     python smoke_test_servers.py 1 3 9          # test only options 1, 3, 9
 
 Results merge into prior runs, so re-running a single option updates just its
@@ -53,6 +53,7 @@ MENU = [
     (11, "FLUX.1 Kontext Full (bf16)",    ["--kontext", "--full-model"],             "edit"),
     (12, "Kontext Full + Uncensored",     ["--kontext", "--full-model", "--uncensored"], "edit"),
     (14, "FLUX.2-klein-4B",               ["--klein-4b"],                            "txt2img"),
+    (15, "Qwen-Image 2.1",                ["--qwen"],                                "edit"),
 ]
 
 
@@ -65,6 +66,10 @@ def derive_flags(raw_args):
     klein = "--klein" in raw_args
     klein_4b = "--klein-4b" in raw_args
     kontext = "--kontext" in raw_args
+    # Which core web_server.py would import for these flags. The FLUX flags
+    # below are meaningless to the others, which ignore them.
+    backend = ("qwen" if "--qwen" in raw_args
+               else "sdxl" if "--sdxl" in raw_args else "flux")
     local_encoder_flag = "--local-encoder" in raw_args
     turbo_flag = "--turbo" in raw_args
     no_turbo = "--no-turbo" in raw_args
@@ -84,9 +89,10 @@ def derive_flags(raw_args):
     if uncensored and not full_model:
         full_model = True
     # Turbo LoRA is a FLUX.2-dev LoRA; not auto-enabled for klein (different arch)
-    turbo = (turbo_flag or (flux2 and not klein)) and not no_turbo
+    turbo = (turbo_flag or (flux2 and not klein)) and not no_turbo and backend == "flux"
 
     return {
+        "backend": backend,
         "full_model": full_model,
         "gguf_quant": gguf,
         "flux2": flux2,
@@ -131,9 +137,16 @@ def run_config_inprocess(num, name, raw_args, kind):
     """Load one config and generate the sample image (runs inside a worker
     subprocess so model/GPU state is fully isolated per config)."""
     _report_progress(num, "importing torch/diffusers")
-    from flux_core import load_model, generate_image, load_turbo_lora, load_uncensored_lora
-
     flags = derive_flags(raw_args)
+    # Same core swap web_server.py does at import; the alternate cores take the
+    # FLUX load_model kwargs and ignore them, so the call below is unchanged.
+    if flags["backend"] == "qwen":
+        from qwen_core import load_model, generate_image, load_turbo_lora, load_uncensored_lora
+    elif flags["backend"] == "sdxl":
+        from sd_core import load_model, generate_image, load_turbo_lora, load_uncensored_lora
+    else:
+        from flux_core import load_model, generate_image, load_turbo_lora, load_uncensored_lora
+
     cmd = "python web_server.py " + " ".join(raw_args) if raw_args else "python web_server.py"
     prompt = EDIT_PROMPT if kind == "edit" else PROMPT
     result = {

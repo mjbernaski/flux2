@@ -38,7 +38,7 @@
 #>
 [CmdletBinding(SupportsShouldProcess)]
 param(
-    [ValidateRange(1, 14)]
+    [ValidateRange(1, 15)]
     [int]$Config,
 
     [switch]$NoStart,
@@ -124,7 +124,7 @@ if (-not $PSBoundParameters.ContainsKey('Config')) {
     $lastConfigFile = Join-Path $FluxRoot '.last_config'
     if (Test-Path $lastConfigFile) {
         $last = (Get-Content $lastConfigFile -ErrorAction SilentlyContinue | Select-Object -First 1)
-        if ($last -match '^([1-9]|1[0-4])$') { $Config = [int]$last }
+        if ($last -match '^([1-9]|1[0-5])$') { $Config = [int]$last }
     }
 }
 

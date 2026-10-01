@@ -154,6 +154,16 @@ pub struct ModelInfo {
     pub sd: bool,
     pub negative_prompt: bool,
     pub inpaint: bool,
+    /// Serving Qwen-Image 2.1, which also sets `transparent`.
+    #[serde(default)]
+    pub qwen: bool,
+    /// RGBA output is available (Qwen backend).
+    #[serde(default)]
+    pub transparent: bool,
+    /// How many reference images this backend takes: 1 on FLUX.1 img2img,
+    /// 3 on Kontext and FLUX.2, 10 on Qwen. Absent on servers predating it.
+    #[serde(default)]
+    pub max_reference_images: Option<u32>,
     #[serde(default)]
     pub hostname: String,
     #[serde(default)]
@@ -383,16 +393,21 @@ pub struct GenerateRequest {
     pub orientation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<String>,
-    /// SDXL backend only.
+    /// SDXL and Qwen backends only; on Qwen it turns on true CFG at `guidance`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub negative_prompt: Option<String>,
-    /// Base64 or data URLs, up to three. More than one needs Kontext or FLUX.2.
+    /// Qwen backend only: transparent background, returned as an RGBA PNG.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transparent: Option<bool>,
+    /// Base64 or data URLs, up to `ModelInfo::max_reference_images`. More than
+    /// one needs Kontext, FLUX.2 or Qwen.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub input_images: Vec<String>,
     /// Paths the server itself can read — avoids uploading entirely.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub input_paths: Vec<String>,
-    /// Inpainting mask; needs exactly one input image and a FLUX.2/SDXL backend.
+    /// Inpainting mask; needs exactly one input image and a FLUX.2, SDXL or
+    /// Qwen backend.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mask_image: Option<String>,
     /// "keep" derives the output dimensions from the reference's aspect ratio.

@@ -18,7 +18,7 @@
 
 param(
     # Menu number from SERVER_OPTIONS.md / run_server.ps1's Get-ConfigArgs.
-    [ValidateRange(1, 14)]
+    [ValidateRange(1, 15)]
     [int]$Config = 14,
 
     # Return as soon as the supervisor is spawned, without waiting for the

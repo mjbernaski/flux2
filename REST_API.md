@@ -21,7 +21,7 @@ set headers, notably `<img src>`.
 **Errors.** Always the same shape, with the HTTP status carrying the category:
 
 ```json
-{"error": {"code": "queue_full", "message": "Queue is full (10 max). Cancel a queued job or wait."}}
+{"error": {"code": "queue_full", "message": "Queue is full (500 max). Cancel a queued job or wait."}}
 ```
 
 Branch on `code` — it is stable. Messages are written for humans and may change.
@@ -74,8 +74,13 @@ worth surfacing since a cold 32B load takes minutes.
 | `GET /telemetry` | GPU power draw, vision-model residency |
 
 Check `GET /model` before sending optional fields: `negative_prompt` needs the
-SDXL backend, `mask_image` needs FLUX.2 or SDXL, and more than one reference
-image needs Kontext or FLUX.2. Sending an unsupported field is a `400`.
+SDXL or Qwen backend, `transparent` needs Qwen, `mask_image` needs FLUX.2,
+SDXL or Qwen, and more than one reference image needs Kontext, FLUX.2 or
+Qwen. Sending an unsupported field is a `400`. `GET /model` answers all of
+this directly: `negative_prompt`, `transparent` and `inpaint` are booleans
+and `max_reference_images` is the limit this backend enforces (1 on FLUX.1
+img2img, 3 on Kontext and FLUX.2, 10 on Qwen) — read it rather than
+assuming a number.
 
 `GET /model` also reports `vae_tiling` and `vae_tiling_threshold_mp`, which
 describe how the final image is decoded. The fp32 VAE decode is the
@@ -130,8 +135,9 @@ Request body — only `prompt` is required:
 | `strength` | float | 0.5 | 0–1; img2img only |
 | `orientation` | string | `square` | `square`, `portrait`, `landscape`, `widescreen`, `extra-tall` |
 | `size` | string | `1mp` | `0.25mp` … `2mp` |
-| `negative_prompt` | string | — | SDXL only |
-| `input_images` | string[] | `[]` | Base64 or data URLs, up to 3 |
+| `negative_prompt` | string | — | SDXL and Qwen; on Qwen it turns on true CFG at `guidance` |
+| `transparent` | bool | false | Qwen only; transparent background, RGBA PNG out |
+| `input_images` | string[] | `[]` | Base64 or data URLs, up to `max_reference_images` |
 | `input_paths` | string[] | — | Server-side paths, folded into `input_images` |
 | `mask_image` | string | — | Inpainting; needs exactly one input image |
 | `aspect_mode` | string | `keep` | `keep` derives output dims from the reference |
@@ -189,7 +195,7 @@ and when will it run":
 {
   "running": { "id": "a1b2c3d4e5f6", "current": 2, "batch": 4, "step": 18, "total_steps": 30 },
   "waiting": [ { "position": 1, "id": "9f8e7d6c5b4a", "prompt": "...", "batch": 2 } ],
-  "depth": 1, "capacity": 10, "accepting": true, "busy": true,
+  "depth": 1, "capacity": 500, "accepting": true, "busy": true,
   "images_pending": 4, "seconds_per_image": 6.4, "estimated_wait_s": 25.6,
   "recent_images": [
     { "filename": "flux2_20260809_101112_ab12cd34.png", "job_id": "a1b2c3d4e5f6",

@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="theme-color" content="#1a1a2e">
+    <title>flux — simple</title>
+    <script>document.title = window.location.hostname + ' flux';</script>
+    <!-- Deliberately shares nothing with app.css/app.js: this page is the
+         type-a-prompt-get-an-image path and stays small enough to read in one
+         sitting. See static/simple.js for why. -->
+    <link rel="stylesheet" href="/static/simple.css?v=5">
+</head>
+<body>
+    <main class="wrap">
+        <h1>flux</h1>
+
+        <!-- Shown only until a key is stored; the same localStorage entry the
+             full UI writes, so setting it in either place covers both. -->
+        <div class="key-row" id="keyRow" hidden>
+            <input type="password" id="apiKey" placeholder="API key" autocomplete="off">
+            <button type="button" id="saveKey">Save</button>
+        </div>
+
+        <form id="form" autocomplete="off">
+            <textarea id="prompt" rows="3" placeholder="A majestic mountain landscape at sunset…" required></textarea>
+
+            <!-- One reference image, optional. The server takes a list of up to
+                 three; one is what fits a page with no strength or aspect
+                 controls to explain what the others would do. -->
+            <div class="ref">
+                <label class="ghost-label" for="file" id="attachLabel">＋ Reference image</label>
+                <input type="file" id="file" accept="image/*" hidden>
+                <div class="thumb" id="thumb" hidden>
+                    <img id="thumbImg" alt="Attached reference image">
+                    <button type="button" id="removeRef" title="Remove the reference image">✕</button>
+                </div>
+                <span class="ref-note" id="refNote" hidden>the output follows its shape</span>
+            </div>
+
+            <div class="buttons">
+                <button type="submit" id="generate" disabled>Generate</button>
+                <!-- Disabled rather than hidden when there is nothing to clear:
+                     a button that comes and goes shifts the row under the cursor. -->
+                <button type="button" id="clear" class="ghost" disabled>Clear</button>
+            </div>
+        </form>
+
+        <p class="status" id="status">connecting…</p>
+        <div class="bar" id="bar" hidden><span id="barFill"></span></div>
+
+        <div class="stage" id="stage" hidden>
+            <img id="image" alt="">
+            <!-- Feed the result back in as the next generation's reference. -->
+            <button type="button" id="useAsRef" class="ghost" hidden>↺ Use as reference</button>
+        </div>
+
+        <p class="footer">
+            <a href="/">full interface</a>
+        </p>
+    </main>
+
+    <script src="/static/simple.js?v=5"></script>
+</body>
+</html>
