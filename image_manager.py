@@ -72,22 +72,38 @@ def _is_image(name):
             and name.lower().endswith(IMG_EXTS))
 
 
+# The one hidden folder. Deliberately the same name as web_server.py's
+# HIDDEN_DIR_NAME: this gallery used to keep its own .hide/ alongside the
+# generator's .hidden/, which meant an image could be "hidden" in two
+# different places and only one UI could see each. migrate_legacy_hide()
+# folds the old tree in at startup.
+HIDDEN_DIR = ".hidden"
+
+# Subfolders of the hidden tree that are not a gallery: step frames are
+# preview decodes, and dot-folders are bookkeeping. Neither is mixed into the
+# normal folder listings either, so neither belongs in the hidden one.
+HIDDEN_SKIP_DIRS = {"steps"}
+
+
+def _hidden_walk(abs_dir):
+    """Every image under the hidden tree, minus the non-gallery subfolders."""
+    for dirpath, dirs, files in os.walk(abs_dir):
+        dirs[:] = [d for d in dirs if d not in HIDDEN_SKIP_DIRS and not d.startswith(".")]
+        for n in files:
+            if _is_image(n):
+                yield os.path.join(dirpath, n)
+
+
 def folder_tree(abs_dir, rel=""):
-    if os.path.basename(abs_dir) == ".hide":
+    if os.path.basename(abs_dir) == HIDDEN_DIR:
         # The hidden tree presents as a single folder: no children, and the
         # count spans every subfolder (originals keep their subpaths inside
-        # .hide so unhide can restore them).
-        count = 0
-        for dirpath, _dirs, files in os.walk(abs_dir):
-            count += sum(1 for n in files if _is_image(n))
-        return {"rel": rel, "name": ".hide", "hidden": True, "count": count, "children": []}
+        # .hidden so unhide can restore them).
+        count = sum(1 for _ in _hidden_walk(abs_dir))
+        return {"rel": rel, "name": HIDDEN_DIR, "hidden": True, "count": count, "children": []}
     children = []
     try:
         for item in sorted(os.listdir(abs_dir), key=str.lower):
-            # web_server's hidden mode writes generations into .hidden/; this
-            # gallery is one of the places that folder is meant to stay out of.
-            if item == ".hidden":
-                continue
             full = os.path.join(abs_dir, item)
             if os.path.isdir(full):
                 children.append(folder_tree(full, (rel + "/" + item) if rel else item))
@@ -108,6 +124,46 @@ def folder_tree(abs_dir, rel=""):
         "count": count,
         "children": children,
     }
+
+
+def migrate_legacy_hide():
+    """Fold a pre-merge .hide/ tree into .hidden/, then drop the empty husk.
+
+    Two hidden folders used to exist: this gallery's .hide/ and the
+    generator's .hidden/. An image could therefore be "hidden" in two
+    different places, and each UI could only see one of them. Subpaths carry
+    over unchanged, so unhide still restores to the original folder.
+
+    A file whose name is already taken on the other side is left where it is
+    rather than overwritten — a merge is not worth losing an image to — and
+    says so in the log, so the leftovers are visible instead of silent.
+    """
+    legacy = os.path.join(ROOT, ".hide")
+    if not os.path.isdir(legacy):
+        return
+    moved = kept = 0
+    for dirpath, _dirs, files in os.walk(legacy):
+        for name in files:
+            src = os.path.join(dirpath, name)
+            rel = os.path.relpath(src, legacy).replace("\\", "/")
+            dst = os.path.join(ROOT, HIDDEN_DIR, *rel.split("/"))
+            if os.path.exists(dst):
+                print(f"  kept (name already in {HIDDEN_DIR}/): {rel}")
+                kept += 1
+                continue
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.move(src, dst)
+            moved += 1
+    # Only prunes directories that came out empty, so anything left behind
+    # (a collision above) keeps its folder and stays findable.
+    for dirpath, _dirs, _files in os.walk(legacy, topdown=False):
+        try:
+            os.rmdir(dirpath)
+        except OSError:
+            pass
+    if moved or kept:
+        print(f"Merged legacy .hide/ into {HIDDEN_DIR}/: {moved} moved"
+              + (f", {kept} left in place (name clash)" if kept else ""))
 
 
 def flat_folder_list(tree, out=None):
@@ -145,9 +201,10 @@ def api_list():
         return jsonify({"error": "Invalid folder"}), 400
     items = []
     try:
-        if ".hide" in [p for p in folder.replace("\\", "/").split("/") if p]:
+        if HIDDEN_DIR in [p for p in folder.replace("\\", "/").split("/") if p]:
             # The hidden tree shows as one folder — list it recursively.
-            file_iter = ((dp, n) for dp, _dirs, files in os.walk(abs_dir) for n in files)
+            file_iter = ((os.path.dirname(f), os.path.basename(f))
+                         for f in _hidden_walk(abs_dir))
         else:
             file_iter = ((abs_dir, n) for n in os.listdir(abs_dir))
         for parent, name in file_iter:
@@ -263,12 +320,17 @@ def api_move():
 
 @app.route("/api/hide", methods=["POST"])
 def api_hide():
-    """Toggle hidden: move into (or out of) the single .hide/ tree at ROOT.
+    """Toggle hidden: move into (or out of) the single .hidden/ tree at ROOT.
 
-    The image's subfolder path is preserved inside .hide/ (archive/foo.png
-    hides to .hide/archive/foo.png), so unhide restores it to where it came
-    from. Unhide also accepts legacy per-folder locations like
-    archive/.hide/foo.png by dropping the .hide path component.
+    The image's subfolder path is preserved inside .hidden/ (archive/foo.png
+    hides to .hidden/archive/foo.png), so unhide restores it to where it came
+    from — and it lands in the same tree the generator writes its hidden-mode
+    output to, so "hidden" means one place for the whole stack.
+
+    Unhide still accepts the two legacy layouts, because files hidden before
+    the merge are still named that way on any box that has not run the
+    startup migration: the old top-level .hide/ tree, and the older
+    per-folder archive/.hide/foo.png. Either path component is dropped.
     """
     body = request.get_json(silent=True) or {}
     rel = body.get("path", "")
@@ -276,11 +338,14 @@ def api_hide():
     if not abs_path or not os.path.isfile(abs_path):
         return jsonify({"success": False, "error": "File not found"}), 404
     parts = rel_of(abs_path).split("/")
-    if ".hide" in parts:
+    if HIDDEN_DIR in parts:
+        parts.remove(HIDDEN_DIR)
+        action = "unhide"
+    elif ".hide" in parts:                      # legacy, pre-merge
         parts.remove(".hide")
         action = "unhide"
     else:
-        parts.insert(0, ".hide")
+        parts.insert(0, HIDDEN_DIR)
         action = "hide"
     dst_abs = os.path.join(ROOT, *parts)
     if os.path.exists(dst_abs):
@@ -457,6 +522,79 @@ HTML_PAGE = r"""<!doctype html>
               font-size: 16px; cursor: pointer; }
   #cmpClose:hover { background: rgba(255,255,255,0.25); }
 
+  /* ---- Slideshow: full-bleed review of a folder at full resolution ----
+     Separate from #modal on purpose: the modal is a work surface (crop, move,
+     info) sized to leave room for its side panel, where this gives the whole
+     viewport to the picture. */
+  #show { position: fixed; inset: 0; background: #000; display: none; z-index: 90;
+          cursor: default; }
+  #show.open { display: block; }
+  #show.idle { cursor: none; }
+  /* Two stacked layers: the next image decodes in the back one while the
+     current is still on screen, and advancing just swaps which is opaque. A
+     single <img> would blank between slides however fast the fetch was. */
+  .show-layer { position: absolute; inset: 0; display: flex;
+                align-items: center; justify-content: center;
+                opacity: 0; transition: opacity 160ms linear; }
+  .show-layer.front { opacity: 1; }
+  .show-layer img { max-width: 100%; max-height: 100%; object-fit: contain;
+                    display: block; user-select: none; -webkit-user-drag: none; }
+  /* Actual-pixels mode: no scaling at all, scroll the overflow instead. The
+     only way to judge render detail without the browser's resampling in the
+     way - which is the whole point of a slideshow over the thumbnail grid. */
+  #show.actual .show-layer { overflow: auto; align-items: safe center; justify-content: safe center; }
+  #show.actual .show-layer img { max-width: none; max-height: none; width: auto; height: auto; }
+
+  .show-top, .show-hud { position: absolute; left: 0; right: 0; z-index: 2;
+                         display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+                         padding: 10px 14px; font-size: 13px;
+                         transition: opacity 250ms linear; }
+  .show-top { top: 0; background: linear-gradient(rgba(0,0,0,0.8), transparent); }
+  .show-hud { bottom: 0; background: linear-gradient(transparent, rgba(0,0,0,0.8)); }
+  /* Chrome hides the controls after a few idle seconds so a running show is
+     just the picture; any mouse move or key brings them back. */
+  #show.idle .show-top, #show.idle .show-hud { opacity: 0; pointer-events: none; }
+  .show-hud button, .show-top button, .show-hud select {
+    background: rgba(255,255,255,0.1); color: var(--fg); border: 1px solid rgba(255,255,255,0.2);
+    padding: 5px 10px; border-radius: 4px; font: inherit; cursor: pointer; }
+  .show-hud button:hover, .show-top button:hover { background: rgba(255,255,255,0.2); }
+  .show-hud button.on { background: var(--accent); border-color: var(--accent); color: #000; }
+  .show-hud button.danger:hover { background: var(--danger); border-color: var(--danger); color: #fff; }
+  /* Armed delete: the second press is the one that acts, so it has to look
+     unmistakably different from the first. */
+  .show-hud button.armed { background: var(--danger); border-color: var(--danger); color: #fff;
+                           animation: armPulse 0.9s ease-in-out infinite; }
+  @keyframes armPulse { 50% { opacity: 0.55; } }
+  .show-count { font-variant-numeric: tabular-nums; color: var(--muted); }
+  .show-name { color: var(--fg); word-break: break-all; font-size: 12px;
+               max-width: 48vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .show-grow { flex: 1; }
+  /* Dwell-time bar: a slide's remaining time, restarted per slide by
+     re-triggering the animation. Hidden while paused. */
+  #showBar { position: absolute; top: 0; left: 0; height: 3px; width: 0;
+             background: var(--accent); z-index: 3; }
+  #showBar.run { animation: showBarFill linear forwards; }
+  @keyframes showBarFill { from { width: 0; } to { width: 100%; } }
+  .show-info { position: absolute; top: 46px; left: 14px; z-index: 2; max-width: min(46ch, 60vw);
+               background: rgba(0,0,0,0.78); border: 1px solid var(--border); border-radius: 6px;
+               padding: 10px 12px; font-size: 12px; display: none; }
+  .show-info.on { display: block; }
+  .show-info dt { color: var(--muted); float: left; clear: left; width: 6.5em; }
+  .show-info dd { margin: 0 0 3px 7em; word-break: break-all; }
+  .show-info .sp { margin: 8px 0 0; padding-top: 8px; border-top: 1px solid var(--border);
+                   white-space: pre-wrap; word-break: break-word; max-height: 30vh; overflow: auto; }
+  .show-keys { position: absolute; right: 14px; top: 46px; z-index: 2;
+               background: rgba(0,0,0,0.78); border: 1px solid var(--border); border-radius: 6px;
+               padding: 10px 12px; font-size: 12px; display: none; }
+  .show-keys.on { display: block; }
+  .show-keys kbd { background: var(--panel2); border: 1px solid var(--border); border-radius: 3px;
+                   padding: 1px 5px; font: 11px ui-monospace, monospace; }
+  .show-keys tr td { padding: 2px 4px; }
+  /* Click zones: the left and right thirds step the show, so it works with a
+     mouse or a phone tap and not only the keyboard. */
+  .show-zone { position: absolute; top: 0; bottom: 0; width: 28%; z-index: 1; }
+  .show-zone.prev { left: 0; } .show-zone.next { right: 0; }
+
   #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
            background: var(--panel); border: 1px solid var(--border); border-radius: 4px;
            padding: 8px 16px; z-index: 100; display: none; }
@@ -479,6 +617,7 @@ HTML_PAGE = r"""<!doctype html>
   </label>
   <span id="count" class="muted"></span>
   <button id="selectAllBtn" title="Select all images in this folder">Select all</button>
+  <button id="showBtn" title="Full-screen slideshow of this folder at full resolution (or of the selection, if there is one)">&#9654; Slideshow</button>
   <span id="selCount" class="muted" style="display:none"></span>
   <button id="cmpBtn" style="display:none" title="Show only the pixels the two selected images share">Compare &#x29C9;</button>
   <button id="bulkHideBtn" style="display:none">Hide selected</button>
@@ -521,6 +660,9 @@ HTML_PAGE = r"""<!doctype html>
         <h3>Hide</h3>
         <button id="hideBtn">Toggle hide</button>
 
+        <h3>Slideshow</h3>
+        <button id="showFromHereBtn">Start here &#9654;</button>
+
         <h3>Crop</h3>
         <div class="muted" style="font-size:12px">Drag on the image to select a region.</div>
         <div id="cropCoords" class="muted" style="font-size:11px; font-family:ui-monospace,monospace"></div>
@@ -539,6 +681,59 @@ HTML_PAGE = r"""<!doctype html>
         <button id="deleteBtn" class="danger">Delete permanently</button>
       </div>
     </div>
+  </div>
+</div>
+
+<div id="show">
+  <div id="showBar"></div>
+  <div class="show-layer" id="showLayer0"><img alt=""></div>
+  <div class="show-layer" id="showLayer1"><img alt=""></div>
+  <div class="show-zone prev" id="showZonePrev" title="Previous"></div>
+  <div class="show-zone next" id="showZoneNext" title="Next"></div>
+
+  <div class="show-top">
+    <span class="show-count" id="showCount"></span>
+    <span class="show-name" id="showName"></span>
+    <span class="show-grow"></span>
+    <button id="showClose" title="Close (Esc)">&times;</button>
+  </div>
+
+  <div class="show-info" id="showInfo"></div>
+
+  <div class="show-keys" id="showKeys">
+    <table>
+      <tr><td><kbd>&larr;</kbd> <kbd>&rarr;</kbd></td><td>previous / next</td></tr>
+      <tr><td><kbd>Space</kbd></td><td>play / pause</td></tr>
+      <tr><td><kbd>H</kbd></td><td>hide (reversible)</td></tr>
+      <tr><td><kbd>X</kbd></td><td>delete &mdash; press twice</td></tr>
+      <tr><td><kbd>A</kbd></td><td>fit / actual pixels</td></tr>
+      <tr><td><kbd>F</kbd></td><td>full screen</td></tr>
+      <tr><td><kbd>I</kbd></td><td>image info</td></tr>
+      <tr><td><kbd>?</kbd></td><td>this list</td></tr>
+      <tr><td><kbd>Esc</kbd></td><td>close</td></tr>
+    </table>
+  </div>
+
+  <div class="show-hud">
+    <button id="showPrev" title="Previous (&larr;)">&#9664;</button>
+    <button id="showPlay" title="Play / pause (Space)">&#9654;</button>
+    <button id="showNext" title="Next (&rarr;)">&#9654;&#9654;</button>
+    <label>Every
+      <select id="showEvery">
+        <option value="1500">1.5s</option>
+        <option value="3000">3s</option>
+        <option value="5000" selected>5s</option>
+        <option value="8000">8s</option>
+        <option value="15000">15s</option>
+      </select>
+    </label>
+    <span class="show-grow"></span>
+    <button id="showHideBtn" title="Move to the hidden tree (H) - reversible">Hide</button>
+    <button id="showDeleteBtn" class="danger" title="Delete permanently (X, press twice)">Delete</button>
+    <button id="showActual" title="Fit to screen / actual pixels (A)">Fit</button>
+    <button id="showFs" title="Full screen (F)">&#9974;</button>
+    <button id="showInfoBtn" title="Image info (I)">Info</button>
+    <button id="showKeysBtn" title="Keyboard shortcuts (?)">?</button>
   </div>
 </div>
 
@@ -569,8 +764,8 @@ HTML_PAGE = r"""<!doctype html>
 const $ = sel => document.querySelector(sel);
 const state = {
   folders: [],       // flat folder list (visible subset, filtered by altHeld)
-  allFolders: [],    // flat folder list, unfiltered (includes .hide)
-  altHeld: false,    // Option/Alt key currently held — reveals the .hide folder
+  allFolders: [],    // flat folder list, unfiltered (includes .hidden)
+  altHeld: false,    // Option/Alt key currently held — reveals the .hidden folder
   items: [],         // current folder images
   current: null,     // selected image item
   naturalSize: null, // {w,h} of current image
@@ -659,7 +854,7 @@ function renderFolderOptions() {
   if (prevMove && visible.some(f => f.rel === prevMove)) move.value = prevMove;
 }
 
-// Hold Option (Alt) to reveal the .hide folder in the folder dropdowns.
+// Hold Option (Alt) to reveal the .hidden folder in the folder dropdowns.
 document.addEventListener('keydown', e => {
   if (e.key !== 'Alt' || state.altHeld) return;
   state.altHeld = true;
@@ -676,7 +871,7 @@ window.addEventListener('blur', () => {
 function releaseAltHeld() {
   state.altHeld = false;
   const sel = $('#folderSel');
-  const wasHidden = sel.value.split('/').includes('.hide');
+  const wasHidden = sel.value.split('/').includes('.hidden');
   renderFolderOptions();
   if (wasHidden) {
     sel.value = '';
@@ -704,7 +899,7 @@ function updateSelectionUI() {
   $('#bulkDeleteBtn').style.display = n ? 'inline-block' : 'none';
   $('#bulkHideBtn').style.display = n ? 'inline-block' : 'none';
   $('#bulkHideBtn').textContent =
-    $('#folderSel').value.split('/').includes('.hide') ? 'Unhide selected' : 'Hide selected';
+    $('#folderSel').value.split('/').includes('.hidden') ? 'Unhide selected' : 'Hide selected';
   $('#cmpBtn').style.display = n === 2 ? 'inline-block' : 'none';
   $('#clearSelBtn').style.display = n ? 'inline-block' : 'none';
   $('#selectAllBtn').style.display = state.items.length ? 'inline-block' : 'none';
@@ -1215,6 +1410,356 @@ $('#apiKey').addEventListener('change', () => {
   refresh();
 });
 
+// ---- Slideshow -------------------------------------------------------
+// Review a whole folder at full resolution and triage it in place. Quality is
+// the point, so three things are deliberate:
+//
+//  * the source is /api/image (the original file), never /api/thumb, which
+//    caps at 512px and re-encodes to JPEG q82;
+//  * the next slides are fetched ahead of time and a slide is only shown once
+//    its bytes are fully in, so none ever paints in progressively;
+//    HTMLImageElement.decode() would be the better gate - it resolves only
+//    when the frame is ready to paint - but it never settles here (attached or
+//    detached, Chrome leaves the promise pending), so the load event is what
+//    the show waits on;
+//  * the dwell timer starts when the image appears, not when it was
+//    requested, so a slow decode shortens nothing.
+//
+// The decoded-bitmap cache is bounded: a 4MP RGBA frame is ~16MB, so holding a
+// whole folder would be hundreds of MB for no benefit.
+const SHOW_PRELOAD = 2;             // slides ahead/behind to decode
+const SHOW_CACHE_KEEP = 5;          // decoded images retained around the cursor
+const SHOW_IDLE_MS = 2600;          // hide the chrome after this much stillness
+const SHOW_ARM_MS = 3000;           // how long a primed delete stays primed
+
+const show = {
+  list: [], i: 0, playing: false, intervalMs: 5000,
+  timer: null, idleTimer: null, armTimer: null,
+  cache: new Map(),                 // rel -> HTMLImageElement
+  front: 1,                         // which layer is currently opaque
+  armed: false, changed: false, token: 0,
+};
+
+function showOpen(items, startIndex) {
+  if (!items.length) { toast('Nothing to show', true); return; }
+  show.list = items.slice();
+  show.i = Math.max(0, Math.min(startIndex || 0, show.list.length - 1));
+  show.changed = false;
+  show.cache.clear();
+  show.front = 1;
+  $('#showLayer0').classList.remove('front');
+  $('#showLayer1').classList.remove('front');
+  show.intervalMs = parseInt($('#showEvery').value, 10) || 5000;
+  $('#show').classList.add('open');
+  showGoto(show.i);
+  showNudge();
+}
+
+function showClose() {
+  showPause();
+  clearTimeout(show.idleTimer);
+  showDisarm();
+  show.token++;                     // abandon any decode still in flight
+  $('#show').classList.remove('open', 'idle');
+  $('#showLayer0').querySelector('img').src = '';
+  $('#showLayer1').querySelector('img').src = '';
+  show.cache.clear();
+  if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+  // Deletes and hides happened server-side; the grid behind is now stale.
+  if (show.changed) refresh();
+}
+
+function showImgFor(rel) {
+  let img = show.cache.get(rel);
+  if (!img) {
+    img = new Image();
+    img.src = imgUrl(rel);          // full-resolution original
+    show.cache.set(rel, img);
+  }
+  return img;
+}
+
+// Resolves once the image's bytes are in and its dimensions are known.
+// Deliberately not img.decode(): that is the better primitive on paper, but it
+// does not settle in this browser for either an attached or a detached <img>,
+// which left every slide blank. The load event is reliable, and a fully
+// fetched image painting into a layer that is fading in over 160ms does not
+// show the progressive paint that the decode gate was there to prevent.
+function showReady(img) {
+  if (img.complete) {
+    return img.naturalWidth ? Promise.resolve() : Promise.reject(new Error('not an image'));
+  }
+  return new Promise((resolve, reject) => {
+    img.addEventListener('load', () => resolve(), { once: true });
+    img.addEventListener('error', () => reject(new Error('load failed')), { once: true });
+  });
+}
+
+function showPreloadAround(i) {
+  for (let d = 1; d <= SHOW_PRELOAD; d++) {
+    for (const j of [i + d, i - d]) {
+      if (j >= 0 && j < show.list.length) showImgFor(show.list[j].rel);
+    }
+  }
+  // Evict anything far from the cursor so the cache stays a window, not a log.
+  if (show.cache.size > SHOW_CACHE_KEEP) {
+    const keep = new Set();
+    for (let d = -SHOW_PRELOAD; d <= SHOW_PRELOAD; d++) {
+      const it = show.list[i + d];
+      if (it) keep.add(it.rel);
+    }
+    for (const rel of Array.from(show.cache.keys())) {
+      if (!keep.has(rel)) show.cache.delete(rel);
+    }
+  }
+}
+
+async function showGoto(i, keepPlaying) {
+  if (!show.list.length) { showClose(); return; }
+  show.i = (i + show.list.length) % show.list.length;
+  const it = show.list[show.i];
+  const token = ++show.token;
+  showDisarm();
+  clearTimeout(show.timer);
+  showBarStop();
+
+  $('#showCount').textContent = (show.i + 1) + ' / ' + show.list.length;
+  $('#showName').textContent = it.name;
+  showRenderInfo(it, null);
+
+  const img = showImgFor(it.rel);
+  try { await showReady(img); }
+  catch (e) {
+    // A load failure is the image itself being unreadable (or deleted from
+    // under us); skipping beats a black slide and a stalled show.
+    if (token !== show.token) return;
+    toast('Could not display ' + it.name, true);
+    if (show.list.length === 1) { showClose(); return; }
+    show.list.splice(show.i, 1);
+    show.cache.delete(it.rel);
+    showGoto(show.i, keepPlaying);
+    return;
+  }
+  if (token !== show.token) return;  // a newer navigation won
+
+  const backEl = show.front === 0 ? $('#showLayer1') : $('#showLayer0');
+  const frontEl = show.front === 0 ? $('#showLayer0') : $('#showLayer1');
+  const backImg = backEl.querySelector('img');
+  backImg.src = img.src;
+  backImg.width = img.naturalWidth;
+  backImg.height = img.naturalHeight;
+  backEl.classList.add('front');
+  frontEl.classList.remove('front');
+  show.front = show.front === 0 ? 1 : 0;
+  backEl.scrollTop = 0; backEl.scrollLeft = 0;
+
+  showRenderInfo(it, img);
+  showPreloadAround(show.i);
+  // Dwell starts now - after the picture is actually up.
+  if (show.playing && keepPlaying !== false) showSchedule();
+}
+
+function showSchedule() {
+  clearTimeout(show.timer);
+  showBarRun();
+  show.timer = setTimeout(() => showGoto(show.i + 1), show.intervalMs);
+}
+
+function showBarRun() {
+  const bar = $('#showBar');
+  bar.classList.remove('run');
+  void bar.offsetWidth;             // reflow, so the animation restarts
+  bar.style.animationDuration = (show.intervalMs / 1000) + 's';
+  bar.classList.add('run');
+}
+
+function showBarStop() {
+  const bar = $('#showBar');
+  bar.classList.remove('run');
+  bar.style.width = '0';
+}
+
+function showPlay() {
+  show.playing = true;
+  $('#showPlay').innerHTML = '&#10073;&#10073;';
+  $('#showPlay').classList.add('on');
+  showSchedule();
+}
+
+function showPause() {
+  show.playing = false;
+  clearTimeout(show.timer);
+  showBarStop();
+  $('#showPlay').innerHTML = '&#9654;';
+  $('#showPlay').classList.remove('on');
+}
+
+function showTogglePlay() { show.playing ? showPause() : showPlay(); }
+
+function showRenderInfo(it, img) {
+  const dims = img ? (img.naturalWidth + ' x ' + img.naturalHeight + ' px') : '...';
+  const mp = img ? ((img.naturalWidth * img.naturalHeight) / 1e6).toFixed(1) + ' MP' : '';
+  let html = '<dl>' +
+    '<dt>File</dt><dd>' + esc(it.name) + '</dd>' +
+    '<dt>Folder</dt><dd>' + esc(it.rel.split('/').slice(0, -1).join('/') || '(root)') + '</dd>' +
+    '<dt>Size</dt><dd>' + fmtBytes(it.size) + '</dd>' +
+    '<dt>Pixels</dt><dd>' + dims + (mp ? ' &middot; ' + mp : '') + '</dd>' +
+    '<dt>Modified</dt><dd>' + fmtDate(it.mtime) + '</dd>' +
+    '</dl>';
+  if (it.prompt) html += '<div class="sp">' + esc(it.prompt) + '</div>';
+  $('#showInfo').innerHTML = html;
+}
+
+function esc(t) {
+  return String(t == null ? '' : t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// Remove the current slide from the show after it has been hidden or deleted,
+// and keep the grid's own state in step so closing is not a surprise.
+function showDropCurrent() {
+  const gone = show.list.splice(show.i, 1)[0];
+  if (gone) {
+    show.cache.delete(gone.rel);
+    state.items = state.items.filter(x => x.rel !== gone.rel);
+    state.selected.delete(gone.rel);
+  }
+  show.changed = true;
+  if (!show.list.length) { toast('That was the last one'); showClose(); return; }
+  if (show.i >= show.list.length) show.i = 0;
+  showGoto(show.i);
+}
+
+async function showHideCurrent() {
+  const it = show.list[show.i];
+  if (!it) return;
+  const wasPlaying = show.playing;
+  showPause();
+  try {
+    const r = await api('/api/hide', { method: 'POST', body: { path: it.rel } });
+    toast(r.action === 'unhide' ? 'Unhid ' + it.name : 'Hid ' + it.name);
+    showDropCurrent();
+    if (wasPlaying && show.list.length) showPlay();
+  } catch (e) { toast(e.message, true); }
+}
+
+// Delete is irreversible and a slideshow is a fast-moving context, so it takes
+// two presses rather than a confirm dialog: a modal would stall the show and
+// steal the keyboard, and confirm-every-time is what trains people to click
+// through without reading.
+function showArmDelete() {
+  show.armed = true;
+  const b = $('#showDeleteBtn');
+  b.classList.add('armed');
+  b.textContent = 'Press again';
+  clearTimeout(show.armTimer);
+  show.armTimer = setTimeout(showDisarm, SHOW_ARM_MS);
+}
+
+function showDisarm() {
+  if (!show.armed) return;
+  show.armed = false;
+  clearTimeout(show.armTimer);
+  const b = $('#showDeleteBtn');
+  b.classList.remove('armed');
+  b.textContent = 'Delete';
+}
+
+async function showDeleteCurrent() {
+  if (!show.armed) { showPause(); showArmDelete(); return; }
+  showDisarm();
+  const it = show.list[show.i];
+  if (!it) return;
+  try {
+    await api('/api/delete', { method: 'POST', body: { path: it.rel } });
+    toast('Deleted ' + it.name);
+    showDropCurrent();
+  } catch (e) { toast(e.message, true); }
+}
+
+function showToggleActual() {
+  const on = $('#show').classList.toggle('actual');
+  $('#showActual').textContent = on ? 'Actual' : 'Fit';
+  $('#showActual').classList.toggle('on', on);
+}
+
+function showToggleFs() {
+  if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+  else $('#show').requestFullscreen().catch(() => toast('Full screen refused', true));
+}
+
+// Any input brings the chrome back and restarts the idle countdown.
+function showNudge() {
+  const el = $('#show');
+  el.classList.remove('idle');
+  clearTimeout(show.idleTimer);
+  show.idleTimer = setTimeout(() => {
+    if (el.classList.contains('open')) el.classList.add('idle');
+  }, SHOW_IDLE_MS);
+}
+
+function showItemsForStart() {
+  // Mirrors the bulk buttons: a selection narrows the show to it.
+  const sel = state.items.filter(it => state.selected.has(it.rel));
+  return sel.length ? sel : state.items;
+}
+
+$('#showBtn').addEventListener('click', () => showOpen(showItemsForStart(), 0));
+$('#showFromHereBtn').addEventListener('click', () => {
+  const cur = state.current;
+  closeModal();
+  const items = state.items;
+  const idx = cur ? items.findIndex(it => it.rel === cur.rel) : 0;
+  showOpen(items, idx < 0 ? 0 : idx);
+});
+$('#showClose').addEventListener('click', showClose);
+$('#showPrev').addEventListener('click', () => { showPause(); showGoto(show.i - 1); });
+$('#showNext').addEventListener('click', () => { showPause(); showGoto(show.i + 1); });
+$('#showPlay').addEventListener('click', showTogglePlay);
+$('#showHideBtn').addEventListener('click', showHideCurrent);
+$('#showDeleteBtn').addEventListener('click', showDeleteCurrent);
+$('#showActual').addEventListener('click', showToggleActual);
+$('#showFs').addEventListener('click', showToggleFs);
+$('#showInfoBtn').addEventListener('click', () => {
+  $('#showInfoBtn').classList.toggle('on', $('#showInfo').classList.toggle('on'));
+});
+$('#showKeysBtn').addEventListener('click', () => {
+  $('#showKeysBtn').classList.toggle('on', $('#showKeys').classList.toggle('on'));
+});
+$('#showEvery').addEventListener('change', () => {
+  show.intervalMs = parseInt($('#showEvery').value, 10) || 5000;
+  if (show.playing) showSchedule();
+});
+$('#showZonePrev').addEventListener('click', () => { showPause(); showGoto(show.i - 1); });
+$('#showZoneNext').addEventListener('click', () => { showPause(); showGoto(show.i + 1); });
+$('#show').addEventListener('mousemove', showNudge);
+
+// Capture phase: while the show is open it owns the keyboard, so the grid's
+// own Esc/arrow handling never sees these keys and cannot also act on them.
+document.addEventListener('keydown', e => {
+  if (!$('#show').classList.contains('open')) return;
+  const tag = (e.target.tagName || '').toLowerCase();
+  if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
+  let handled = true;
+  switch (e.key) {
+    case 'Escape':    showClose(); break;
+    case 'ArrowRight':
+    case 'PageDown':  showPause(); showGoto(show.i + 1); break;
+    case 'ArrowLeft':
+    case 'PageUp':    showPause(); showGoto(show.i - 1); break;
+    case 'Home':      showPause(); showGoto(0); break;
+    case 'End':       showPause(); showGoto(show.list.length - 1); break;
+    case ' ':         showTogglePlay(); break;
+    case 'h': case 'H': showHideCurrent(); break;
+    case 'x': case 'X': case 'Delete': showDeleteCurrent(); break;
+    case 'a': case 'A': showToggleActual(); break;
+    case 'f': case 'F': showToggleFs(); break;
+    case 'i': case 'I': $('#showInfoBtn').click(); break;
+    case '?':           $('#showKeysBtn').click(); break;
+    default: handled = false;
+  }
+  if (handled) { e.preventDefault(); e.stopPropagation(); showNudge(); }
+}, true);
+
 async function refresh() {
   try {
     await loadFolders();
@@ -1248,6 +1793,7 @@ if __name__ == "__main__":
         import sys
         sys.exit(1)
 
+    migrate_legacy_hide()
     print(f"Image Manager serving {ROOT}")
     print(f"Listening on http://{args.host}:{args.port}  (hostname: {socket.gethostname()})")
     app.run(host=args.host, port=args.port, threaded=True)

@@ -23,7 +23,18 @@ entry points share one model core:
   one place. Adding an endpoint means extracting an `_api_*` function and
   wiring both dialects to it. See REST_API.md and `examples/`.
 - **`image_manager.py`** — separate Flask gallery/crop tool on port 2223 over
-  the same `web-generated/` tree.
+  the same `web-generated/` tree. Hide moves an image into `.hidden/` —
+  the *same* folder the generator's hidden mode writes to, keeping its
+  subpath (`archive/x.png` ⇄ `.hidden/archive/x.png`) so unhide restores it.
+  This gallery used to keep a second tree at `.hide/`, which meant an image
+  could be hidden in two places and each UI saw only one;
+  `migrate_legacy_hide()` folds any leftover `.hide/` in at startup and
+  `api_hide` still accepts the old paths for unhide. Its slideshow (`#show`)
+  is the folder-review path: full-bleed, sourced from `/api/image` rather than the 512px JPEG
+  `/api/thumb`, with `H` to hide and a two-press `X` to delete as you watch.
+  It waits on each image's `load` event, **not** `img.decode()` — the better
+  gate on paper, but it never settles in Chrome here for an attached or a
+  detached `<img>`, which left every slide blank.
 
 ## Running
 
@@ -68,6 +79,7 @@ python smoke_test_servers.py        # every menu config, isolated subprocesses
 python smoke_test_servers.py 9 10   # subset
 python test_rest_api.py             # /api/v1 contract checks, no GPU needed
 python test_gpu_pace.py             # sysmem-fallback detector, no GPU needed
+python test_fallback.py             # load-failure fallback, no GPU needed
 ```
 
 `smoke_test_servers.py` writes a live-updating HTML tracker to
@@ -77,6 +89,8 @@ covers routing/auth/status codes/error envelopes in seconds but never reaches
 the GPU — it is the one test to run after touching either API dialect.
 `test_gpu_pace.py` feeds the step-pace detector timings from real incidents, so
 it also needs no GPU; run it after touching the SLOW_STEP_* logic.
+`test_fallback.py` checks the load-failure fallback's decision table (also no
+GPU) — run it after touching `FALLBACK_CONFIG` or the model-load error path.
 
 ## Dependencies
 
@@ -183,6 +197,25 @@ retired for the first release that carries the pipeline.
   supervisor. `FLUX_SLOW_STEP_FACTOR=0` disables it. `_release_gpu_cache`
   (`torch.cuda.empty_cache` between jobs) shrinks the idle footprint so the
   desktop's GPU clients have somewhere to grow other than into our weights.
+- **Load-failure fallback**: a model that fails to load is the one failure the
+  supervisor cannot see — the Flask app stays up answering `/ready` with an
+  error, the process never exits, and nothing restarts, so the box serves
+  nothing until a human notices. `_fallback_after_load_failure` requests a
+  restart into `FALLBACK_CONFIG` (env `FLUX_FALLBACK_CONFIG`, default 15) over
+  the same exit-86 route as `/switch-model`. It declines in exactly three
+  cases, and each one matters: unsupervised (`FLUX_CONFIG` unset), because
+  exiting would leave nothing at all where staying up at least reports the
+  error; already *on* the fallback config, because exit 86 resets the
+  supervisor's retry counter and a fallback that cannot load either would
+  relaunch forever; and `FLUX_FALLBACK_CONFIG=0`. An active multi-model run
+  first gets the dead config written into its results as failed
+  (`_multi_run_record_load_failure`) — a run picks its next config by what has
+  no result yet, so without that it would send the server straight back into
+  the config that just failed. `run_server.ps1` covers what the process cannot
+  see of itself: when a config burns all `$MaxRetries` (a backend import that
+  fails before Flask starts, or a crash that repeats), it hops to
+  `$FallbackConfig` once and then gives up normally, so a box where nothing
+  loads still stops.
 - **Reference images**: `generate_image` accepts one PIL image or a list of up
   to `MAX_REFERENCE_IMAGES` (3). FLUX.2 pipelines take the list natively;
   Kontext stitches multiple refs side-by-side (`_stitch_references`) since its
@@ -275,9 +308,12 @@ retired for the first release that carries the pipeline.
   the same browser can read — never learns about a hidden generation. (Pressing
   Reset twice inside two seconds wipes that list outright.) It is concealment,
   not security: the API key still reaches everything. The reference-image
-  folder browser skips dotfiles and
-  `image_manager.py`'s folder tree skips `.hidden` by name, which is what keeps
-  the directory out of sight in the other two UIs.
+  folder browser skips dotfiles, which keeps the directory out of sight there.
+  `image_manager.py` is the deliberate exception: `.hidden/` is also where its
+  own Hide moves images, so it shows the folder — but only while Option/Alt is
+  held (`visibleFolders`), and it leaves out `steps/` and dot-subfolders
+  (`_hidden_walk`), which are preview decodes and bookkeeping rather than a
+  gallery.
 - **Output convention**: `flux{1|2}_{YYYYMMDD_HHMMSS}_{8hex}.png` plus a
   `.prompt` sidecar with the generation metadata, in `web-generated/` (server)
   or the CWD (CLI). `image_manager.py` parses the `# Prompt:` sidecar line —

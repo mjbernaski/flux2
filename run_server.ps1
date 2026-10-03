@@ -36,6 +36,13 @@ $LastConfigFile = ".last_config"
 $LogFile = "server.log"
 $MaxRetries = 5
 $RetryDelay = 3
+# Where to go when a config cannot be made to run at all. web_server.py handles
+# the case it can see - a model that fails to load - by requesting a switch here
+# (exit $SwitchExitCode). This covers the ones it cannot: an import that fails
+# before Flask starts, or a crash that repeats every retry. Without it the loop
+# spends all five retries on a config that will never work and then gives up
+# with nothing serving. 0 disables the fallback and restores give-up-and-exit.
+$FallbackConfig = if ($env:FLUX_FALLBACK_CONFIG -match '^\d+$') { [int]$env:FLUX_FALLBACK_CONFIG } else { 15 }
 $PythonExe = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
 
 function Get-ConfigArgs([int]$Config) {
@@ -295,6 +302,20 @@ function Start-FluxServer([int]$Config, [string[]]$ExtraArgs = @()) {
             }
 
             if ($attempt -ge $MaxRetries -and $attempt -ne 0) {
+                # One last move before giving up: if this is not already the
+                # fallback config, restart into it. Only ever one hop - the
+                # fallback's own retries end in the plain give-up below, so a
+                # box where nothing loads still stops instead of looping.
+                if ($FallbackConfig -ne 0 -and $Config -ne $FallbackConfig -and (Get-ConfigArgs $FallbackConfig)) {
+                    Write-Log "Maximum retries ($MaxRetries) reached on config $Config." "Red"
+                    Write-Log "Falling back to config $FallbackConfig." "Cyan"
+                    $Config = $FallbackConfig
+                    $cfg = Get-ConfigArgs $FallbackConfig
+                    $attempt = 0
+                    $firstStart = $true
+                    Start-Sleep -Seconds $RetryDelay
+                    continue
+                }
                 Write-Log "Maximum retries ($MaxRetries) reached. Giving up." "Red"
                 return 1
             }

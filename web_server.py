@@ -237,6 +237,28 @@ SERVER_CONFIGS = {
 }
 SWITCH_EXIT_CODE = 86
 SWITCH_CONFIG_FILE = ".next_config"
+
+# Config to fall back to when the selected one cannot load its model. A failed
+# load is the one failure the supervisor cannot see: the Flask app stays up and
+# answers /ready with an error, the process never exits, so nothing restarts
+# and the box serves nothing until a human notices. Falling back re-uses the
+# /switch-model exit-86 route, so the recovery path is the one already in use.
+# FLUX_FALLBACK_CONFIG=0 (or off/none) disables it and leaves the error standing.
+def _fallback_config_from_env():
+    raw = os.environ.get("FLUX_FALLBACK_CONFIG", "15").strip().lower()
+    if raw in ("", "0", "off", "no", "none", "false"):
+        return None
+    try:
+        n = int(raw)
+    except ValueError:
+        n = None
+    if n not in SERVER_CONFIGS:
+        print(f"Ignoring FLUX_FALLBACK_CONFIG={raw!r} (not a config number); using 15.")
+        return 15
+    return n
+
+
+FALLBACK_CONFIG = _fallback_config_from_env()
 try:
     _current_config = int(os.environ.get("FLUX_CONFIG", ""))
 except ValueError:
@@ -1573,6 +1595,64 @@ def _multi_run_record(job):
             _multi_run_finish(state, canceled=True)
         else:
             _multi_run_save(state)
+
+
+def _multi_run_record_load_failure(error):
+    """Record the current config as failed in an active run, without a job.
+
+    A run advances by asking which of its configs has no result yet, so a
+    config that cannot even load its model has to be written down as failed —
+    otherwise the run would keep choosing it, and the load-failure fallback
+    below would bounce between it and FALLBACK_CONFIG forever.
+    """
+    with _multi_run_lock:
+        state = _multi_run_load()
+        if not state or state.get('finished'):
+            return
+        if any(r.get('config') == _current_config for r in state['results']):
+            return
+        state['results'].append({
+            'config': _current_config,
+            'label': SERVER_CONFIGS.get(_current_config, str(_current_config)),
+            'model': None,
+            'state': 'failed',
+            'error': f'model load failed: {error}',
+            'images': [],
+            'generation_time': 0,
+        })
+        _multi_run_save(state)
+        print(f"[multi-run] config {_current_config} skipped: model load failed", flush=True)
+
+
+def _fallback_after_load_failure(error):
+    """Restart into FALLBACK_CONFIG after a failed model load.
+
+    Returns True if a restart was requested. Three things stop it:
+
+    - no supervisor (FLUX_CONFIG unset), because exiting would then leave
+      nothing at all, where staying up at least reports the error to /ready;
+    - already running the fallback config, because a fallback that cannot load
+      either would relaunch forever — exit 86 resets the supervisor's retry
+      counter, so its five-strikes limit would never catch this;
+    - FLUX_FALLBACK_CONFIG=0.
+    """
+    if FALLBACK_CONFIG is None or _current_config is None:
+        return False
+    if _current_config == FALLBACK_CONFIG:
+        print(f"FATAL: fallback config {FALLBACK_CONFIG} is itself the one that "
+              f"failed to load - staying up to report the error.", flush=True)
+        return False
+    _multi_run_record_load_failure(error)
+    with open(SWITCH_CONFIG_FILE, 'w') as f:
+        f.write(str(FALLBACK_CONFIG))
+    print(f"[fallback] config {_current_config} ({SERVER_CONFIGS.get(_current_config)}) "
+          f"failed to load - restarting into config {FALLBACK_CONFIG} "
+          f"({SERVER_CONFIGS[FALLBACK_CONFIG]})", flush=True)
+    # Longer than the /switch-model delay: this gives the UI's /ready poll a
+    # cycle to show what actually failed before the process goes away, so the
+    # restart is not the only thing the user ever sees.
+    threading.Timer(3.0, lambda: os._exit(SWITCH_EXIT_CODE)).start()
+    return True
 
 
 def _multi_run_advance():
@@ -3798,6 +3878,10 @@ if __name__ == '__main__':
             _model_load_status = "error"
             print(f"FATAL: model load failed: {e}")
             traceback.print_exc()
+            # Hand the box back to a config that works rather than sitting here
+            # serving nothing; see _fallback_after_load_failure for when it
+            # declines to.
+            _fallback_after_load_failure(e)
 
     _model_load_start_ts = time.perf_counter()
     threading.Thread(target=_load_in_background, daemon=True).start()

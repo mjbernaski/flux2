@@ -690,7 +690,7 @@ function syncRefUI() {
     if (uploadPlaceholder) {
         const span = uploadPlaceholder.querySelector('span');
         if (span) span.textContent = n === 0
-            ? `Tap or click to add up to ${MAX_REFERENCE_IMAGES} images`
+            ? `Tap, click, drop or paste up to ${MAX_REFERENCE_IMAGES} images`
             : `+ Add image (${n}/${MAX_REFERENCE_IMAGES})`;
     }
     // Strength only applies to single-image FLUX.1 img2img; multi-reference
@@ -1612,6 +1612,32 @@ if (uploadArea) {
     });
 }
 if (inputImage) inputImage.addEventListener('change', function(e) { addImageFiles(e.target.files); });
+
+// Paste an image straight in (Ctrl/Cmd-V), from a screenshot tool, an image
+// copied in another tab, or a file copied in the file manager. Bound on the
+// document rather than the upload area because paste has no hover target —
+// there is nowhere to aim it the way you aim a drop.
+//
+// Only a clipboard carrying actual image data is intercepted: pasting text
+// still reaches the prompt box, which is the far more common paste on this
+// page. A clipboard with both (copying an image in a browser usually also
+// sets text/html) counts as an image, since pasting markup into the prompt
+// is never what was meant.
+document.addEventListener('paste', function(e) {
+    if (!e.clipboardData) return;
+    // clipboardData.files is empty in some browsers for copied-image data, so
+    // items is the reliable source; .files alone would miss the common case.
+    var files = Array.from(e.clipboardData.items || [])
+        .filter(function(i) { return i.kind === 'file'; })
+        .map(function(i) { return i.getAsFile(); })
+        .filter(function(f) { return f && (f.type.indexOf('image/') === 0 || isRawFile(f)); });
+    if (!files.length) return;
+    // Past the reference limit there is nothing to add, so let the paste fall
+    // through untouched rather than swallowing it to no effect.
+    if (currentInputImages.length >= MAX_REFERENCE_IMAGES) return;
+    e.preventDefault();
+    addImageFiles(files);
+});
 
 const imageUrlInput = document.getElementById('imageUrlInput');
 const addUrlBtn = document.getElementById('addUrlBtn');

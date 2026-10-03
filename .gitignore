@@ -70,6 +70,7 @@ ollama.err.log
 
 # Editor/log artifacts (siblings of the entries above)
 image_manager.err.log
+image_manager.out.log
 
 # API guide build intermediates; the PDFs in docs/ are the deliverable
 docs/*.html
