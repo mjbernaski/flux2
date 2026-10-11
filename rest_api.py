@@ -395,6 +395,15 @@ def save_image(filename):
     return jsonify({'saved': ws._api_save_hidden(filename)})
 
 
+@rest.route('/images/<path:filename>/hide', methods=['POST'])
+@endpoint
+def hide_image(filename):
+    """Toggle an image into or out of `.hidden/` — the same tree, and the same
+    toggle, as the image manager's Hide. Returns the new identifier, which is
+    what every other route then expects."""
+    return jsonify(ws._api_hide_image(filename))
+
+
 @rest.route('/archive', methods=['POST'])
 @endpoint
 def archive():
@@ -499,7 +508,9 @@ def create_vlm_job():
       describe  images[] (base64/data URLs, up to MAX_REFERENCE_IMAGES),
                 think, model              -> result.prompt
       boost     prompt, level 1-5, think, has_image, negative_prompt,
-                variant_index, variant_count, model
+                variant_index, variant_count, model, input_images[]
+                (optional: shows the references to the VLM, so the rewrite is
+                grounded in them rather than inferred from the draft)
                                           -> result.prompt, result.negative_prompt
       critique  direction, prompt, ref_image, output_filename, history, model
                                           -> result.critique, result.revised_prompt,
@@ -834,6 +845,14 @@ def _openapi_document():
                 'Copy an image into .saved/, beyond archive and delete-today.',
                 tag='images',
                 params=[('filename', 'path', True, 'string', 'Output filename')])},
+            '/images/{filename}/hide': {'post': _op(
+                'Toggle an image into or out of .hidden/ — the same folder, and '
+                'the same toggle, as the image manager Hide. Returns the new '
+                'identifier, which is what the other routes then expect.',
+                tag='images',
+                params=[('filename', 'path', True, 'string', 'Output filename')],
+                responses={'200': {'description': 'Moved'}, '404': err,
+                           '409': dict(err, description='Name already taken on the other side')})},
             '/archive': {'post': _op("Move today's output into archive/.", tag='images')},
             '/filmstrips': {'post': _op(
                 'Compose an edit-loop film strip and preserve its iterations.',
@@ -892,7 +911,10 @@ def _openapi_document():
                           'level': {'type': 'integer', 'minimum': 1, 'maximum': 5,
                                     'default': 3, 'description': 'boost: rewrite boldness.'},
                           'has_image': {'type': 'boolean',
-                                        'description': 'boost: references are attached.'},
+                                        'description': 'boost: references are attached (picks the idiom).'},
+                          'input_images': {'type': 'array', 'items': {'type': 'string'},
+                                           'description': 'boost: base64 references to show the '
+                                                          'VLM. Omit to keep boost text-only.'},
                           'negative_prompt': {'type': 'string'},
                           'variant_index': {'type': 'integer'},
                           'variant_count': {'type': 'integer'},

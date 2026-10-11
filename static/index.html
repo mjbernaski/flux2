@@ -6,7 +6,7 @@
     <meta name="theme-color" content="#1a1a2e">
     <title>flux</title>
     <script>document.title = window.location.hostname + ' flux';</script>
-    <link rel="stylesheet" href="/static/app.css?v=17">
+    <link rel="stylesheet" href="/static/app.css?v=19">
 </head>
 <body>
     <div class="loading-overlay" id="loadingOverlay">
@@ -88,6 +88,10 @@
                 <label class="boost-think" for="boostThink"
                        title="On: the VLM deliberates before rewriting — better results, slower. Off: instant-ish shallow rewrite.">
                     <input type="checkbox" id="boostThink"> think
+                </label>
+                <label class="boost-think" id="boostRefsLabel" for="boostUseRefs" style="display:none"
+                       title="On: the reference images are sent to the VLM, so it rewrites from what it can actually see. Off: text-only, the VLM only knows that references exist.">
+                    <input type="checkbox" id="boostUseRefs"> show refs
                 </label>
             </div>
             <div class="boost-control boost-variants-control">
@@ -277,13 +281,27 @@
                 <label for="batch">Batch Size</label>
                 <select id="batch" name="batch">
                     <option value="1" selected>1 image</option>
-                    <option value="2">2 images</option>
-                    <option value="4">4 images</option>
-                    <option value="8">8 images</option>
-                    <option value="16">16 images</option>
-                    <option value="32">32 images</option>
-                    <option value="64">64 images</option>
-                    <option value="128">128 images</option>
+                    <option value="2">2 images (2&times;1 sheet)</option>
+                    <option value="3">3 images (3&times;1 sheet)</option>
+                    <option value="4">4 images (2&times;2 sheet)</option>
+                    <option value="6">6 images (3&times;2 sheet)</option>
+                    <option value="8">8 images (4&times;2 sheet)</option>
+                    <option value="9">9 images (3&times;3 sheet)</option>
+                    <option value="12">12 images (4&times;3 sheet)</option>
+                    <option value="16">16 images (4&times;4 sheet)</option>
+                    <option value="18">18 images (6&times;3 sheet)</option>
+                    <option value="24">24 images (6&times;4 sheet)</option>
+                    <option value="27">27 images (9&times;3 sheet)</option>
+                    <option value="32">32 images (8&times;4 sheet)</option>
+                    <option value="36">36 images (6&times;6 sheet)</option>
+                    <option value="48">48 images (8&times;6 sheet)</option>
+                    <option value="54">54 images (9&times;6 sheet)</option>
+                    <option value="64">64 images (8&times;8 sheet)</option>
+                    <option value="72">72 images (9&times;8 sheet)</option>
+                    <option value="81">81 images (9&times;9 sheet)</option>
+                    <option value="96">96 images (12&times;8 sheet)</option>
+                    <option value="108">108 images (12&times;9 sheet)</option>
+                    <option value="128">128 images (16&times;8 sheet)</option>
                 </select>
             </div>
         </div>
@@ -546,6 +564,6 @@
         </details>
     </div>
 
-    <script src="/static/app.js?v=18"></script>
+    <script src="/static/app.js?v=22"></script>
 </body>
 </html>

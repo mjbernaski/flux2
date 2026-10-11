@@ -20,3 +20,8 @@ pillow
 rawpy  # LibRaw bindings: camera RAW (NEF etc.) reference uploads via /convert-raw
 python-dotenv
 # nvidia-modelopt  # installed for future NVFP4 support (currently blocked by diffusers Flux2 converter)
+# Super-resolution model loader for image_manager.py's upscaler (Real-ESRGAN
+# weights under models/upscale/). Not the `realesrgan` package: that depends on
+# basicsr, which is unmaintained and fails to import against current
+# torchvision. Optional - image_manager degrades to no upscaler without it.
+spandrel

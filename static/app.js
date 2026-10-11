@@ -125,9 +125,45 @@ if (apiKeyInput) {
                     + MAX_REFERENCE_IMAGES + '; the first sets the output aspect)';
                 if (typeof syncRefUI === 'function') syncRefUI();
             }
+            importRefsFromUrl();
         })
-        .catch(function() { clearTimeout(timeout); el.textContent = 'Model info unavailable (use server URL, e.g. http://localhost:2222)'; });
+        .catch(function() {
+            clearTimeout(timeout);
+            el.textContent = 'Model info unavailable (use server URL, e.g. http://localhost:2222)';
+            importRefsFromUrl();   // still worth trying, at the default limit
+        });
 })();
+
+// ---- "Use as reference" handoff from the image manager (port 2223) --------
+// The manager opens this page with ?ref=<server path>, repeatable. Each one
+// goes through the same /fetch-image-path import the URL box uses, so the
+// 2048px/JPEG bounding, the reference limit and the error reporting all stay
+// in one place rather than being reimplemented for the handoff.
+//
+// Sequential, not parallel: addImageSource checks the limit on entry and
+// again before pushing, and firing N at once would let several past the first
+// check. The params are stripped as soon as they are read, so reloading the
+// page - or the reload a model switch performs - does not add them all again.
+function importRefsFromUrl() {
+    var params = new URLSearchParams(window.location.search);
+    var refs = params.getAll('ref').filter(function(r) { return r; });
+    if (!refs.length) return;
+    params.delete('ref');
+    var rest = params.toString();
+    history.replaceState(null, '', window.location.pathname + (rest ? '?' + rest : ''));
+    var i = 0, failures = [];
+    (function next() {
+        if (i >= refs.length) {
+            if (failures.length) alert('Could not add ' + failures.length
+                + ' reference image' + (failures.length === 1 ? '' : 's') + ': ' + failures[0]);
+            return;
+        }
+        addImageSource(refs[i++], function(err) {
+            if (err) failures.push(err);
+            next();
+        });
+    })();
+}
 
 // ---- Form-state carryover across a model switch ----
 // The switch ends in a full page reload (so /model-info re-fetches and the
@@ -157,6 +193,7 @@ function saveSwitchState() {
         showPreview: chk('showPreview'),
         savePreviews: chk('savePreviews'),
         boostThink: chk('boostThink'),
+        boostUseRefs: chk('boostUseRefs'),
         describeThink: chk('describeThink'),
         strength: strengthSlider ? strengthSlider.value : null,
         aspectMode: aspectModeEl ? aspectModeEl.value : null,
@@ -603,35 +640,6 @@ async function useAsReference(filename) {
     }
 }
 
-// Copy an image into the server-side .saved subdir (preserves it from
-// archive/delete-today). `el` is the clicked button; we reflect status on it.
-// Text-label buttons get a label swap; compact icon buttons just restyle.
-async function saveHidden(el, filename) {
-    const labeled = el && el.classList.contains('save-hidden-btn');
-    const original = el ? el.textContent : '';
-    if (el) { el.classList.add('saving'); if (labeled) el.textContent = 'Saving…'; }
-    try {
-        const res = await fetch('/save-hidden', {
-            method: 'POST',
-            headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
-            body: JSON.stringify({ filename: filename })
-        });
-        const body = await res.json();
-        if (body.success) {
-            if (el) {
-                el.classList.remove('saving'); el.classList.add('saved');
-                if (labeled) el.textContent = '★ Saved'; else el.title = 'Saved';
-            }
-        } else {
-            if (el) { el.classList.remove('saving'); if (labeled) el.textContent = original; }
-            alert('Save failed: ' + (body.error || 'unknown error'));
-        }
-    } catch (err) {
-        if (el) { el.classList.remove('saving'); if (labeled) el.textContent = original; }
-        alert('Save failed: ' + err.message);
-    }
-}
-
 // Permanently delete one of today's images (PNG + .prompt sidecar) after
 // confirming. Shared by the result cards and the history grid. Returns true
 // when the server reports the delete succeeded.
@@ -650,6 +658,41 @@ async function deleteImage(filename) {
         alert('Delete failed: ' + err.message);
     }
     return false;
+}
+
+// Move an image into (or out of) web-generated/.hidden/ — the same folder,
+// and the same toggle, the image manager's Hide performs. Distinct from this
+// page's hidden *mode*, which decides where a job writes before it runs; this
+// acts on an image that already exists. Reversible, so no confirm.
+//
+// The server returns the image's new identifier, because hiding changes it
+// (`foo.png` becomes `.hidden/foo.png`). Nothing here needs it — the grids
+// reload from /history straight after — but it is what a caller would use to
+// act on the image again.
+async function hideImage(filename) {
+    try {
+        const res = await fetch('/hide', {
+            method: 'POST',
+            headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+            body: JSON.stringify({ filename: filename })
+        });
+        const body = await res.json();
+        if (body.success) return body;
+        alert('Hide failed: ' + (body.error || 'unknown error'));
+    } catch (err) {
+        alert('Hide failed: ' + err.message);
+    }
+    return null;
+}
+
+// The reference images to show the boosting VLM, or [] to keep boost the
+// text-only call it has always been. Opt-in per the "show refs" toggle: a
+// grounded rewrite is usually better, but the VLM then tends to caption what
+// it can already see, and it costs a vision pass — worth being able to A/B.
+function boostRefImages() {
+    const el = document.getElementById('boostUseRefs');
+    if (!el || !el.checked) return [];
+    return currentInputImages.slice(0, MAX_REFERENCE_IMAGES);
 }
 
 // Re-render the reference thumbnails and every control whose visibility
@@ -698,6 +741,10 @@ function syncRefUI() {
     if (strengthControl) strengthControl.style.display = n === 1 ? 'flex' : 'none';
     const describeControl = document.getElementById('describeControl');
     if (describeControl) describeControl.style.display = n > 0 ? 'block' : 'none';
+    // "show refs" is meaningless with nothing attached; hide it rather than
+    // offer a toggle that cannot change the outcome.
+    const boostRefsLabel = document.getElementById('boostRefsLabel');
+    if (boostRefsLabel) boostRefsLabel.style.display = n > 0 ? 'inline-flex' : 'none';
     if (aspectModeControl) aspectModeControl.style.display = n > 0 ? 'block' : 'none';
     if (multiRefHint) multiRefHint.style.display = n > 1 ? 'block' : 'none';
     if (inputImage) inputImage.value = '';
@@ -1231,6 +1278,7 @@ async function runBoost() {
                 level: level,
                 think: thinkEl ? thinkEl.checked : false,
                 has_image: currentInputImages.length > 0,
+                input_images: boostRefImages(),
                 negative_prompt: negativeEl && negativeEl.value.trim() ? negativeEl.value.trim() : null
             })
         });
@@ -1434,6 +1482,7 @@ async function runBoostVariants() {
                         level: levelEl ? parseInt(levelEl.value, 10) : 3,
                         think: thinkEl ? thinkEl.checked : false,
                         has_image: currentInputImages.length > 0,
+                        input_images: boostRefImages(),
                         negative_prompt: draftNegative,
                         variant_index: i + 1,
                         variant_count: n
@@ -2364,7 +2413,7 @@ function addImageToGrid(img, index) {
             <a class="download-btn" href="#">Download</a>
             <a href="#" class="seed-btn">Use Seed</a>
             <a href="#" class="ref-btn">Use as Reference</a>
-            <a href="#" class="save-hidden-btn">★ Save</a>
+            <a href="#" class="hide-btn"></a>
             <a href="#" class="delete-btn">Delete</a>
         </div>
         <p class="info">${meta ? meta + ' · Seed: ' + img.seed : 'Seed: ' + img.seed}</p>
@@ -2388,7 +2437,22 @@ function addImageToGrid(img, index) {
     dl.setAttribute('download', img.filename);
     card.querySelector('.seed-btn').addEventListener('click', (e) => { e.preventDefault(); useSeed(img.seed); });
     card.querySelector('.ref-btn').addEventListener('click', (e) => { e.preventDefault(); useAsReference(img.filename); });
-    card.querySelector('.save-hidden-btn').addEventListener('click', function(e) { e.preventDefault(); saveHidden(this, img.filename); });
+    const hideLink = card.querySelector('.hide-btn');
+    if (hideLink) {
+        const hiding = !img.filename.startsWith('.hidden/');
+        hideLink.textContent = hiding ? '◐ Hide' : '◑ Unhide';
+        hideLink.title = hiding ? 'Move into the hidden folder — reversible' : 'Move back out of the hidden folder';
+        hideLink.addEventListener('click', async function(e) {
+            e.preventDefault();
+            if (this.classList.contains('hiding')) return;
+            this.classList.add('hiding');
+            const res = await hideImage(img.filename);
+            this.classList.remove('hiding');
+            if (!res) return;
+            removeResultCard(img.filename);
+            loadHistory();
+        });
+    }
     card.querySelector('.delete-btn').addEventListener('click', async function(e) {
         e.preventDefault();
         if (this.classList.contains('deleting')) return;
@@ -2959,7 +3023,7 @@ async function loadHistory() {
                 <img loading="lazy">
                 <button type="button" class="item-cmp" title="Compare: pick this and one more image">⧉</button>
                 <button type="button" class="item-ref" title="Use as reference">↪</button>
-                <button type="button" class="item-save" title="Save (survives housekeeping)">★</button>
+                <button type="button" class="item-hide"></button>
                 <button type="button" class="item-delete" title="Delete">X</button>
                 <div class="overlay">
                     <span class="time"></span>
@@ -2974,7 +3038,7 @@ async function loadHistory() {
             item.title = img.prompt || img.filename;
             item.addEventListener('click', (e) => {
                 if (e.target.classList.contains('item-delete')) return;
-                if (e.target.classList.contains('item-save')) return;
+                if (e.target.classList.contains('item-hide')) return;
                 if (e.target.classList.contains('item-ref')) return;
                 if (e.target.classList.contains('item-cmp')) return;
                 openLightbox(lbList, idx);
@@ -2999,11 +3063,19 @@ async function loadHistory() {
                     cmpBtn.classList.add('cmp-armed');
                 }
             }
-            const saveBtn = item.querySelector('.item-save');
-            if (saveBtn) {
-                saveBtn.addEventListener('click', (e) => {
+            const hideBtn = item.querySelector('.item-hide');
+            if (hideBtn) {
+                // In hidden mode the grid is the hidden folder, so the same
+                // button is the way back out of it.
+                const hiding = !img.filename.startsWith('.hidden/');
+                hideBtn.textContent = hiding ? '◐' : '◑';
+                hideBtn.title = hiding ? 'Hide (reversible)' : 'Unhide';
+                hideBtn.addEventListener('click', async (e) => {
                     e.stopPropagation();
-                    saveHidden(saveBtn, img.filename);
+                    if (await hideImage(img.filename)) {
+                        removeResultCard(img.filename);
+                        loadHistory();
+                    }
                 });
             }
             const delBtn = item.querySelector('.item-delete');
@@ -3497,6 +3569,7 @@ if (loopAcceptBtn) loopAcceptBtn.addEventListener('click', function() {
     setChk('showPreview', saved.showPreview);
     setChk('savePreviews', saved.savePreviews);
     setChk('boostThink', saved.boostThink);
+    setChk('boostUseRefs', saved.boostUseRefs);
     setChk('describeThink', saved.describeThink);
     if (typeof syncSavePreviewsVisibility === 'function') syncSavePreviewsVisibility();
     if (strengthSlider && saved.strength !== null && saved.strength !== undefined) {

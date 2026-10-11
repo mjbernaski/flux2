@@ -821,7 +821,7 @@ BOOST_LEVELS = {
 
 def vlm_boost(model, prompt, family="flux2", model_desc="", level=3,
               think=False, ollama_url="http://127.0.0.1:11434", variant=None,
-              negative_prompt=None):
+              negative_prompt=None, images=None):
     """Rewrite the user's draft prompt into a stronger one tuned to the
     prompting idiom of the loaded image model (`family` picks the guidance;
     `model_desc` is the human-readable model name for context; `level` 1-5
@@ -834,8 +834,18 @@ def vlm_boost(model, prompt, family="flux2", model_desc="", level=3,
     via CFG — it gets rewritten alongside the positive prompt in the same
     call, so the pair stays consistent: the positive rewrite must not add
     detail that fights or duplicates the (possibly also-tightened) negative
-    exclusions. Text-only chat — no images. Returns {"prompt": str,
-    "negative_prompt": str or None} on success, or None on any failure."""
+    exclusions.
+
+    `images` (optional) are the reference images the generation will condition
+    on. Passing them makes this a vision call, so the model can ground the
+    rewrite in what is actually in frame instead of guessing from the draft
+    alone. It is the caller's choice because it is a real trade: seeing the
+    reference stops the model inventing detail that contradicts it, but it
+    also tempts it into captioning what is already visible, and it costs a
+    vision pass. Omitted, this stays the text-only chat it has always been.
+
+    Returns {"prompt": str, "negative_prompt": str or None} on success, or
+    None on any failure."""
     guidance = BOOST_GUIDANCE.get(family, BOOST_GUIDANCE["flux2"])
     degree, temperature = BOOST_LEVELS.get(level, BOOST_LEVELS[3])
     variant_line = ""
@@ -866,11 +876,26 @@ def vlm_boost(model, prompt, family="flux2", model_desc="", level=3,
             "prompt rules out), and the negative prompt must not exclude "
             "anything the positive prompt now explicitly asks for.\n"
         )
+    images = list(images or [])
+    image_line = ""
+    if images:
+        plural = "images" if len(images) > 1 else "image"
+        image_line = (
+            f"Attached {'are' if len(images) > 1 else 'is'} the {len(images)} "
+            f"reference {plural} the image model will condition on, so you can "
+            "see what it will be working from. Ground the rewrite in what is "
+            "actually there - match the subject, setting and style you can see "
+            "rather than adding detail that contradicts them. Write the prompt "
+            "for the intended result, not a caption of the reference: do not "
+            "restate what the model can already see unless the draft asks to "
+            "change it.\n"
+        )
     ask = (
         "You improve prompts for a local text-to-image system"
         + (f" currently running {model_desc}" if model_desc else "") + ".\n"
         f"{guidance}\n"
         f"The user's draft prompt: {prompt}\n"
+        f"{image_line}"
         f"{negative_line}"
         f"{variant_line}"
         "Rewrite it into a stronger prompt for this model. Preserve the "
@@ -882,9 +907,14 @@ def vlm_boost(model, prompt, family="flux2", model_desc="", level=3,
         + ("Reply with the improved prompt and negative_prompt."
            if negative_prompt else "Reply with the improved prompt only.")
     )
+    message = {"role": "user", "content": ask}
+    if images:
+        # Same shape the critique and describe calls use; _openai_body turns
+        # it into image_url parts for an OpenAI-dialect endpoint.
+        message["images"] = [img_b64(im) for im in images]
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": ask}],
+        "messages": [message],
         "stream": False,
         "think": bool(think),
         "format": BOOST_SCHEMA if negative_prompt else DESCRIBE_SCHEMA,

@@ -378,10 +378,9 @@ button:disabled {
 .image-card .seed-btn:hover { background: #5a6268; }
 .image-card .ref-btn { background: #17a2b8; cursor: pointer; }
 .image-card .ref-btn:hover { background: #138496; }
-.image-card .save-hidden-btn { background: #b8860b; cursor: pointer; }
-.image-card .save-hidden-btn:hover { background: #9c7209; }
-.image-card .save-hidden-btn.saved { background: #4a4a4a; cursor: default; }
-.image-card .save-hidden-btn.saving { opacity: 0.7; cursor: default; }
+.image-card .hide-btn { background: #5a5a5a; cursor: pointer; }
+.image-card .hide-btn:hover { background: #767676; }
+.image-card .hide-btn.hiding { opacity: 0.7; cursor: default; pointer-events: none; }
 .image-card .delete-btn { background: #c0392b; cursor: pointer; }
 .image-card .delete-btn:hover { background: #992d22; }
 .image-card .delete-btn.deleting { opacity: 0.7; cursor: default; }
@@ -1125,28 +1124,6 @@ button:disabled {
 }
 .history-item:hover .item-delete { opacity: 1; }
 .history-item .item-delete:hover { background: rgba(153, 45, 34, 1); }
-.history-item .item-save {
-    position: absolute;
-    top: 4px;
-    right: 30px;
-    width: 22px;
-    height: 22px;
-    padding: 0;
-    background: rgba(184, 134, 11, 0.85);
-    color: #fff;
-    border: none;
-    border-radius: 4px;
-    font-size: 13px;
-    font-weight: bold;
-    line-height: 1;
-    cursor: pointer;
-    opacity: 0;
-    transition: opacity 0.2s;
-    z-index: 2;
-}
-.history-item:hover .item-save { opacity: 1; }
-.history-item .item-save:hover { background: rgba(150, 109, 9, 1); }
-.history-item .item-save.saved { background: rgba(74, 74, 74, 0.9); }
 .history-item .item-ref {
     position: absolute;
     top: 4px;
@@ -1168,6 +1145,31 @@ button:disabled {
 }
 .history-item:hover .item-ref { opacity: 1; }
 .history-item .item-ref:hover { background: rgba(18, 132, 150, 1); }
+/* Hide: the next slot leftward in the row of hover buttons. Grey rather
+   than coloured — hiding is housekeeping, and should not compete with Save
+   or Delete for attention. */
+.history-item .item-hide {
+    position: absolute;
+    top: 4px;
+    right: 30px;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    background: rgba(90, 90, 90, 0.85);
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    font-size: 13px;
+    font-weight: bold;
+    line-height: 1;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.2s;
+    z-index: 2;
+}
+.history-item:hover .item-hide { opacity: 1; }
+.history-item .item-hide:hover { background: rgba(130, 130, 130, 1); }
+
 .history-item .item-cmp {
     position: absolute;
     top: 4px;
@@ -1573,18 +1575,18 @@ button:disabled {
    untouched. */
 @media (hover: none), (pointer: coarse) {
     .history-item .item-delete,
-    .history-item .item-save,
     .history-item .item-ref,
-    .history-item .item-cmp {
+    .history-item .item-cmp,
+    .history-item .item-hide {
         opacity: 1;
         width: 32px;
         height: 32px;
         font-size: 15px;
     }
     .history-item .item-delete { right: 4px; }
-    .history-item .item-save { right: 42px; }
     .history-item .item-ref { right: 80px; }
     .history-item .item-cmp { right: 118px; }
+    .history-item .item-hide { right: 42px; }
     .history-item .overlay { opacity: 1; }
     /* :hover sticks after a tap on iOS; keep thumbnails in place. */
     .history-item:hover { transform: none; }
@@ -1672,3 +1674,4 @@ button:disabled {
     cursor: pointer;
     border: 1px solid #3d3d5c;
 }
+

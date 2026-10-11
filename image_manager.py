@@ -7,6 +7,7 @@ or
     python image_manager.py --port 2223
 """
 import argparse
+import upscaler
 import io
 import os
 import shutil
@@ -78,6 +79,10 @@ def _is_image(name):
 # different places and only one UI could see each. migrate_legacy_hide()
 # folds the old tree in at startup.
 HIDDEN_DIR = ".hidden"
+
+# The generator UI's port, for the "use as reference" handoff. Same PORT the
+# web_server reads, so one setting moves both; injected into the page below.
+GENERATOR_PORT = int(os.environ.get("PORT", 2222))
 
 # Subfolders of the hidden tree that are not a gallery: step frames are
 # preview decodes, and dot-folders are bookkeeping. Neither is mixed into the
@@ -361,6 +366,70 @@ def api_hide():
     return jsonify({"success": True, "action": action, "new_path": rel_of(dst_abs)})
 
 
+@app.route("/api/upscalers")
+def api_upscalers():
+    """What this install can upscale with. Empty list = feature off, which is
+    how the UI decides whether to show the control at all: spandrel and the
+    weights are both optional, and a checkout without them must still work."""
+    return jsonify({"models": upscaler.available(),
+                    "default": upscaler.DEFAULT_MODEL,
+                    "cuda": upscaler.cuda_available()})
+
+
+@app.route("/api/upscale", methods=["POST"])
+def api_upscale():
+    """Upscale an image 4x, writing a sibling file rather than replacing it.
+
+    Synchronous: the default model measures ~3s per megapixel on CPU, which is
+    well inside a fetch. The big model on CPU is ~60s/MP, so the UI names the
+    cost on the control rather than hiding it behind a spinner. upscaler.py
+    serialises the work itself, so several requests queue instead of fighting
+    over the same cores.
+    """
+    body = request.get_json(silent=True) or {}
+    rel = body.get("path", "")
+    name = body.get("model") or upscaler.DEFAULT_MODEL
+    device = body.get("device") or "cpu"
+    abs_path = safe_resolve(rel)
+    if not abs_path or not os.path.isfile(abs_path):
+        return jsonify({"success": False, "error": "File not found"}), 404
+    try:
+        img = Image.open(abs_path)
+        out, scale = upscaler.upscale(img, name=name, device=device)
+    except Exception as e:
+        return jsonify({"success": False, "error": f"{type(e).__name__}: {e}"}), 500
+
+    stem, _ext = os.path.splitext(abs_path)
+    dst = f"{stem}_x{scale}.png"
+    n = 2
+    while os.path.exists(dst):          # never overwrite a previous upscale
+        dst = f"{stem}_x{scale}_{n}.png"
+        n += 1
+    try:
+        out.save(dst)
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+    # Carry the sidecar across so the result keeps the prompt it came from —
+    # image_manager and the generator both read that "# Prompt:" line.
+    src_sidecar = sidecar_path(abs_path)
+    if os.path.isfile(src_sidecar):
+        try:
+            with open(src_sidecar, "r") as f:
+                text = f.read()
+            with open(sidecar_path(dst), "w") as f:
+                f.write(text)
+                if not text.endswith("\n"):
+                    f.write("\n")
+                f.write(f"# Upscaled: {scale}x {name} ({device}) from "
+                        f"{os.path.basename(abs_path)}\n")
+        except Exception:
+            pass    # the image is the deliverable; a missing sidecar is cosmetic
+
+    return jsonify({"success": True, "new_path": rel_of(dst), "scale": scale,
+                    "width": out.size[0], "height": out.size[1]})
+
+
 @app.route("/api/crop", methods=["POST"])
 def api_crop():
     """Crop a rectangle. Body: {path, left, top, right, bottom, mode: 'replace'|'new'}
@@ -416,6 +485,7 @@ HTML_PAGE = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Image Manager</title>
 <style>
   :root {
@@ -428,7 +498,13 @@ HTML_PAGE = r"""<!doctype html>
          background: var(--bg); color: var(--fg); height: 100vh; display: flex; flex-direction: column; }
   header { padding: 8px 12px; background: var(--panel); border-bottom: 1px solid var(--border);
            display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-  header h1 { font-size: 16px; margin: 0; margin-right: 6px; }
+  header h1 { font-size: 16px; margin: 0; margin-right: 6px;
+               /* The reveal gesture taps this five times: stop iOS selecting
+                  the text and stop double-tap-to-zoom eating the later taps. */
+               user-select: none; -webkit-user-select: none; touch-action: manipulation; }
+  /* The only tell that the hidden folder is showing - same idea as the
+     generator UI, where the title's colour is the whole indicator. */
+  body.reveal-hidden header h1 { color: var(--accent); }
   header select, header input, header button {
     background: var(--panel2); color: var(--fg); border: 1px solid var(--border);
     padding: 5px 8px; border-radius: 4px; font: inherit;
@@ -467,6 +543,22 @@ HTML_PAGE = r"""<!doctype html>
   header button.danger:hover { background: #ff6a6a; }
   header button:disabled { opacity: 0.5; cursor: not-allowed; }
 
+  /* A card whose image is gone (deleted, or moved to the hidden tree) keeps
+     its place in the grid as a gray square. Dropping the card instead would
+     reflow every card after it and slide the next image under the pointer
+     mid-triage, which is how you delete the wrong one next. Cleared by
+     Refresh or a folder change - both reload the listing for real. */
+  /* Dim the text, not the square: a card-wide opacity over this dark theme
+     turned the placeholder almost black, which reads as a broken thumbnail
+     rather than a deliberate gap. */
+  .card.gone .thumb { background: #4e4e4e; cursor: default; }
+  .card.gone .thumb img { display: none; }
+  .card.gone .thumb::after { content: attr(data-gone); color: #d8d8d8; font-size: 11px;
+                             letter-spacing: 0.12em; text-transform: uppercase; }
+  .card.gone .meta { opacity: 0.45; }
+  .card.gone .actions button { opacity: 0.3; pointer-events: none; }
+  .card.gone .select-cb { display: none; }
+
   #modal { position: fixed; inset: 0; background: rgba(0,0,0,0.85); display: none;
            align-items: center; justify-content: center; z-index: 10; }
   #modal.open { display: flex; }
@@ -500,6 +592,37 @@ HTML_PAGE = r"""<!doctype html>
   .modal-side .prompt { background: var(--panel2); padding: 6px 8px; border-radius: 4px;
                         font-size: 12px; white-space: pre-wrap; word-break: break-word; max-height: 120px; overflow: auto; }
   .close-btn { background: transparent; border: none; color: var(--fg); font-size: 20px; cursor: pointer; }
+
+  /* Phone layout for the open-image view. The side panel is a fixed 280px, so
+     beside it on a ~390px screen the picture gets whatever is left - about a
+     hundred pixels. Below 720px the modal becomes a full-screen sheet instead:
+     image on top, controls stacked underneath, each scrolling on its own.
+     (Only reachable since the viewport meta was added - before that a phone
+     rendered the whole page at desktop width and zoomed out.) */
+  @media (max-width: 720px) {
+    #modal { align-items: stretch; justify-content: stretch; }
+    .modal-box { max-width: none; max-height: none; width: 100vw; height: 100vh;
+                 border: none; border-radius: 0; }
+    /* dvh excludes Safari's collapsing URL bar, which vh does not: with vh the
+       bottom of the panel sits under the browser chrome until you scroll. */
+    @supports (height: 100dvh) { .modal-box { height: 100dvh; } }
+    .modal-body { flex-direction: column; }
+    /* A fixed share for the image rather than flex:1, so the controls below
+       keep a predictable amount of room whatever the aspect ratio. */
+    .modal-img-wrap { flex: 0 0 auto; height: 42vh; }
+    #modalImg { max-height: 42vh; }
+    .modal-side { width: auto; border-left: none; border-top: 1px solid var(--border);
+                  flex: 1 1 auto; min-height: 0; }
+    /* 6px of padding is a mouse-sized target; these are thumbs. */
+    .modal-side button, .modal-side select { padding: 10px 12px; min-height: 42px; }
+    .modal-side .prompt { max-height: 90px; }
+    .modal-head { padding: 10px 12px; }
+    .close-btn { font-size: 28px; padding: 0 10px; min-width: 44px; }
+    /* Two columns of thumbnails beat one: 200px leaves a single column on a
+       phone, which turns browsing into a very long scroll. */
+    #grid { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px; }
+    main { padding: 8px; }
+  }
 
   /* Pixel compare overlay (header "Compare" button, two images selected) */
   #cmpOverlay { position: fixed; inset: 0; background: rgba(0,0,0,0.92); display: none;
@@ -620,6 +743,7 @@ HTML_PAGE = r"""<!doctype html>
   <button id="showBtn" title="Full-screen slideshow of this folder at full resolution (or of the selection, if there is one)">&#9654; Slideshow</button>
   <span id="selCount" class="muted" style="display:none"></span>
   <button id="cmpBtn" style="display:none" title="Show only the pixels the two selected images share">Compare &#x29C9;</button>
+  <button id="bulkRefBtn" style="display:none" title="Open the generator with these as reference images">Use as references</button>
   <button id="bulkHideBtn" style="display:none">Hide selected</button>
   <button id="bulkDeleteBtn" class="danger" style="display:none">Delete selected</button>
   <button id="clearSelBtn" style="display:none">Clear</button>
@@ -663,6 +787,23 @@ HTML_PAGE = r"""<!doctype html>
         <h3>Slideshow</h3>
         <button id="showFromHereBtn">Start here &#9654;</button>
 
+        <h3>Generator</h3>
+        <button id="useAsRefBtn">Use as reference image</button>
+
+        <div id="upscaleBox" style="display:none">
+          <h3>Upscale</h3>
+          <div class="row">
+            <select id="upscaleModel" class="flex-grow" style="flex:1"></select>
+          </div>
+          <div class="row">
+            <label style="font-size:12px"><input type="checkbox" id="upscaleCuda"> use GPU</label>
+          </div>
+          <div class="muted" style="font-size:11px" id="upscaleNote"></div>
+          <div class="row">
+            <button id="upscaleBtn">Upscale 4&times;</button>
+          </div>
+        </div>
+
         <h3>Crop</h3>
         <div class="muted" style="font-size:12px">Drag on the image to select a region.</div>
         <div id="cropCoords" class="muted" style="font-size:11px; font-family:ui-monospace,monospace"></div>
@@ -704,6 +845,7 @@ HTML_PAGE = r"""<!doctype html>
     <table>
       <tr><td><kbd>&larr;</kbd> <kbd>&rarr;</kbd></td><td>previous / next</td></tr>
       <tr><td><kbd>Space</kbd></td><td>play / pause</td></tr>
+      <tr><td><kbd>R</kbd></td><td>use as reference</td></tr>
       <tr><td><kbd>H</kbd></td><td>hide (reversible)</td></tr>
       <tr><td><kbd>X</kbd></td><td>delete &mdash; press twice</td></tr>
       <tr><td><kbd>A</kbd></td><td>fit / actual pixels</td></tr>
@@ -728,6 +870,7 @@ HTML_PAGE = r"""<!doctype html>
       </select>
     </label>
     <span class="show-grow"></span>
+    <button id="showRefBtn" title="Use as a reference image in the generator (R)">Ref</button>
     <button id="showHideBtn" title="Move to the hidden tree (H) - reversible">Hide</button>
     <button id="showDeleteBtn" class="danger" title="Delete permanently (X, press twice)">Delete</button>
     <button id="showActual" title="Fit to screen / actual pixels (A)">Fit</button>
@@ -766,6 +909,7 @@ const state = {
   folders: [],       // flat folder list (visible subset, filtered by altHeld)
   allFolders: [],    // flat folder list, unfiltered (includes .hidden)
   altHeld: false,    // Option/Alt key currently held — reveals the .hidden folder
+  revealHidden: false, // sticky reveal, toggled by five taps on the title
   items: [],         // current folder images
   current: null,     // selected image item
   naturalSize: null, // {w,h} of current image
@@ -830,7 +974,8 @@ async function loadFolders() {
 }
 
 function visibleFolders() {
-  return state.altHeld ? state.allFolders : state.allFolders.filter(f => !f.hidden);
+  return (state.altHeld || state.revealHidden)
+    ? state.allFolders : state.allFolders.filter(f => !f.hidden);
 }
 
 function renderFolderOptions() {
@@ -870,14 +1015,48 @@ window.addEventListener('blur', () => {
 
 function releaseAltHeld() {
   state.altHeld = false;
-  const sel = $('#folderSel');
-  const wasHidden = sel.value.split('/').includes('.hidden');
   renderFolderOptions();
-  if (wasHidden) {
-    sel.value = '';
-    loadList('').catch(e => toast(e.message, true));
-  }
+  if (!state.revealHidden) leaveHiddenFolder();
 }
+
+// Drop back to the root listing if the folder on screen is inside the hidden
+// tree. Called when the reveal ends, so letting go does not leave hidden
+// images sitting on screen under a dropdown that no longer lists them.
+function leaveHiddenFolder() {
+  const sel = $('#folderSel');
+  if (!sel.value.split('/').includes('.hidden')) return;
+  sel.value = '';
+  loadList('').catch(e => toast(e.message, true));
+}
+
+// Five taps on the title inside two seconds toggles the hidden folder into
+// the dropdowns and — unlike Alt — keeps it there. Alt works only while held,
+// which is no use on a phone: there is no Alt key to hold, so before this
+// there was no way to reach the hidden tree from a touch device at all. Same
+// gesture as the generator UI's hidden mode, so one habit covers both apps,
+// and the same reasoning: no button, no label, no tooltip, so nothing on the
+// page suggests it is there and a stray double-tap cannot reach it.
+function setRevealHidden(on) {
+  state.revealHidden = !!on;
+  document.body.classList.toggle('reveal-hidden', state.revealHidden);
+  renderFolderOptions();
+  if (!state.revealHidden) leaveHiddenFolder();
+}
+
+(function () {
+  const title = document.querySelector('header h1');
+  if (!title) return;
+  const NEEDED = 5, WINDOW_MS = 2000;
+  let taps = [];
+  title.addEventListener('click', () => {
+    const now = Date.now();
+    taps = taps.filter(t => now - t < WINDOW_MS);
+    taps.push(now);
+    if (taps.length < NEEDED) return;
+    taps = [];
+    setRevealHidden(!state.revealHidden);
+  });
+})();
 
 async function loadList(folder) {
   const data = await api('/api/list?folder=' + encodeURIComponent(folder));
@@ -887,7 +1066,7 @@ async function loadList(folder) {
   for (const rel of Array.from(state.selected)) {
     if (!present.has(rel)) state.selected.delete(rel);
   }
-  $('#count').textContent = `${data.count} image${data.count === 1 ? '' : 's'}`;
+  updateCountLabel();
   renderGrid();
   updateSelectionUI();
 }
@@ -898,13 +1077,15 @@ function updateSelectionUI() {
   $('#selCount').textContent = n ? `${n} selected` : '';
   $('#bulkDeleteBtn').style.display = n ? 'inline-block' : 'none';
   $('#bulkHideBtn').style.display = n ? 'inline-block' : 'none';
+  $('#bulkRefBtn').style.display = n ? 'inline-block' : 'none';
+  $('#bulkRefBtn').textContent = n === 1 ? 'Use as reference' : `Use ${n} as references`;
   $('#bulkHideBtn').textContent =
     $('#folderSel').value.split('/').includes('.hidden') ? 'Unhide selected' : 'Hide selected';
   $('#cmpBtn').style.display = n === 2 ? 'inline-block' : 'none';
   $('#clearSelBtn').style.display = n ? 'inline-block' : 'none';
   $('#selectAllBtn').style.display = state.items.length ? 'inline-block' : 'none';
   $('#selectAllBtn').textContent =
-    (n && n === state.items.length) ? 'Deselect all' : 'Select all';
+    (n && n === liveItems().length) ? 'Deselect all' : 'Select all';
 }
 
 function toggleSelect(rel, shiftKey=false) {
@@ -916,6 +1097,7 @@ function toggleSelect(rel, shiftKey=false) {
       const [lo, hi] = a < b ? [a, b] : [b, a];
       const shouldSelect = !state.selected.has(rel);
       for (let i = lo; i <= hi; i++) {
+        if (state.items[i].gone) continue;   // a tombstone is not selectable
         if (shouldSelect) state.selected.add(rels[i]);
         else state.selected.delete(rels[i]);
       }
@@ -925,6 +1107,8 @@ function toggleSelect(rel, shiftKey=false) {
       return;
     }
   }
+  const target = state.items.find(x => x.rel === rel);
+  if (target && target.gone) return;
   if (state.selected.has(rel)) state.selected.delete(rel);
   else state.selected.add(rel);
   state.lastClickedRel = rel;
@@ -958,6 +1142,7 @@ function renderGrid() {
       <div class="actions">
         <button data-act="open">Open</button>
         <button data-act="hide">Hide</button>
+        <button data-act="ref" title="Use as a reference image in the generator">Ref</button>
         <button class="danger" data-act="delete">Delete</button>
       </div>`;
     const cb = card.querySelector('.select-cb');
@@ -967,6 +1152,7 @@ function renderGrid() {
     });
     const thumb = card.querySelector('.thumb');
     thumb.addEventListener('click', e => {
+      if (it.gone) return;
       // Shift-click on the thumb toggles selection (range with prior click).
       if (e.shiftKey) { toggleSelect(it.rel, true); return; }
       openModal(it);
@@ -974,14 +1160,111 @@ function renderGrid() {
     card.querySelectorAll('[data-act]').forEach(btn => {
       btn.addEventListener('click', e => {
         e.stopPropagation();
+        if (it.gone) return;
         const act = btn.getAttribute('data-act');
         if (act === 'open') openModal(it);
         else if (act === 'delete') quickDelete(it);
         else if (act === 'hide') quickHide(it);
+        else if (act === 'ref') sendToGenerator([it.rel]);
       });
     });
+    if (it.gone) applyGone(card, it.gone);
     grid.appendChild(card);
   }
+}
+
+// ---- Tombstones ------------------------------------------------------
+// Removing an image used to call refresh(), which rebuilt the whole grid and
+// threw away the scroll position. The item instead stays in state.items
+// carrying a `gone` label, so every later re-render (selection, drag-select)
+// keeps the same geometry.
+function applyGone(card, label) {
+  card.classList.add('gone');
+  card.classList.remove('selected');
+  const thumb = card.querySelector('.thumb');
+  if (thumb) {
+    thumb.dataset.gone = label;
+    thumb.title = label;
+    const img = thumb.querySelector('img');
+    // Drop the src so the browser stops holding a decode of a file that is
+    // no longer there; the element stays so the box does not change size.
+    if (img) img.removeAttribute('src');
+  }
+}
+
+function markGone(rel, label) {
+  const it = state.items.find(x => x.rel === rel);
+  if (it) it.gone = label;
+  state.selected.delete(rel);
+  if (state.lastClickedRel === rel) state.lastClickedRel = null;
+  const card = $('#grid').querySelector(`.card[data-rel="${CSS.escape(rel)}"]`);
+  if (card) applyGone(card, label);
+  updateCountLabel();
+  updateSelectionUI();
+}
+
+function liveItems() { return state.items.filter(it => !it.gone); }
+
+// ---- Upscale ---------------------------------------------------------
+// Optional feature: /api/upscalers returns an empty list when spandrel or the
+// weights are missing, and the whole control stays hidden rather than offering
+// something that would 500. The GPU box is off by default on purpose — this
+// process is separate from the generator precisely so upscaling costs it
+// nothing, and borrowing its card is the one way to undo that.
+let upscalers = { models: [], default: null, cuda: false };
+
+async function loadUpscalers() {
+  try { upscalers = await api('/api/upscalers'); } catch (e) { return; }
+  const box = $('#upscaleBox'), sel = $('#upscaleModel');
+  if (!upscalers.models.length) { box.style.display = 'none'; return; }
+  box.style.display = 'block';
+  sel.innerHTML = '';
+  for (const m of upscalers.models) {
+    const o = document.createElement('option');
+    o.value = m.name; o.textContent = m.label; o.dataset.note = m.note || '';
+    sel.appendChild(o);
+  }
+  sel.value = upscalers.default || upscalers.models[0].name;
+  $('#upscaleCuda').disabled = !upscalers.cuda;
+  syncUpscaleNote();
+}
+
+function syncUpscaleNote() {
+  const o = $('#upscaleModel').selectedOptions[0];
+  const gpu = $('#upscaleCuda').checked;
+  $('#upscaleNote').textContent = (o ? o.dataset.note : '')
+    + (gpu ? ' — on the GPU, which the generator is also using' : '');
+}
+
+// ---- Send to the generator as a reference image ----------------------
+// The generator holds reference images in its own page state, so there is
+// nothing to push server-side: the handoff is a link that opens it with
+// ?ref=<path>, which it imports through its existing /fetch-image-path route.
+// That route resolves a relative path against web-generated/ - the same tree
+// this gallery serves - so the identifier we already have is all it needs,
+// and no image data crosses between the two apps.
+//
+// Built from location.hostname rather than a configured address, so a phone
+// on the LAN reaches the generator at whatever host it reached this page by.
+// The named window target means repeated sends land in one generator tab
+// instead of stacking up a new one each time.
+function sendToGenerator(rels) {
+  rels = (rels || []).filter(Boolean);
+  if (!rels.length) return;
+  const qs = rels.map(r => 'ref=' + encodeURIComponent(r)).join('&');
+  const url = `${location.protocol}//${location.hostname}:__GENERATOR_PORT__/?${qs}`;
+  const w = window.open(url, 'flux-generator');
+  if (!w) { toast('Allow pop-ups for this site to send to the generator', true); return; }
+  try { w.focus(); } catch (e) {}
+  toast(rels.length === 1 ? 'Sent to the generator'
+                          : `Sent ${rels.length} to the generator`);
+}
+
+function updateCountLabel() {
+  const live = liveItems().length;
+  const gone = state.items.length - live;
+  $('#count').textContent = `${live} image${live === 1 ? '' : 's'}`
+    + (gone ? ` \u00b7 ${gone} removed` : '');
 }
 
 async function quickDelete(it) {
@@ -989,7 +1272,7 @@ async function quickDelete(it) {
   try {
     await api('/api/delete', { method: 'POST', body: { path: it.rel } });
     toast('Deleted');
-    refresh();
+    markGone(it.rel, 'deleted');
   } catch (e) { toast(e.message, true); }
 }
 
@@ -997,7 +1280,7 @@ async function quickHide(it) {
   try {
     const r = await api('/api/hide', { method: 'POST', body: { path: it.rel } });
     toast(r.action === 'hide' ? 'Hidden' : 'Unhidden');
-    refresh();
+    markGone(it.rel, r.action === 'hide' ? 'hidden' : 'unhidden');
   } catch (e) { toast(e.message, true); }
 }
 
@@ -1037,6 +1320,7 @@ async function quickHide(it) {
                                 width: (x2 - x1) + 'px', height: (y2 - y1) + 'px' });
     state.selected = new Set(baseSelected);
     for (const card of grid.children) {
+      if (card.classList.contains('gone')) continue;
       const r = card.getBoundingClientRect();
       const cx1 = r.left + scrollX, cy1 = r.top + scrollY;
       if (cx1 < x2 && cx1 + r.width > x1 && cy1 < y2 && cy1 + r.height > y1)
@@ -1206,20 +1490,22 @@ $('#moveBtn').addEventListener('click', async () => {
   if (!state.current) return;
   const dst = $('#moveSel').value;
   try {
-    await api('/api/move', { method: 'POST', body: { path: state.current.rel, folder: dst }});
+    const rel = state.current.rel;
+    await api('/api/move', { method: 'POST', body: { path: rel, folder: dst }});
     toast('Moved');
     closeModal();
-    refresh();
+    markGone(rel, 'moved');
   } catch (e) { toast(e.message, true); }
 });
 
 $('#hideBtn').addEventListener('click', async () => {
   if (!state.current) return;
   try {
-    const r = await api('/api/hide', { method: 'POST', body: { path: state.current.rel }});
+    const rel = state.current.rel;
+    const r = await api('/api/hide', { method: 'POST', body: { path: rel }});
     toast(r.action === 'hide' ? 'Hidden' : 'Unhidden');
     closeModal();
-    refresh();
+    markGone(rel, r.action === 'hide' ? 'hidden' : 'unhidden');
   } catch (e) { toast(e.message, true); }
 });
 
@@ -1227,13 +1513,43 @@ $('#deleteBtn').addEventListener('click', async () => {
   if (!state.current) return;
   if (!confirm(`Permanently delete ${state.current.name}?`)) return;
   try {
-    await api('/api/delete', { method: 'POST', body: { path: state.current.rel }});
+    const rel = state.current.rel;
+    await api('/api/delete', { method: 'POST', body: { path: rel }});
     toast('Deleted');
     closeModal();
-    refresh();
+    markGone(rel, 'deleted');
   } catch (e) { toast(e.message, true); }
 });
 
+$('#upscaleModel').addEventListener('change', syncUpscaleNote);
+$('#upscaleCuda').addEventListener('change', syncUpscaleNote);
+
+$('#upscaleBtn').addEventListener('click', async () => {
+  if (!state.current) return;
+  const btn = $('#upscaleBtn'), label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Upscaling…';
+  const t0 = Date.now();
+  const tick = setInterval(() => {
+    btn.textContent = `Upscaling… ${Math.round((Date.now() - t0) / 1000)}s`;
+  }, 1000);
+  try {
+    const r = await api('/api/upscale', { method: 'POST', body: {
+      path: state.current.rel, model: $('#upscaleModel').value,
+      device: $('#upscaleCuda').checked ? 'cuda' : 'cpu',
+    }});
+    toast(`Upscaled to ${r.width}×${r.height} in ${Math.round((Date.now() - t0) / 1000)}s`);
+    closeModal();
+    refresh();      // a new file exists, so the listing really has changed
+  } catch (e) { toast(e.message, true); }
+  clearInterval(tick);
+  btn.disabled = false;
+  btn.textContent = label;
+});
+
+$('#useAsRefBtn').addEventListener('click', () => {
+  if (state.current) sendToGenerator([state.current.rel]);
+});
 $('#closeBtn').addEventListener('click', closeModal);
 $('#modal').addEventListener('click', e => { if (e.target.id === 'modal') closeModal(); });
 document.addEventListener('keydown', e => {
@@ -1247,7 +1563,10 @@ document.addEventListener('keydown', e => {
     if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
     const idx = state.items.findIndex(it => it.rel === state.current.rel);
     if (idx === -1) return;
-    const next = idx + (e.key === 'ArrowRight' ? 1 : -1);
+    const step = e.key === 'ArrowRight' ? 1 : -1;
+    // Step over tombstones: their file is gone, so opening one shows a 404.
+    let next = idx + step;
+    while (next >= 0 && next < state.items.length && state.items[next].gone) next += step;
     if (next < 0 || next >= state.items.length) return;
     e.preventDefault();
     openModal(state.items[next]);
@@ -1262,13 +1581,18 @@ $('#folderSel').addEventListener('change', () => {
 $('#refresh').addEventListener('click', () => refresh());
 
 $('#selectAllBtn').addEventListener('click', () => {
-  if (state.selected.size === state.items.length) {
+  const live = liveItems();
+  if (state.selected.size === live.length) {
     state.selected.clear();
   } else {
-    state.selected = new Set(state.items.map(it => it.rel));
+    state.selected = new Set(live.map(it => it.rel));
   }
   renderGrid();
   updateSelectionUI();
+});
+
+$('#bulkRefBtn').addEventListener('click', () => {
+  sendToGenerator(liveItems().filter(it => state.selected.has(it.rel)).map(it => it.rel));
 });
 
 $('#clearSelBtn').addEventListener('click', () => {
@@ -1289,8 +1613,8 @@ $('#bulkHideBtn').addEventListener('click', async () => {
   for (let i = 0; i < targets.length; i++) {
     btn.textContent = `${verb} ${i + 1}/${targets.length}...`;
     try {
-      await api('/api/hide', { method: 'POST', body: { path: targets[i].rel } });
-      state.selected.delete(targets[i].rel);
+      const r = await api('/api/hide', { method: 'POST', body: { path: targets[i].rel } });
+      markGone(targets[i].rel, r.action === 'unhide' ? 'unhidden' : 'hidden');
       ok++;
     } catch (e) { failed++; lastErr = e.message; }
   }
@@ -1300,7 +1624,6 @@ $('#bulkHideBtn').addEventListener('click', async () => {
   state.selected.clear();
   const done = verb === 'Hiding' ? 'Hid' : 'Unhid';
   toast(failed ? `${done} ${ok}, ${failed} failed: ${lastErr}` : `${done} ${ok}`, failed > 0);
-  refresh();
 });
 
 $('#bulkDeleteBtn').addEventListener('click', async () => {
@@ -1315,7 +1638,7 @@ $('#bulkDeleteBtn').addEventListener('click', async () => {
     btn.textContent = `Deleting ${i + 1}/${targets.length}...`;
     try {
       await api('/api/delete', { method: 'POST', body: { path: targets[i].rel } });
-      state.selected.delete(targets[i].rel);
+      markGone(targets[i].rel, 'deleted');
       ok++;
     } catch (e) { failed++; lastErr = e.message; }
   }
@@ -1324,7 +1647,6 @@ $('#bulkDeleteBtn').addEventListener('click', async () => {
   state.lastClickedRel = null;
   state.selected.clear();
   toast(failed ? `Deleted ${ok}, ${failed} failed: ${lastErr}` : `Deleted ${ok}`, failed > 0);
-  refresh();
 });
 // ---- Pixel compare: with exactly two images selected, render only the
 // pixels they share — per-channel RGB diff within the tolerance keeps the
@@ -1465,8 +1787,9 @@ function showClose() {
   $('#showLayer1').querySelector('img').src = '';
   show.cache.clear();
   if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
-  // Deletes and hides happened server-side; the grid behind is now stale.
-  if (show.changed) refresh();
+  // No refresh(): whatever the show removed was tombstoned in the grid as it
+  // happened, so closing lands back on the same layout and scroll position
+  // rather than a rebuilt page.
 }
 
 function showImgFor(rel) {
@@ -1616,12 +1939,14 @@ function esc(t) {
 
 // Remove the current slide from the show after it has been hidden or deleted,
 // and keep the grid's own state in step so closing is not a surprise.
-function showDropCurrent() {
+function showDropCurrent(label) {
   const gone = show.list.splice(show.i, 1)[0];
   if (gone) {
     show.cache.delete(gone.rel);
-    state.items = state.items.filter(x => x.rel !== gone.rel);
-    state.selected.delete(gone.rel);
+    // Leaves a gray square in the grid behind rather than dropping the card.
+    // Harmless when the show is running over a different folder than the grid
+    // is listing: markGone simply finds nothing to mark.
+    markGone(gone.rel, label);
   }
   show.changed = true;
   if (!show.list.length) { toast('That was the last one'); showClose(); return; }
@@ -1637,7 +1962,7 @@ async function showHideCurrent() {
   try {
     const r = await api('/api/hide', { method: 'POST', body: { path: it.rel } });
     toast(r.action === 'unhide' ? 'Unhid ' + it.name : 'Hid ' + it.name);
-    showDropCurrent();
+    showDropCurrent(r.action === 'unhide' ? 'unhidden' : 'hidden');
     if (wasPlaying && show.list.length) showPlay();
   } catch (e) { toast(e.message, true); }
 }
@@ -1672,7 +1997,7 @@ async function showDeleteCurrent() {
   try {
     await api('/api/delete', { method: 'POST', body: { path: it.rel } });
     toast('Deleted ' + it.name);
-    showDropCurrent();
+    showDropCurrent('deleted');
   } catch (e) { toast(e.message, true); }
 }
 
@@ -1712,6 +2037,9 @@ $('#showFromHereBtn').addEventListener('click', () => {
   showOpen(items, idx < 0 ? 0 : idx);
 });
 $('#showClose').addEventListener('click', showClose);
+$('#showRefBtn').addEventListener('click', () => {
+  if (show.list[show.i]) sendToGenerator([show.list[show.i].rel]);
+});
 $('#showPrev').addEventListener('click', () => { showPause(); showGoto(show.i - 1); });
 $('#showNext').addEventListener('click', () => { showPause(); showGoto(show.i + 1); });
 $('#showPlay').addEventListener('click', showTogglePlay);
@@ -1749,6 +2077,7 @@ document.addEventListener('keydown', e => {
     case 'Home':      showPause(); showGoto(0); break;
     case 'End':       showPause(); showGoto(show.list.length - 1); break;
     case ' ':         showTogglePlay(); break;
+    case 'r': case 'R': if (show.list[show.i]) sendToGenerator([show.list[show.i].rel]); break;
     case 'h': case 'H': showHideCurrent(); break;
     case 'x': case 'X': case 'Delete': showDeleteCurrent(); break;
     case 'a': case 'A': showToggleActual(); break;
@@ -1762,6 +2091,7 @@ document.addEventListener('keydown', e => {
 
 async function refresh() {
   try {
+    await loadUpscalers();
     await loadFolders();
     await loadList($('#folderSel').value || '');
   } catch (e) { toast(e.message, true); }
@@ -1779,7 +2109,8 @@ refresh();
 @app.route("/")
 def index():
     from flask import Response
-    return Response(HTML_PAGE, mimetype="text/html")
+    return Response(HTML_PAGE.replace("__GENERATOR_PORT__", str(GENERATOR_PORT)),
+                    mimetype="text/html")
 
 
 if __name__ == "__main__":

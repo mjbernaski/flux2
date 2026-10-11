@@ -748,6 +748,34 @@ def _fit_label(draw, text, max_px, max_width):
     return text + '…', font
 
 
+def _grid_shape(n):
+    """(columns, rows) for an n-cell contact sheet, preferring an exact fit.
+
+    The batch sizes the UI offers are 2^a*3^b precisely so they factor into a
+    rectangle; plain ceil(sqrt(n)) columns would lay 18 out as 5x4 with two
+    holes in it, and 8 as 3x3 with one. Among the exact factorisations take the
+    one closest to square, allowing up to 3:1 so three images get a strip
+    rather than a square with a gap. A count that does not factor usefully —
+    a prime, or a batch that failed partway and left 7 images — falls back to
+    the old ceil(sqrt) behaviour.
+    """
+    best = None
+    for cols in range(1, n + 1):
+        if n % cols:
+            continue
+        rows = n // cols
+        if rows > cols:          # each pair appears twice; keep the wide one
+            continue
+        if cols > 3 * rows:      # too wide to read as a sheet
+            continue
+        if best is None or (cols - rows) < (best[0] - best[1]):
+            best = (cols, rows)
+    if best:
+        return best
+    cols = math.ceil(math.sqrt(n))
+    return cols, math.ceil(n / cols)
+
+
 def _build_composite_grid(grid_cells, cell_width, cell_height, label_height=0):
     """Paste a 2D list of (image, label)/None cells into one labeled composite.
 
@@ -887,8 +915,7 @@ def _build_expansion_composite(group):
     if len(thumbs) < 2:
         return None
 
-    n_cols = math.ceil(math.sqrt(len(thumbs)))
-    n_rows = math.ceil(len(thumbs) / n_cols)
+    n_cols, n_rows = _grid_shape(len(thumbs))
     grid_cells = [
         thumbs[r * n_cols:(r + 1) * n_cols] +
         [None] * (n_cols - len(thumbs[r * n_cols:(r + 1) * n_cols]))
@@ -1238,8 +1265,7 @@ def _run_job(job: Job):
                 batch_thumbs.append((thumb, i + 1))
 
         if batch > 1:
-            n_cols = math.ceil(math.sqrt(batch))
-            n_rows = math.ceil(batch / n_cols)
+            n_cols, n_rows = _grid_shape(batch)
             grid_cells = [
                 batch_thumbs[r * n_cols:(r + 1) * n_cols] + [None] * (n_cols - len(batch_thumbs[r * n_cols:(r + 1) * n_cols]))
                 for r in range(n_rows)
@@ -1508,8 +1534,7 @@ def _build_multi_run_composite(state):
     if len(thumbs) < 2:
         return None
 
-    n_cols = math.ceil(math.sqrt(len(thumbs)))
-    n_rows = math.ceil(len(thumbs) / n_cols)
+    n_cols, n_rows = _grid_shape(len(thumbs))
     grid_cells = [
         thumbs[r * n_cols:(r + 1) * n_cols] +
         [None] * (n_cols - len(thumbs[r * n_cols:(r + 1) * n_cols]))
@@ -3410,20 +3435,21 @@ def _boost_family(has_image=False):
 
 
 def _run_boost(cid, model, prompt, family, model_desc, level, think, variant=None,
-               negative_prompt=None):
+               negative_prompt=None, images=None):
     from edit_loop import vlm_boost
     try:
         boosted = vlm_boost(model, prompt, family=family, model_desc=model_desc,
                             level=level, think=think, variant=variant,
-                            negative_prompt=negative_prompt, ollama_url=OLLAMA_URL)
+                            negative_prompt=negative_prompt, images=images,
+                            ollama_url=OLLAMA_URL)
         if boosted:
             payload = {'success': True, 'prompt': boosted['prompt'],
                        'negative_prompt': boosted.get('negative_prompt')}
         else:
-            # Boost is a text-only call, so "vision model" misdirected: every
-            # failure here is the VLM endpoint being unreachable, speaking a
-            # dialect we got wrong, or replying without a usable prompt. The
-            # specific reason is printed by vlm_boost.
+            # Failure here is the VLM endpoint being unreachable, speaking a
+            # dialect we got wrong, or replying without a usable prompt — and,
+            # when references were attached, possibly a model that has no
+            # vision at all. The specific reason is printed by vlm_boost.
             payload = {'success': False,
                        'error': f'no rewrite from VLM at {OLLAMA_URL} '
                                 f'(model {model}) — see server.log'}
@@ -3447,7 +3473,12 @@ def boost():
     and `negative_prompt`. Optional `variant_index` + `variant_count` mark
     this as one of N independent rewrites of the same draft (the evolve
     feature): the VLM is pushed toward a direction the other rewrites are
-    unlikely to take. Returns a boost_id immediately;
+    unlikely to take. Optional `input_images` (the same base64 list /generate
+    takes) shows the references to the VLM, so the rewrite is grounded in what
+    the image model will actually condition on instead of inferred from the
+    draft alone — that makes it a vision call and needs a VLM with vision.
+    Omitting the field keeps boost text-only, which is the old behaviour.
+    Returns a boost_id immediately;
     poll GET /boost/<id> for the improved prompt (+ negative_prompt)."""
     try:
         cid = _api_start_boost(request.json or {})
@@ -3482,8 +3513,27 @@ def _api_start_boost(data):
     think = bool(data.get('think', False))
     model = data.get('model') or CRITIQUE_MODEL
     negative_prompt = (data.get('negative_prompt') or '').strip() or None
+    # Optional: the references themselves, so the rewrite can be grounded in
+    # what the image model will actually see. Separate from `has_image`, which
+    # only picks the prompting idiom and stays true whether or not the caller
+    # chose to show the pictures. Decoded here so a bad upload is a 400 rather
+    # than a job that fails later.
+    images = []
+    for i, b64 in enumerate(data.get('input_images') or []):
+        if not isinstance(b64, str):
+            raise ApiError(f'input_images[{i}] is not a base64 image', 400, 'invalid_request')
+        try:
+            payload = b64.split(',', 1)[1] if ',' in b64 else b64
+            images.append(Image.open(io.BytesIO(base64.b64decode(payload))).convert('RGB'))
+        except Exception:
+            raise ApiError(f'input_images[{i}] is not a decodable base64 image',
+                           400, 'invalid_request')
+    max_refs = getattr(flux_core, 'MAX_REFERENCE_IMAGES', 3)
+    if len(images) > max_refs:
+        raise ApiError(f'at most {max_refs} reference images', 400, 'invalid_request')
     return _vlm_job_start(_run_boost, model, prompt, _boost_family(has_image),
-                          _model_type_string(), level, think, variant, negative_prompt)
+                          _model_type_string(), level, think, variant, negative_prompt,
+                          images)
 
 
 @app.route('/boost/<cid>')
@@ -3773,6 +3823,61 @@ def _api_save_hidden(target):
     except Exception as e:
         raise ApiError(str(e), 500, 'io_error')
     return target
+
+
+def _api_hide_image(target):
+    """Move one output image (and its sidecar) into or out of `.hidden/`.
+
+    The same toggle image_manager.py's /api/hide performs, over the same
+    folder — since the two trees were merged there is one `.hidden/` and this
+    is simply the other UI's way into it. Hiding is reversible and the
+    identifier survives the move: `foo.png` becomes `.hidden/foo.png`, which
+    `_resolve_output_name` already accepts, so /images/, delete and save keep
+    working on the result without the caller learning a second scheme.
+
+    Unlike the generator's hidden *mode*, which decides where a job writes
+    before it runs, this acts on an image that already exists.
+
+    Returns {"action": "hide"|"unhide", "filename": <new identifier>}.
+    """
+    src = _resolve_output_name(target)
+    if not os.path.isfile(src):
+        raise ApiError('File not found', 404, 'not_found')
+
+    name = os.path.basename(target)
+    if target.startswith(HIDDEN_PREFIX):
+        action, dst_name = 'unhide', name
+    else:
+        action, dst_name = 'hide', HIDDEN_PREFIX + name
+    dst = _resolve_output_name(dst_name)
+    if os.path.exists(dst):
+        raise ApiError(f'{dst_name} already exists', 409, 'conflict')
+
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    try:
+        shutil.move(src, dst)
+        sidecar = name.rsplit('.', 1)[0] + '.prompt'
+        src_sidecar = os.path.join(os.path.dirname(src), sidecar)
+        if os.path.isfile(src_sidecar):
+            shutil.move(src_sidecar, os.path.join(os.path.dirname(dst), sidecar))
+    except Exception as e:
+        raise ApiError(str(e), 500, 'io_error')
+    return {'action': action, 'filename': dst_name}
+
+
+@app.route('/hide', methods=['POST'])
+def hide_image():
+    """Toggle one of this session's images into or out of `.hidden/`.
+    JSON body: {"filename": "..."} — the identifier /history returned."""
+    body = request.get_json(silent=True) or {}
+    name = (body.get('filename') or '').strip()
+    if not name:
+        return jsonify({'success': False, 'error': 'filename is required'}), 400
+    try:
+        result = _api_hide_image(name)
+    except ApiError as e:
+        return jsonify({'success': False, 'error': e.message}), e.status
+    return jsonify(dict(result, success=True))
 
 
 # Mount /api/v1 once every _api_* core function above exists. The live module

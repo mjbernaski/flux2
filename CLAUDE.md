@@ -22,6 +22,20 @@ entry points share one model core:
   the `_api_*` core functions in `web_server.py`, so behavior lives in exactly
   one place. Adding an endpoint means extracting an `_api_*` function and
   wiring both dialects to it. See REST_API.md and `examples/`.
+- **`upscaler.py`** — Real-ESRGAN 4x super-resolution for `image_manager.py`,
+  **on the CPU by default**. The point of the default is that the manager is a
+  separate process from the generator: taking VRAM on the card the generator is
+  resident on is exactly what triggers the WDDM sysmem-fallback stall below.
+  Measured on a 992px source, 12 threads: `realesr-general-x4v3` (1.2M params)
+  2.7s on CPU / 0.9s CUDA, `RealESRGAN_x4plus` (16.7M) 60.8s / 2.3s — so the
+  compact model is the default, and `device="cuda"` is opt-in per request.
+  Weights are plain `.pth` under `models/upscale/` (gitignored), loaded through
+  **spandrel**, not the `realesrgan` package — that one needs `basicsr`, which
+  is unmaintained and fails to import against current torchvision. Tiled at 192px
+  with 16px of context cropped back off, so peak memory is flat whatever the
+  source size (a 4x pass on 1MP produces 16MP). Everything imports lazily and
+  `available()` returns `[]` when spandrel or the weights are missing, which is
+  how the UI decides whether to show the control at all.
 - **`image_manager.py`** — separate Flask gallery/crop tool on port 2223 over
   the same `web-generated/` tree. Hide moves an image into `.hidden/` —
   the *same* folder the generator's hidden mode writes to, keeping its
@@ -29,7 +43,26 @@ entry points share one model core:
   This gallery used to keep a second tree at `.hide/`, which meant an image
   could be hidden in two places and each UI saw only one;
   `migrate_legacy_hide()` folds any leftover `.hide/` in at startup and
-  `api_hide` still accepts the old paths for unhide. Its slideshow (`#show`)
+  `api_hide` still accepts the old paths for unhide. Removing an image
+  (delete, hide, move — from a card, the modal, a bulk action or the
+  slideshow) leaves its card in place as a gray square via `markGone` instead
+  of calling `refresh()`: rebuilding the grid reflowed every later card and
+  slid the next image under the pointer mid-triage, which is how you delete
+  the wrong one next. The item stays in `state.items` carrying a `gone` label
+  so later re-renders keep the geometry; Refresh and folder changes clear the
+  tombstones by reloading for real. **Use as reference** (card button, modal,
+  bulk, or `R` in the slideshow) hands an image to the generator by opening it
+  at `?ref=<path>` — repeatable, into a named tab so repeats reuse one.
+  Nothing is pushed server-side and no image data crosses between the two
+  apps: references live in the generator page's own state, and `?ref=` is
+  imported through its existing `/fetch-image-path`, which resolves the
+  relative path against the same `web-generated/` tree this gallery serves.
+  The URL is built from `location.hostname` so it works from a phone on the
+  LAN, and `GENERATOR_PORT` comes from the same `PORT` env `web_server` reads.
+  `importRefsFromUrl` (app.js) runs after `/model-info` resolves, so a backend
+  taking ten references is not capped at the default three; it imports
+  sequentially (the limit check would otherwise race) and strips the params so
+  a reload does not re-add them. Its slideshow (`#show`)
   is the folder-review path: full-bleed, sourced from `/api/image` rather than the 512px JPEG
   `/api/thumb`, with `H` to hide and a two-press `X` to delete as you watch.
   It waits on each image's `load` event, **not** `img.decode()` — the better
@@ -137,6 +170,16 @@ retired for the first release that carries the pipeline.
   step restores from the source, so it can never bleed into the result) and the
   unpainted region is composited back. Needs diffusers with
   `QwenImage21Pipeline` — merged upstream 2026-09-18, i.e. newer than 0.40.0.
+- **Boost with or without the references**: `/boost` takes an optional
+  `input_images` (the same base64 list `/generate` uses). Present, the
+  references go to the VLM and the rewrite is grounded in what the image model
+  will actually condition on; absent, boost stays the text-only call it always
+  was. The UI exposes this as a "show refs" checkbox that only appears once
+  references are attached, because it is a genuine trade worth A/B-ing —
+  seeing the reference stops the VLM inventing detail that contradicts it, but
+  tempts it into captioning what is already visible, and it costs a vision
+  pass (so it needs a VLM that has vision). Distinct from `has_image`, which
+  only picks the prompting idiom and stays true either way.
 - **VLM endpoint**: critique/describe/boost talk to the vision model through
   `edit_loop.py`, which speaks two dialects. `OLLAMA_URL` (the endpoint, name
   kept for compatibility) may point at a local ollama daemon — `/api/chat`,
@@ -247,6 +290,15 @@ retired for the first release that carries the pipeline.
 - **Web queue**: one worker thread, `QUEUE_MAX_SIZE=500`, jobs carry progress
   state polled by the UI via `/status`. `/generate` validates all params at the
   API boundary and returns 400s.
+- **Contact sheets**: batch, expansion and multi-run results are tiled by
+  `_grid_shape`, which takes the exact factor pair closest to square (allowing
+  up to 3:1, so three images get a strip rather than a square with a gap) and
+  only falls back to `ceil(sqrt(n))` columns when the count does not factor —
+  a prime, or a batch that failed partway. The batch sizes the UI offers are
+  the 3-smooth numbers (2^a·3^b: 1, 2, 3, 4, 6, 8, 9, 12, 16, 18, 24, 27, …,
+  128) precisely so every one of them tiles with no empty cells, and each
+  option names the sheet it produces. The server clamp is unchanged and still
+  accepts any batch 1-128, so the API is not restricted to the menu.
 - **Prompt expansion**: `{a|b}` in a prompt queues one job per alternative,
   cartesian across groups (`expand_prompt` in `web_server.py`, applied inside
   `_api_enqueue_generation` so both API dialects and every client get it).
@@ -297,6 +349,17 @@ retired for the first release that carries the pipeline.
   `_api_queue_snapshot`, `_api_queue_view` and `_recent_images_locked` unless
   the caller asks for them, so a second tab or the shared `/api/v1/queue.html`
   never shows them (queue *counts* stay honest — `accepting` must not lie).
+  Hiding an image that *already exists* is a separate thing from the mode:
+  `_api_hide_image` (`POST /hide`, REST `POST /api/v1/images/<name>/hide`)
+  moves one output and its sidecar into or out of `.hidden/` — the same folder
+  and the same toggle as `image_manager.py`'s Hide, since the two trees were
+  merged. The identifier survives the move (`foo.png` ⇄ `.hidden/foo.png`,
+  both of which `_resolve_output_name` accepts), so `/images/`, delete and
+  save keep working on the result. The UI puts it on result cards and history
+  thumbnails, and in hidden mode the same button is the way back out. It took
+  the ★ save button's slot: `.saved/` survives housekeeping, which is a rarer
+  need than hiding, and five hover buttons on a ~158px thumbnail was one too
+  many. `_api_save_hidden` and both its routes remain — only the UI went.
   Callers opt in per request (`hidden` field, or `?hidden=1` on `/history`,
   `/status`, `/archive`, `/delete`) or per session via the `X-Flux-Hidden`
   header, which `_hidden_requested` reads; the web UI sends that header from
