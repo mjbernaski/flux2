@@ -329,12 +329,44 @@ def describe_metrics(m):
            f"{m['anchoring']} (1.0 = identical layout). " + "; ".join(notes)
 
 
-def img_b64(image, max_side=896):
+def img_b64(image, max_side=896, quality=90):
+    """Encode a PIL image for a VLM call: downscaled to `max_side`, then JPEG.
+
+    JPEG rather than PNG because the only consumer is a vision encoder that
+    resamples to its own patch grid anyway, and the lossless version costs ~6x
+    the bytes for no difference the model can see — a 896px photo is ~1.8MB of
+    base64 as PNG against ~300KB as JPEG. That mattered once boost grew an
+    optional reference list: a 10-reference Qwen boost shipped ~18MB to the VLM
+    host on every call, and Boost xN / Evolve make one call per rewrite. Alpha
+    is flattened onto white instead of preserved; the model is shown a rendered
+    image either way, and JPEG carries no alpha channel.
+    """
     im = image.copy()
     im.thumbnail((max_side, max_side))
+    if im.mode in ("RGBA", "LA", "PA") or (im.mode == "P" and "transparency" in im.info):
+        im = im.convert("RGBA")
+        flat = Image.new("RGB", im.size, (255, 255, 255))
+        flat.paste(im, mask=im.getchannel("A"))
+        im = flat
+    elif im.mode != "RGB":
+        im = im.convert("RGB")
     buf = io.BytesIO()
-    im.save(buf, format="PNG")
+    im.save(buf, format="JPEG", quality=quality)
     return base64.b64encode(buf.getvalue()).decode()
+
+
+# Base64 signatures of the encodings img_b64 can emit, for the OpenAI dialect's
+# data URLs — declaring image/png for JPEG bytes works on servers that sniff
+# and fails on the ones that don't, and the encoder is free to change.
+_B64_MIME = (("/9j/", "image/jpeg"), ("iVBOR", "image/png"),
+             ("R0lGOD", "image/gif"), ("UklGR", "image/webp"))
+
+
+def _b64_mime(b):
+    for sig, mime in _B64_MIME:
+        if b.startswith(sig):
+            return mime
+    return "image/png"
 
 
 # Structured-output schema for the critique: ollama constrains generation to
@@ -382,7 +414,7 @@ def _openai_body(payload):
         if images:
             content = [{"type": "text", "text": content}] + [
                 {"type": "image_url",
-                 "image_url": {"url": "data:image/png;base64," + b}}
+                 "image_url": {"url": f"data:{_b64_mime(b)};base64,{b}"}}
                 for b in images
             ]
         messages.append({"role": m.get("role", "user"), "content": content})

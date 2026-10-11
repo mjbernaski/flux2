@@ -172,37 +172,53 @@ retired for the first release that carries the pipeline.
   `QwenImage21Pipeline` — merged upstream 2026-09-18, i.e. newer than 0.40.0.
 - **Boost with or without the references**: `/boost` takes an optional
   `input_images` (the same base64 list `/generate` uses). Present, the
-  references go to the VLM and the rewrite is grounded in what the image model
-  will actually condition on; absent, boost stays the text-only call it always
-  was. The UI exposes this as a "show refs" checkbox that only appears once
-  references are attached, because it is a genuine trade worth A/B-ing —
-  seeing the reference stops the VLM inventing detail that contradicts it, but
-  tempts it into captioning what is already visible, and it costs a vision
-  pass (so it needs a VLM that has vision). Distinct from `has_image`, which
-  only picks the prompting idiom and stays true either way.
+  references go to the VLM and the rewrite is grounded in what the image
+  model will actually condition on; absent, boost stays the text-only call
+  it always was. The UI exposes this as a "show refs" checkbox that only
+  appears once references are attached, because it is a genuine trade worth
+  A/B-ing — seeing the reference stops the VLM inventing detail that
+  contradicts it, but tempts it into captioning what is already visible, and
+  it costs a vision pass (so it needs a VLM that has vision). Distinct from
+  `has_image`, which only picks the prompting idiom and stays true either
+  way. The checkbox lives in the Boost row but governs **all three** boost
+  buttons — Boost, Boost xN and Evolve each post `boostRefImages()` — so its
+  on-state is styled as a chip naming the reference count rather than a bare
+  tick two rows up; the default stays off because a vision pass costs real
+  time (~15s against ~10s here). The posted copies are shrunk to
+  `BOOST_REF_EDGE` (1024px) and cached per reference list: the VLM only ever
+  sees them at 896px, and Boost xN / Evolve make one call per rewrite, so
+  the generation-sized originals would be re-uploaded N times for pixels
+  nothing reads.
 - **VLM endpoint**: critique/describe/boost talk to the vision model through
-  `edit_loop.py`, which speaks two dialects. `OLLAMA_URL` (the endpoint, name
-  kept for compatibility) may point at a local ollama daemon — `/api/chat`,
-  base64 `images`, `format` schema — or at an OpenAI-compatible server such as
-  vLLM — `/v1/chat/completions`, `image_url` data-URL parts, `response_format`
-  guided decoding. `vlm_dialect()` probes `/api/version` once per URL and
-  caches the answer (`VLM_API=ollama|openai` forces it); `_openai_body()` does
-  the translation, and the reply is reshaped back into ollama's envelope so
-  every caller stays dialect-agnostic. `CRITIQUE_MODEL`/`DESCRIBE_MODEL` name
-  the model, and default to `auto` — `resolve_vlm_model()` asks the endpoint
-  what it serves (`/v1/models`, or ollama's `/api/ps` then `/api/tags`) and
-  takes the first, preferring a resident one, so restarting the serving host
-  on a different checkpoint doesn't need a config edit. The answer is cached
-  per URL, refreshed by the `/status` probe (so a swap is noticed within one
-  poll and the UI badge names the real model), and dropped by
-  `forget_vlm_model()` on any HTTP error, which makes `_chat_text`'s existing
-  retry re-discover in place. An explicit name still pins — do that when the
-  endpoint serves several models and only one has vision. Serving the VLM
-  off-box is the point of this: it takes the vision model's VRAM off the
-  generating card entirely, which makes the note below moot for that setup
-  (the status badge reads
-  `/v1/models` instead of `/api/ps`, and startup warm-up is skipped — a remote
-  server owns its own residency).
+  `edit_loop.py`, which speaks two dialects. `OLLAMA_URL` (the endpoint,
+  name kept for compatibility) may point at a local ollama daemon —
+  `/api/chat`, base64 `images`, `format` schema — or at an OpenAI-compatible
+  server such as vLLM — `/v1/chat/completions`, `image_url` data-URL parts,
+  `response_format` guided decoding. Images go out through `img_b64` —
+  896px, **JPEG**, alpha flattened onto white — because the far end is a
+  vision encoder that resamples to its own patch grid: lossless PNG cost 6x
+  the bytes and 6x the encode time for nothing the model can see (1848KB vs
+  302KB of base64 for one 896px photo, which is 18MB a call once a
+  10-reference Qwen boost shows its refs). `_b64_mime` sniffs the base64
+  signature so the data URL's declared type follows the encoder instead of
+  being hardcoded. `vlm_dialect()` probes `/api/version` once per URL and
+  caches the answer (`VLM_API=ollama|openai` forces it); `_openai_body()`
+  does the translation, and the reply is reshaped back into ollama's
+  envelope so every caller stays dialect-agnostic.
+  `CRITIQUE_MODEL`/`DESCRIBE_MODEL` name the model, and default to `auto` —
+  `resolve_vlm_model()` asks the endpoint what it serves (`/v1/models`, or
+  ollama's `/api/ps` then `/api/tags`) and takes the first, preferring a
+  resident one, so restarting the serving host on a different checkpoint
+  doesn't need a config edit. The answer is cached per URL, refreshed by the
+  `/status` probe (so a swap is noticed within one poll and the UI badge
+  names the real model), and dropped by `forget_vlm_model()` on any HTTP
+  error, which makes `_chat_text`'s existing retry re-discover in place. An
+  explicit name still pins — do that when the endpoint serves several models
+  and only one has vision. Serving the VLM off-box is the point of this: it
+  takes the vision model's VRAM off the generating card entirely, which
+  makes the note below moot for that setup (the status badge reads
+  `/v1/models` instead of `/api/ps`, and startup warm-up is skipped — a
+  remote server owns its own residency).
 - **VLM VRAM**: a *local* ollama vision model (critique/describe/boost) competes
   with the diffusion pipeline for the same card — a resident qwen3.6 is ~5GB.
   `edit_loop.KEEP_ALIVE` (env `VLM_KEEP_ALIVE`, default `"0"`) is sent as

@@ -1675,3 +1675,18 @@ button:disabled {
     border: 1px solid #3d3d5c;
 }
 
+/* "show refs" governs Boost, Boost xN and Evolve but sits only in the first
+   one's row, so the on-state has to be visible from the others: an accent and
+   the reference count, rather than a checkbox two rows up that is easy to
+   leave set from a previous prompt. The padding and the transparent border
+   live on the base so switching the toggle recolors the chip rather than
+   reflowing the row. */
+#boostRefsLabel {
+    padding: 2px 7px; border: 1px solid transparent; border-radius: 10px;
+}
+#boostRefsLabel.boost-refs-on {
+    background: rgba(118, 75, 162, 0.25);
+    border-color: #764ba2;
+    color: #e3d6ff;
+    font-weight: 600;
+}

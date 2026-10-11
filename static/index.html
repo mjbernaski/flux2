@@ -6,7 +6,7 @@
     <meta name="theme-color" content="#1a1a2e">
     <title>flux</title>
     <script>document.title = window.location.hostname + ' flux';</script>
-    <link rel="stylesheet" href="/static/app.css?v=19">
+    <link rel="stylesheet" href="/static/app.css?v=20">
 </head>
 <body>
     <div class="loading-overlay" id="loadingOverlay">
@@ -90,8 +90,8 @@
                     <input type="checkbox" id="boostThink"> think
                 </label>
                 <label class="boost-think" id="boostRefsLabel" for="boostUseRefs" style="display:none"
-                       title="On: the reference images are sent to the VLM, so it rewrites from what it can actually see. Off: text-only, the VLM only knows that references exist.">
-                    <input type="checkbox" id="boostUseRefs"> show refs
+                       title="Applies to all three boost buttons. On: the reference images are sent to the VLM, so it rewrites from what it can actually see &mdash; better grounded, but it costs a vision pass and takes noticeably longer. Off: text-only, the VLM only knows that references exist.">
+                    <input type="checkbox" id="boostUseRefs"> <span id="boostRefsText">show refs</span>
                 </label>
             </div>
             <div class="boost-control boost-variants-control">
@@ -564,6 +564,6 @@
         </details>
     </div>
 
-    <script src="/static/app.js?v=22"></script>
+    <script src="/static/app.js?v=23"></script>
 </body>
 </html>

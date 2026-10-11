@@ -689,11 +689,58 @@ async function hideImage(filename) {
 // text-only call it has always been. Opt-in per the "show refs" toggle: a
 // grounded rewrite is usually better, but the VLM then tends to caption what
 // it can already see, and it costs a vision pass — worth being able to A/B.
-function boostRefImages() {
+function boostRefsEnabled() {
     const el = document.getElementById('boostUseRefs');
-    if (!el || !el.checked) return [];
-    return currentInputImages.slice(0, MAX_REFERENCE_IMAGES);
+    return !!(el && el.checked && currentInputImages.length);
 }
+
+// References are kept at generation resolution (MAX_UPLOAD_EDGE, 2048px), but
+// the VLM is only ever shown them downscaled to 896px server-side, so posting
+// the full-size copies to /boost is upload spent on pixels nothing reads.
+// Shrink to BOOST_REF_EDGE instead, and cache the result: Boost xN and Evolve
+// make one call per rewrite, so a 6-rewrite run would otherwise re-upload the
+// same photos six times — minutes, not seconds, from a phone on the LAN.
+var BOOST_REF_EDGE = 1024;
+var boostRefCache = { key: null, images: null };
+
+// Cheap identity for a list of data URLs: lengths plus tails. Two distinct
+// references colliding would need the same byte count and the same trailing
+// base64, i.e. they are the same picture.
+function boostRefCacheKey(refs) {
+    return refs.map(function(u) { return u.length + ':' + u.slice(-24); }).join('|');
+}
+
+async function boostRefImages() {
+    if (!boostRefsEnabled()) return [];
+    const refs = currentInputImages.slice(0, MAX_REFERENCE_IMAGES);
+    const key = boostRefCacheKey(refs);
+    if (boostRefCache.key === key) return boostRefCache.images;
+    const small = await Promise.all(refs.map(function(dataUrl) {
+        return new Promise(function(resolve) {
+            shrinkImageDataUrl(dataUrl, resolve, BOOST_REF_EDGE);
+        });
+    }));
+    boostRefCache = { key: key, images: small };
+    return small;
+}
+
+// The toggle governs all three boost buttons (Boost, Boost xN, Evolve), but it
+// only lives in the first one's row, so an unnoticed setting silently changes
+// what the other two do. Make the on-state read at a glance — the count of
+// references that will be shown, and an accent on the control itself — rather
+// than relying on a checkbox two rows up.
+function syncBoostRefsLabel() {
+    const label = document.getElementById('boostRefsLabel');
+    const text = document.getElementById('boostRefsText');
+    if (!label) return;
+    const on = boostRefsEnabled();
+    const n = Math.min(currentInputImages.length, MAX_REFERENCE_IMAGES);
+    label.classList.toggle('boost-refs-on', on);
+    if (text) text.textContent = on ? `showing ${n} ref${n > 1 ? 's' : ''}` : 'show refs';
+}
+
+const boostUseRefsEl = document.getElementById('boostUseRefs');
+if (boostUseRefsEl) boostUseRefsEl.addEventListener('change', syncBoostRefsLabel);
 
 // Re-render the reference thumbnails and every control whose visibility
 // depends on how many references are loaded.
@@ -744,7 +791,10 @@ function syncRefUI() {
     // "show refs" is meaningless with nothing attached; hide it rather than
     // offer a toggle that cannot change the outcome.
     const boostRefsLabel = document.getElementById('boostRefsLabel');
-    if (boostRefsLabel) boostRefsLabel.style.display = n > 0 ? 'inline-flex' : 'none';
+    if (boostRefsLabel) {
+        boostRefsLabel.style.display = n > 0 ? 'inline-flex' : 'none';
+        syncBoostRefsLabel();
+    }
     if (aspectModeControl) aspectModeControl.style.display = n > 0 ? 'block' : 'none';
     if (multiRefHint) multiRefHint.style.display = n > 1 ? 'block' : 'none';
     if (inputImage) inputImage.value = '';
@@ -756,11 +806,12 @@ function syncRefUI() {
 var MAX_UPLOAD_EDGE = 2048;
 var UPLOAD_JPEG_QUALITY = 0.92;
 
-function shrinkImageDataUrl(dataUrl, cb) {
+function shrinkImageDataUrl(dataUrl, cb, maxEdge) {
+    var edge = maxEdge || MAX_UPLOAD_EDGE;
     var img = new Image();
     img.onload = function() {
         var w = img.naturalWidth, h = img.naturalHeight;
-        var scale = Math.min(1, MAX_UPLOAD_EDGE / Math.max(w, h));
+        var scale = Math.min(1, edge / Math.max(w, h));
         if (scale === 1 && dataUrl.length < 4 * 1024 * 1024) { cb(dataUrl); return; }
         var canvas = document.createElement('canvas');
         canvas.width = Math.max(1, Math.round(w * scale));
@@ -1268,7 +1319,10 @@ async function runBoost() {
     btn.disabled = true;
     const level = levelEl ? parseInt(levelEl.value, 10) : 3;
     const negativeEl = document.getElementById('negativePrompt');
-    const prog = vlmStatusStart(btn, 'Boosting prompt (level ' + level + ')');
+    const refs = await boostRefImages();
+    const prog = vlmStatusStart(btn, 'Boosting prompt (level ' + level
+        + (refs.length ? `, showing ${refs.length} ref${refs.length > 1 ? 's' : ''}`
+                       : (currentInputImages.length ? ', text only' : '')) + ')');
     try {
         const res = await fetch('/boost', {
             method: 'POST',
@@ -1278,7 +1332,7 @@ async function runBoost() {
                 level: level,
                 think: thinkEl ? thinkEl.checked : false,
                 has_image: currentInputImages.length > 0,
-                input_images: boostRefImages(),
+                input_images: refs,
                 negative_prompt: negativeEl && negativeEl.value.trim() ? negativeEl.value.trim() : null
             })
         });
@@ -1431,15 +1485,19 @@ async function runBoostVariants() {
 
     const oldLabel = btn.textContent;
     btn.disabled = true;
+    // Resolved once up front, not per rewrite: every call posts the same
+    // pictures, and the shrink is work the browser need only do once.
+    const refs = await boostRefImages();
+    const refNote = refs.length ? ` showing ${refs.length} ref${refs.length > 1 ? 's' : ''}` : '';
     let done = 0, queued = 0, failed = 0;
-    const prog = vlmStatusStart(btn, `Boosting ${n} rewrites`);
+    const prog = vlmStatusStart(btn, `Boosting ${n} rewrites${refNote}`);
     const tick = function() {
         const btnText = `Boosting ${done}/${n}… ${prog.elapsed()}`;
         // Once a generation is running, its step-by-step progress owns the
         // status bar; keep the tally on the button only.
         if (runningJobId) { btn.textContent = btnText; return; }
-        prog.tick(`Boosting ${n} rewrites — ${done} boosted, ${queued} queued`
-                  + (failed ? `, ${failed} failed` : ''), btnText);
+        prog.tick(`Boosting ${n} rewrites${refNote} — ${done} boosted, `
+                  + `${queued} queued` + (failed ? `, ${failed} failed` : ''), btnText);
     };
     tick();
 
@@ -1482,7 +1540,7 @@ async function runBoostVariants() {
                         level: levelEl ? parseInt(levelEl.value, 10) : 3,
                         think: thinkEl ? thinkEl.checked : false,
                         has_image: currentInputImages.length > 0,
-                        input_images: boostRefImages(),
+                        input_images: refs,
                         negative_prompt: draftNegative,
                         variant_index: i + 1,
                         variant_count: n
@@ -1570,8 +1628,12 @@ async function runEvolveGenerate() {
     // Same fresh start as the Generate button: the results section shows this
     // run's variations, not the previous run's alongside them.
     await clearRecentResults();
+    // Same as Boost xN: the toggle covers this button too, and every one of
+    // the n rewrites posts the same references, so shrink them once.
+    const refs = await boostRefImages();
+    const refNote = refs.length ? ` showing ${refs.length} ref${refs.length > 1 ? 's' : ''}` : '';
     let evolved = 0, queued = 0, failed = 0;
-    const prog = vlmStatusStart(btn, `Evolving ${n} prompt variations`);
+    const prog = vlmStatusStart(btn, `Evolving ${n} prompt variations${refNote}`);
     const tick = function() {
         const btnText = `Evolving ${evolved}/${n}… ${prog.elapsed()}`;
         // Once a generation is running, its step-by-step progress owns the
@@ -1580,7 +1642,7 @@ async function runEvolveGenerate() {
             btn.textContent = btnText;
             return;
         }
-        prog.tick(`Evolving ${n} prompt variations — ${evolved} evolved, `
+        prog.tick(`Evolving ${n} prompt variations${refNote} — ${evolved} evolved, `
                   + `${queued} queued` + (failed ? `, ${failed} failed` : ''),
                   btnText);
     };
@@ -1596,6 +1658,7 @@ async function runEvolveGenerate() {
                         level: levelEl ? parseInt(levelEl.value, 10) : 3,
                         think: thinkEl ? thinkEl.checked : false,
                         has_image: currentInputImages.length > 0,
+                        input_images: refs,
                         negative_prompt: negativeEl && negativeEl.value.trim() ? negativeEl.value.trim() : null,
                         variant_index: i + 1,
                         variant_count: n
