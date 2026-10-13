@@ -510,7 +510,8 @@ def create_vlm_job():
       boost     prompt, level 1-5, think, has_image, negative_prompt,
                 variant_index, variant_count, model, input_images[]
                 (optional: shows the references to the VLM, so the rewrite is
-                grounded in them rather than inferred from the draft)
+                grounded in them rather than inferred from the draft),
+                steer (optional: how to rewrite, which overrides the draft)
                                           -> result.prompt, result.negative_prompt
       critique  direction, prompt, ref_image, output_filename, history, model
                                           -> result.critique, result.revised_prompt,
@@ -915,6 +916,9 @@ def _openapi_document():
                           'input_images': {'type': 'array', 'items': {'type': 'string'},
                                            'description': 'boost: base64 references to show the '
                                                           'VLM. Omit to keep boost text-only.'},
+                          'steer': {'type': 'string',
+                                    'description': 'boost: how to rewrite (overrides the '
+                                                   'draft, the level and the family guidance).'},
                           'negative_prompt': {'type': 'string'},
                           'variant_index': {'type': 'integer'},
                           'variant_count': {'type': 'integer'},

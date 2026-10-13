@@ -189,6 +189,18 @@ retired for the first release that carries the pipeline.
   sees them at 896px, and Boost xN / Evolve make one call per rewrite, so
   the generation-sized originals would be re-uploaded N times for pixels
   nothing reads.
+- **Steering a boost**: `/boost` also takes `steer`, a second instruction
+  that says *how* to rewrite ("set it at night", "keep it under 20 words")
+  as against the prompt, which says what to depict. It is its own field, not
+  text appended to the draft, because the VLM is told it **outranks** the
+  draft, the level and the family guidance: steering text pasted into the
+  prompt box would instead be rewritten as subject matter, which is the
+  opposite of what it is for. Capped at `BOOST_STEER_MAX` (2000) — longer
+  than that is a draft prompt in the wrong field. The UI puts it behind a
+  "steer" chip in the Boost row, collapsed until asked for and governing all
+  three buttons like "show refs"; closing the row clears the text rather than
+  hiding a setting that keeps applying, and a steer that survives a model
+  switch reopens the row for the same reason.
 - **VLM endpoint**: critique/describe/boost talk to the vision model through
   `edit_loop.py`, which speaks two dialects. `OLLAMA_URL` (the endpoint,
   name kept for compatibility) may point at a local ollama daemon —

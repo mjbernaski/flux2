@@ -93,6 +93,18 @@
                        title="Applies to all three boost buttons. On: the reference images are sent to the VLM, so it rewrites from what it can actually see &mdash; better grounded, but it costs a vision pass and takes noticeably longer. Off: text-only, the VLM only knows that references exist.">
                     <input type="checkbox" id="boostUseRefs"> <span id="boostRefsText">show refs</span>
                 </label>
+                <button type="button" id="boostSteerBtn" class="boost-steer-btn"
+                        title="Steer the rewrite: a separate instruction for the vision model about how to rewrite, applied by all three boost buttons">&#9998; <span id="boostSteerBtnText">steer</span></button>
+            </div>
+            <!-- Steering: how to rewrite, as against the prompt, which is what
+                 to depict. Collapsed until asked for, but kept open whenever it
+                 holds text, since a steer hidden in a closed row would silently
+                 reshape every later boost. -->
+            <div class="boost-control boost-steer-row" id="boostSteerRow" style="display:none">
+                <input type="text" id="boostSteer" maxlength="2000"
+                       placeholder="How to rewrite it — e.g. set it at night, keep it under 20 words, no camera jargon"
+                       title="Sent with the draft to the vision model and allowed to override it: where this contradicts the prompt, this wins. Applies to Boost, Boost &times;N and Evolve.">
+                <button type="button" id="boostSteerClear" title="Clear the steering instruction">Clear</button>
             </div>
             <div class="boost-control boost-variants-control">
                 <button type="button" id="boostVariantsBtn" class="describe-btn boost-btn"

@@ -3417,6 +3417,11 @@ def browse_thumb():
     return Response(data, mimetype='image/jpeg')
 
 
+# Longest accepted boost steer. Generous for an instruction, short enough
+# that it cannot crowd out the draft in the VLM's context.
+BOOST_STEER_MAX = 2000
+
+
 def _boost_family(has_image=False):
     """Prompting idiom of the loaded backend, keying edit_loop.BOOST_GUIDANCE.
     With reference image(s) attached the idiom shifts: FLUX.2 and Kontext
@@ -3435,13 +3440,13 @@ def _boost_family(has_image=False):
 
 
 def _run_boost(cid, model, prompt, family, model_desc, level, think, variant=None,
-               negative_prompt=None, images=None):
+               negative_prompt=None, images=None, steer=None):
     from edit_loop import vlm_boost
     try:
         boosted = vlm_boost(model, prompt, family=family, model_desc=model_desc,
                             level=level, think=think, variant=variant,
                             negative_prompt=negative_prompt, images=images,
-                            ollama_url=OLLAMA_URL)
+                            steer=steer, ollama_url=OLLAMA_URL)
         if boosted:
             payload = {'success': True, 'prompt': boosted['prompt'],
                        'negative_prompt': boosted.get('negative_prompt')}
@@ -3478,6 +3483,11 @@ def boost():
     the image model will actually condition on instead of inferred from the
     draft alone — that makes it a vision call and needs a VLM with vision.
     Omitting the field keeps boost text-only, which is the old behaviour.
+    Optional `steer` is a free-text instruction about the rewrite itself
+    ("set it at night", "keep it under twenty words") which outranks the
+    draft, the level and the model-family guidance — it is the user steering
+    this rewrite rather than describing the subject, so it must not be folded
+    into `prompt`, where it would be rewritten as if it were.
     Returns a boost_id immediately;
     poll GET /boost/<id> for the improved prompt (+ negative_prompt)."""
     try:
@@ -3513,6 +3523,13 @@ def _api_start_boost(data):
     think = bool(data.get('think', False))
     model = data.get('model') or CRITIQUE_MODEL
     negative_prompt = (data.get('negative_prompt') or '').strip() or None
+    # How to steer this rewrite, as opposed to what to depict. Capped because
+    # it is prepended to a prompt with a fixed context window, and a steer
+    # longer than this is a draft prompt in the wrong field.
+    steer = (data.get('steer') or '').strip() or None
+    if steer and len(steer) > BOOST_STEER_MAX:
+        raise ApiError(f'steer must be at most {BOOST_STEER_MAX} characters',
+                       400, 'invalid_request')
     # Optional: the references themselves, so the rewrite can be grounded in
     # what the image model will actually see. Separate from `has_image`, which
     # only picks the prompting idiom and stays true whether or not the caller
@@ -3533,7 +3550,7 @@ def _api_start_boost(data):
         raise ApiError(f'at most {max_refs} reference images', 400, 'invalid_request')
     return _vlm_job_start(_run_boost, model, prompt, _boost_family(has_image),
                           _model_type_string(), level, think, variant, negative_prompt,
-                          images)
+                          images, steer)
 
 
 @app.route('/boost/<cid>')

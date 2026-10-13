@@ -795,6 +795,12 @@ def main():
     check('an out-of-range boost level is 400', r.status_code == 400)
 
     r = client.post(f'{PREFIX}/vlm/jobs', headers=AUTH,
+                    json={'task': 'boost', 'prompt': 'x',
+                          'steer': 'y' * (ws.BOOST_STEER_MAX + 1)})
+    check('an over-long boost steer is 400',
+          r.status_code == 400 and err_code(r) == 'invalid_request')
+
+    r = client.post(f'{PREFIX}/vlm/jobs', headers=AUTH,
                     json={'task': 'critique', 'direction': 'brighter'})
     check('critique without a reference is 400', r.status_code == 400)
 

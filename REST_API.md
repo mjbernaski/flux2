@@ -354,9 +354,13 @@ exposes these as three endpoints with three different id fields.
 - **describe** — `images[]`, `think` → `result.prompt`. Photo(s) in, a prompt
   that would recreate them out.
 - **boost** — `prompt`, `level` 1–5, `has_image`, `negative_prompt`,
-  `variant_index`/`variant_count` → `result.prompt`, `result.negative_prompt`.
-  Rewrites a draft into the loaded model's idiom; `level` sets how far it may
-  depart from the original.
+  `steer`, `variant_index`/`variant_count` → `result.prompt`,
+  `result.negative_prompt`. Rewrites a draft into the loaded model's idiom;
+  `level` sets how far it may depart from the original. `steer` is a separate
+  instruction about the rewrite itself ("set it at night", "keep it under
+  twenty words", at most 2000 characters) and outranks the draft, the level
+  and the idiom guidance — so it belongs in its own field, not appended to
+  `prompt`, where it would be rewritten as subject matter.
 - **critique** — `direction`, `ref_image`, `output_filename`, `history` →
   `result.critique`, `result.revised_prompt`, `result.score`, `result.metrics`.
   Compares an edit's output against its reference.

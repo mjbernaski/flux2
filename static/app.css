@@ -1690,3 +1690,33 @@ button:disabled {
     color: #e3d6ff;
     font-weight: 600;
 }
+
+/* Steering — the same chip treatment as "show refs", and for the same reason:
+   it governs all three boost buttons from the first one's row, and a steer
+   left over from a previous prompt would otherwise silently reshape every
+   rewrite. The row below it is collapsed until asked for. */
+.boost-steer-btn {
+    /* flex:0 0 auto against the global `button { flex: 1 }`, which would
+       otherwise stretch a chip across the rest of the row. */
+    flex: 0 0 auto;
+    background: #2a2a40; color: #ccc; border: 1px solid #3d3d5c;
+    border-radius: 10px; padding: 3px 9px; cursor: pointer; font-size: 13px;
+}
+.boost-steer-btn:hover { background: #33334d; color: #fff; }
+.boost-steer-btn.boost-steer-on {
+    background: rgba(118, 75, 162, 0.25);
+    border-color: #764ba2;
+    color: #e3d6ff;
+    font-weight: 600;
+}
+.boost-steer-row { margin-top: 6px; }
+.boost-steer-row input[type="text"] {
+    flex: 1 1 260px; min-width: 0; margin-bottom: 0;
+    padding: 6px 10px; font-size: 13px;
+}
+#boostSteerClear {
+    flex: 0 0 auto;
+    background: #333; color: #ccc; border: 1px solid #444;
+    border-radius: 4px; padding: 5px 10px; cursor: pointer; font-size: 12px;
+}
+#boostSteerClear:hover { background: #3d3d3d; }

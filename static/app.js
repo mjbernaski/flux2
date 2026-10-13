@@ -194,6 +194,7 @@ function saveSwitchState() {
         savePreviews: chk('savePreviews'),
         boostThink: chk('boostThink'),
         boostUseRefs: chk('boostUseRefs'),
+        boostSteer: val('boostSteer'),
         describeThink: chk('describeThink'),
         strength: strengthSlider ? strengthSlider.value : null,
         aspectMode: aspectModeEl ? aspectModeEl.value : null,
@@ -741,6 +742,62 @@ function syncBoostRefsLabel() {
 
 const boostUseRefsEl = document.getElementById('boostUseRefs');
 if (boostUseRefsEl) boostUseRefsEl.addEventListener('change', syncBoostRefsLabel);
+
+// ---- Steering the rewrite ----
+// A second, separate instruction for the boosting VLM: the prompt says what to
+// depict, the steer says how to rewrite it ("set it at night", "keep it under
+// 20 words", "no camera jargon"). It is posted as its own field rather than
+// appended to the prompt because the server lets it override the draft — text
+// pasted into the prompt box would instead be rewritten as if it were subject
+// matter, which is the opposite of steering.
+//
+// Like "show refs" it governs all three boost buttons from the first one's
+// row, so the same rule applies: the on-state has to be readable from the
+// other two. The row is collapsed until asked for, and never auto-collapses
+// while it holds text.
+function boostSteerText() {
+    const el = document.getElementById('boostSteer');
+    const v = el ? (el.value || '').trim() : '';
+    return v || null;
+}
+
+function syncBoostSteerUi() {
+    const btn = document.getElementById('boostSteerBtn');
+    const text = document.getElementById('boostSteerBtnText');
+    if (!btn) return;
+    const on = !!boostSteerText();
+    btn.classList.toggle('boost-steer-on', on);
+    if (text) text.textContent = on ? 'steering on' : 'steer';
+}
+
+// A note for the progress line, so a run that came out oddly can be traced
+// back to a steer left in the box.
+function boostSteerNote() {
+    return boostSteerText() ? ', steered' : '';
+}
+
+const boostSteerBtnEl = document.getElementById('boostSteerBtn');
+const boostSteerRowEl = document.getElementById('boostSteerRow');
+const boostSteerEl = document.getElementById('boostSteer');
+if (boostSteerBtnEl && boostSteerRowEl) {
+    boostSteerBtnEl.addEventListener('click', function() {
+        const open = boostSteerRowEl.style.display !== 'none';
+        // Closing a row that still holds a steer would hide a setting that
+        // keeps applying; clear it instead, which is what closing means here.
+        if (open && boostSteerEl) boostSteerEl.value = '';
+        boostSteerRowEl.style.display = open ? 'none' : 'flex';
+        if (!open && boostSteerEl) boostSteerEl.focus();
+        syncBoostSteerUi();
+    });
+}
+if (boostSteerEl) boostSteerEl.addEventListener('input', syncBoostSteerUi);
+const boostSteerClearEl = document.getElementById('boostSteerClear');
+if (boostSteerClearEl) {
+    boostSteerClearEl.addEventListener('click', function() {
+        if (boostSteerEl) { boostSteerEl.value = ''; boostSteerEl.focus(); }
+        syncBoostSteerUi();
+    });
+}
 
 // Re-render the reference thumbnails and every control whose visibility
 // depends on how many references are loaded.
@@ -1320,9 +1377,11 @@ async function runBoost() {
     const level = levelEl ? parseInt(levelEl.value, 10) : 3;
     const negativeEl = document.getElementById('negativePrompt');
     const refs = await boostRefImages();
+    const steer = boostSteerText();
     const prog = vlmStatusStart(btn, 'Boosting prompt (level ' + level
         + (refs.length ? `, showing ${refs.length} ref${refs.length > 1 ? 's' : ''}`
-                       : (currentInputImages.length ? ', text only' : '')) + ')');
+                       : (currentInputImages.length ? ', text only' : ''))
+        + boostSteerNote() + ')');
     try {
         const res = await fetch('/boost', {
             method: 'POST',
@@ -1333,6 +1392,7 @@ async function runBoost() {
                 think: thinkEl ? thinkEl.checked : false,
                 has_image: currentInputImages.length > 0,
                 input_images: refs,
+                steer: steer,
                 negative_prompt: negativeEl && negativeEl.value.trim() ? negativeEl.value.trim() : null
             })
         });
@@ -1467,8 +1527,10 @@ async function runBoostVariants() {
                 <button type="button" class="boost-options-close">Close</button>
             </span>
         `;
+        const titleSteer = boostSteerText();
         head.querySelector('.boost-options-title').textContent =
-            `${n} rewrites — each generates as it lands`;
+            `${n} rewrites — each generates as it lands`
+            + (titleSteer ? ` · steered: ${titleSteer}` : '');
         head.querySelector('.boost-options-restore').addEventListener('click', function() {
             if (boostVariantsDraft) {
                 promptEl.value = boostVariantsDraft.prompt;
@@ -1488,7 +1550,9 @@ async function runBoostVariants() {
     // Resolved once up front, not per rewrite: every call posts the same
     // pictures, and the shrink is work the browser need only do once.
     const refs = await boostRefImages();
-    const refNote = refs.length ? ` showing ${refs.length} ref${refs.length > 1 ? 's' : ''}` : '';
+    const steer = boostSteerText();
+    const refNote = (refs.length ? ` showing ${refs.length} ref${refs.length > 1 ? 's' : ''}` : '')
+        + (steer ? ' (steered)' : '');
     let done = 0, queued = 0, failed = 0;
     const prog = vlmStatusStart(btn, `Boosting ${n} rewrites${refNote}`);
     const tick = function() {
@@ -1541,6 +1605,7 @@ async function runBoostVariants() {
                         think: thinkEl ? thinkEl.checked : false,
                         has_image: currentInputImages.length > 0,
                         input_images: refs,
+                        steer: steer,
                         negative_prompt: draftNegative,
                         variant_index: i + 1,
                         variant_count: n
@@ -1631,7 +1696,9 @@ async function runEvolveGenerate() {
     // Same as Boost xN: the toggle covers this button too, and every one of
     // the n rewrites posts the same references, so shrink them once.
     const refs = await boostRefImages();
-    const refNote = refs.length ? ` showing ${refs.length} ref${refs.length > 1 ? 's' : ''}` : '';
+    const steer = boostSteerText();
+    const refNote = (refs.length ? ` showing ${refs.length} ref${refs.length > 1 ? 's' : ''}` : '')
+        + (steer ? ' (steered)' : '');
     let evolved = 0, queued = 0, failed = 0;
     const prog = vlmStatusStart(btn, `Evolving ${n} prompt variations${refNote}`);
     const tick = function() {
@@ -1659,6 +1726,7 @@ async function runEvolveGenerate() {
                         think: thinkEl ? thinkEl.checked : false,
                         has_image: currentInputImages.length > 0,
                         input_images: refs,
+                        steer: steer,
                         negative_prompt: negativeEl && negativeEl.value.trim() ? negativeEl.value.trim() : null,
                         variant_index: i + 1,
                         variant_count: n
@@ -3633,6 +3701,11 @@ if (loopAcceptBtn) loopAcceptBtn.addEventListener('click', function() {
     setChk('savePreviews', saved.savePreviews);
     setChk('boostThink', saved.boostThink);
     setChk('boostUseRefs', saved.boostUseRefs);
+    setVal('boostSteer', saved.boostSteer);
+    // A steer that survived the switch has to be visible, or it would reshape
+    // the next rewrite from a row still collapsed.
+    if (saved.boostSteer && boostSteerRowEl) boostSteerRowEl.style.display = 'flex';
+    if (typeof syncBoostSteerUi === 'function') syncBoostSteerUi();
     setChk('describeThink', saved.describeThink);
     if (typeof syncSavePreviewsVisibility === 'function') syncSavePreviewsVisibility();
     if (strengthSlider && saved.strength !== null && saved.strength !== undefined) {

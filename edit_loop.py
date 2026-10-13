@@ -853,7 +853,7 @@ BOOST_LEVELS = {
 
 def vlm_boost(model, prompt, family="flux2", model_desc="", level=3,
               think=False, ollama_url="http://127.0.0.1:11434", variant=None,
-              negative_prompt=None, images=None):
+              negative_prompt=None, images=None, steer=None):
     """Rewrite the user's draft prompt into a stronger one tuned to the
     prompting idiom of the loaded image model (`family` picks the guidance;
     `model_desc` is the human-readable model name for context; `level` 1-5
@@ -867,6 +867,15 @@ def vlm_boost(model, prompt, family="flux2", model_desc="", level=3,
     call, so the pair stays consistent: the positive rewrite must not add
     detail that fights or duplicates the (possibly also-tightened) negative
     exclusions.
+
+    `steer` (optional) is the user's own instruction about the rewrite itself
+    — "set it at night", "keep it under twenty words", "no camera jargon" —
+    as opposed to the draft, which is the subject. It is a separate argument
+    rather than text appended to the draft because it outranks the draft: it
+    comes from the same user and later, so where it contradicts a detail they
+    wrote, the steer is what they now want, and the model is told so. It also
+    outranks `family` guidance and `level`, which are defaults rather than
+    anything the user asked for.
 
     `images` (optional) are the reference images the generation will condition
     on. Passing them makes this a vision call, so the model can ground the
@@ -908,6 +917,19 @@ def vlm_boost(model, prompt, family="flux2", model_desc="", level=3,
             "prompt rules out), and the negative prompt must not exclude "
             "anything the positive prompt now explicitly asks for.\n"
         )
+    steer_line = ""
+    steer = (steer or "").strip()
+    if steer:
+        steer_line = (
+            "The user has separately said how they want the prompt steered: "
+            f"\"{steer}\"\n"
+            "That instruction is about the rewrite itself and it governs this "
+            "reply. Follow it even where it conflicts with the style guidance, "
+            "with the degree of rewrite, or with a detail in the draft — it is "
+            "the same user asking, later, so a detail it contradicts is one "
+            "they have changed their mind about. Apply it to the prompt you "
+            "write; never answer it, quote it, or mention it in the prompt.\n"
+        )
     images = list(images or [])
     image_line = ""
     if images:
@@ -930,12 +952,15 @@ def vlm_boost(model, prompt, family="flux2", model_desc="", level=3,
         f"{image_line}"
         f"{negative_line}"
         f"{variant_line}"
+        f"{steer_line}"
         "Rewrite it into a stronger prompt for this model. Preserve the "
         "user's intent and every explicit detail they gave (subjects, "
         "counts, colors, names, any text to render verbatim). "
         f"Degree of rewrite: {degree} "
         "Where the degree conflicts with the style guidance above (e.g. on "
-        "length or how much to add), the degree wins. "
+        "length or how much to add), the degree wins"
+        + (", and the user's steering instruction wins over both. "
+           if steer else ". ")
         + ("Reply with the improved prompt and negative_prompt."
            if negative_prompt else "Reply with the improved prompt only.")
     )
