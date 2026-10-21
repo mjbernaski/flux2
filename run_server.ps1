@@ -211,6 +211,23 @@ function Confirm-ImageManager {
         -RedirectStandardOutput "image_manager.log" -RedirectStandardError "image_manager.err.log"
 }
 
+# video_server.py (port 2224) is the mode switch: this box runs either the
+# image generator or MiniMax H3 video (ComfyUI on 8188), never both, because
+# H3 peaks at ~27GB against the generator's 21-26GB on one 32GB card. The
+# switch cannot live in either of those two - whichever is up is the one being
+# stopped - so it lives in a third app that holds no model and stays up in
+# both modes. run_video.ps1 ensures it from the other side, and kill_flux.ps1
+# spares it by port so it survives the stop half of a switch.
+function Confirm-VideoServer {
+    $vsPort = if ($env:VIDEO_SERVER_PORT) { [int]$env:VIDEO_SERVER_PORT } else { 2224 }
+    if (netstat -ano | Select-String ":$vsPort\s.*LISTENING") { return }
+    if (-not (Test-Path "video_server.py")) { return }
+    Write-Host "Starting video server on port $vsPort (logging to video_server.log)..." -ForegroundColor Cyan
+    Start-Process -FilePath $PythonExe -ArgumentList "-u", "video_server.py", "--port", "$vsPort" `
+        -WorkingDirectory $PSScriptRoot -WindowStyle Hidden `
+        -RedirectStandardOutput "video_server.log" -RedirectStandardError "video_server.err.log"
+}
+
 function Write-Log([string]$Message, [string]$Color = "White") {
     Write-Host $Message -ForegroundColor $Color
     Add-Content -Path $LogFile -Value $Message
@@ -235,14 +252,32 @@ function Start-FluxServer([int]$Config, [string[]]$ExtraArgs = @()) {
     Write-Host "Logging to: $LogFile" -ForegroundColor Cyan
     Write-Host ""
 
+    # ComfyUI resident means video mode owns the card. Starting a model on top
+    # of it does not fail cleanly: the Windows driver pages one of the two out
+    # and every step runs 8-200x slow with no error (the sysmem-fallback case).
+    # switch_mode.ps1 is the supported way across, because it waits for the
+    # VRAM to actually be released before starting anything.
+    $comfyPort = if ($env:COMFY_PORT -match '^\d+$') { [int]$env:COMFY_PORT } else { 8188 }
+    if (netstat -ano | Select-String ":$comfyPort\s.*LISTENING") {
+        Write-Host ""
+        Write-Host "ComfyUI is listening on port $comfyPort - the box is in video mode." -ForegroundColor Red
+        Write-Host "Switch back first:  .\switch_mode.ps1 flux -Config $Config" -ForegroundColor Cyan
+        return 1
+    }
+
     Stop-ExistingServer
     Confirm-Ollama
     Confirm-ImageManager
+    Confirm-VideoServer
 
     # kill_flux.ps1 leaves .flux_stopped behind so the FluxServerWatchdog task
     # does not resurrect a deliberate stop. Starting again is the intent that
     # cancels it - clear it here so the watchdog guards this run too.
     Remove-Item ".flux_stopped" -Force -ErrorAction SilentlyContinue
+    # Starting the generator is the declaration that flux is the wanted GPU
+    # tenant, the same way it cancels .flux_stopped. watchdog.ps1 reads this to
+    # know which of the two to bring back.
+    Set-Content -Path ".mode" -Value "flux" -Encoding ascii -ErrorAction SilentlyContinue
 
     $PID | Out-File "server.pid" -Encoding ascii
     try {

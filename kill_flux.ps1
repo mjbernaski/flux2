@@ -26,11 +26,20 @@
 #
 # That tree is also why the image manager can be spared by default: its chain
 # is identified by port 2223 and excluded, rather than guessed at by path.
+#
+# video_server.py (port 2224) is spared the same way, and for a stronger
+# reason. It holds no model and no VRAM, and it is the page that asks for the
+# switch back out of video mode - so it has to outlive a flux kill, which is
+# the first half of every switch into video mode. Killing it would leave the
+# box in video mode with nothing able to bring the generator back. Note it
+# runs from .venv like the server does, so the straggler sweep below would
+# find it by path if it were not excluded here by port.
 
 [CmdletBinding(SupportsShouldProcess)]
 param(
-    # Also stop image_manager.py (port 2223). Off by default so the gallery
-    # survives a server restart, matching what run_server.ps1 assumes.
+    # Also stop image_manager.py (port 2223) and video_server.py (port 2224).
+    # Off by default so the gallery survives a server restart, matching what
+    # run_server.ps1 assumes, and so the mode-switch UI survives a switch.
     [switch]$All
 )
 
@@ -51,6 +60,7 @@ function Get-EnvPort([string]$Name, [int]$Default) {
 
 $Port = Get-EnvPort "PORT" 2222
 $ImPort = Get-EnvPort "IMAGE_MANAGER_PORT" 2223
+$VsPort = Get-EnvPort "VIDEO_SERVER_PORT" 2224
 
 # netstat rather than Get-NetTCPConnection: the latter goes through CIM, which
 # is access-denied here for the same reason Win32_Process is.
@@ -167,6 +177,15 @@ $imSeeds = if ($procs) {
 $imChain = Expand-Chains $imSeeds
 Write-Verbose "image_manager.py chain (port ${ImPort}): $($imChain -join ', ')"
 
+$vsSeeds = if ($procs) {
+    @($procs | Where-Object { $_.CommandLine -match 'video_server\.py' } |
+        ForEach-Object { [int]$_.ProcessId })
+} else {
+    Get-PortListeners $VsPort
+}
+$vsChain = Expand-Chains $vsSeeds
+Write-Verbose "video_server.py chain (port ${VsPort}): $($vsChain -join ', ')"
+
 $serverSeeds = if ($procs) {
     @($procs | Where-Object { $_.CommandLine -match 'web_server\.py' } |
         ForEach-Object { [int]$_.ProcessId })
@@ -177,15 +196,17 @@ $serverChain = Expand-Chains $serverSeeds
 Write-Verbose "web_server.py chain (port ${Port}): $($serverChain -join ', ')"
 
 # A server killed mid-startup has not bound the port yet, so also sweep venv
-# pythons that belong to no known chain - minus the manager's, which is the
-# one venv python we deliberately leave alone.
+# pythons that belong to no known chain - minus the manager's and the video
+# server's, which are the venv pythons we deliberately leave alone.
+$spared = @($imChain + $vsChain | Select-Object -Unique)
 $stragglers = @(Expand-Chains @($AllProcs |
     Where-Object { $_.ProcessName -like 'python*' -and $_.Path -eq $PythonExe } |
-    ForEach-Object { $_.Id }) | Where-Object { $imChain -notcontains $_ })
+    ForEach-Object { $_.Id }) | Where-Object { $spared -notcontains $_ })
 if ($stragglers) { Write-Verbose "venv python stragglers: $($stragglers -join ', ')" }
 
-$targets = @(@($serverChain) + $stragglers | Select-Object -Unique)
-if ($All) { $targets = @($targets + $imChain | Select-Object -Unique) }
+$targets = @(@($serverChain) + $stragglers | Where-Object { $spared -notcontains $_ } |
+    Select-Object -Unique)
+if ($All) { $targets = @($targets + $spared | Select-Object -Unique) }
 
 # Supervisors: the non-python parent of any chain we are about to kill, plus
 # whatever server.pid records. Killing these first stops the restart loop.
@@ -245,7 +266,7 @@ if (-not $killed) {
 Start-Sleep -Seconds 1
 Write-Verbose "Re-checking for survivors..."
 $remaining = Get-PortListeners $Port
-if ($All) { $remaining += Get-PortListeners $ImPort }
+if ($All) { $remaining += Get-PortListeners $ImPort; $remaining += Get-PortListeners $VsPort }
 $remaining = @($remaining | Where-Object { $_ -ne $PID } | Select-Object -Unique)
 
 if ($remaining) {

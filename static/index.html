@@ -31,6 +31,11 @@
         <!-- href is set per-job by renderPreviewsLink on each /status poll. -->
         <a id="previewsLink" class="top-link" target="_blank" rel="noopener"
            style="display: none;">&#9707; Previews</a>
+        <!-- href is built in app.js from location.hostname, so it works from a
+             phone on the LAN; port 2224 is video_server.py, which is up in both
+             modes and is where the GPU is handed over to H3. -->
+        <a id="videoLink" class="top-link" target="_blank" rel="noopener"
+           title="MiniMax H3 video &mdash; stops this server and gives H3 the card">&#9654; Video</a>
         <a href="/alternate" class="top-link" title="Denser sidebar + main dashboard layout">&#9776; Dense view</a>
         <a href="/simple" class="top-link" title="Prompt, Generate, image — everything else at its default">&#9679; Simple view</a>
     </div>

@@ -29,17 +29,124 @@ function Write-WatchdogLog([string]$Message) {
 }
 
 # Same port resolution as run_server.ps1, kill_flux.ps1 and f14.ps1.
-$Port = 2222
-if ($env:PORT -match '^\d+$') {
-    $Port = [int]$env:PORT
-} elseif (Test-Path (Join-Path $FluxRoot ".env")) {
-    $m = Select-String -Path (Join-Path $FluxRoot ".env") -Pattern '^PORT=(\d+)' -ErrorAction SilentlyContinue
-    if ($m) { $Port = [int]$m.Matches[0].Groups[1].Value }
+function Get-EnvPort([string]$Name, [int]$Default) {
+    $fromEnv = [Environment]::GetEnvironmentVariable($Name)
+    if ($fromEnv -match '^\d+$') { return [int]$fromEnv }
+    $envFile = Join-Path $FluxRoot ".env"
+    if (Test-Path $envFile) {
+        $m = Select-String -Path $envFile -Pattern "^$Name=(\d+)" -ErrorAction SilentlyContinue
+        if ($m) { return [int]$m.Matches[0].Groups[1].Value }
+    }
+    return $Default
 }
+
+$Port = Get-EnvPort "PORT" 2222
+$ComfyPort = Get-EnvPort "COMFY_PORT" 8188
+$VideoServerPort = Get-EnvPort "VIDEO_SERVER_PORT" 2224
 
 # netstat, not Get-NetTCPConnection: the latter goes through CIM, which is
 # access-denied in some shells here (see kill_flux.ps1).
-if (netstat -ano | Select-String ":$Port\s.*LISTENING") {
+function Test-PortUp([int]$ListenPort) {
+    return [bool](netstat -ano | Select-String ":$ListenPort\s.*LISTENING")
+}
+
+function Test-LivePid([string]$PidPath) {
+    if (-not (Test-Path $PidPath)) { return $false }
+    $recorded = (Get-Content $PidPath -ErrorAction SilentlyContinue | Select-Object -First 1)
+    return ($recorded -match '^\d+$' -and
+            (Get-Process -Id ([int]$recorded) -ErrorAction SilentlyContinue))
+}
+
+# A switch in flight is stopping one tenant and starting the other, which looks
+# exactly like "both down" for a minute or two. Relaunching into that window is
+# how two models end up on one card, so stay out of it entirely.
+$switchingFile = Join-Path $FluxRoot ".switching"
+if (Test-Path $switchingFile) {
+    $age = (Get-Date) - (Get-Item $switchingFile).LastWriteTime
+    if ($age.TotalMinutes -lt 15) {
+        Write-Verbose "A mode switch has been in flight for $([int]$age.TotalSeconds)s - leaving it alone."
+        exit 0
+    }
+    Write-WatchdogLog "Ignoring a stale .switching ($([int]$age.TotalMinutes) minutes old)."
+}
+
+# video_server.py holds no model and belongs up in both modes: it is the UI the
+# mode switch is driven from, and in video mode it is the only way back. Both
+# supervisors start it, but neither is running when it is the thing that died.
+if (-not (Test-PortUp $VideoServerPort) -and (Test-Path (Join-Path $FluxRoot "video_server.py"))) {
+    $venvPython = Join-Path $FluxRoot ".venv\Scripts\python.exe"
+    if ((Test-Path $venvPython) -and $PSCmdlet.ShouldProcess("video_server.py", "start")) {
+        Write-WatchdogLog "Port $VideoServerPort down - starting video_server.py."
+        try {
+            Start-Process -FilePath $venvPython `
+                -ArgumentList "-u", "video_server.py", "--port", "$VideoServerPort" `
+                -WorkingDirectory $FluxRoot -WindowStyle Hidden `
+                -RedirectStandardOutput (Join-Path $FluxRoot "video_server.log") `
+                -RedirectStandardError (Join-Path $FluxRoot "video_server.err.log")
+        } catch {
+            Write-WatchdogLog "Could not start video_server.py: $($_.Exception.Message)"
+        }
+    }
+}
+
+# Which GPU tenant is wanted. switch_mode.ps1 is the only writer; absent means
+# flux, so a box that has never switched behaves as it always did.
+$Mode = "flux"
+$modeFile = Join-Path $FluxRoot ".mode"
+if (Test-Path $modeFile) {
+    $wanted = (Get-Content $modeFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+    if ($wanted) { $wanted = $wanted.Trim().ToLower() }
+    if ($wanted -eq "video") { $Mode = "video" }
+}
+
+if ($Mode -eq "video") {
+    # --- video mode: supervise ComfyUI, and never start the generator --------
+    if (Test-PortUp $ComfyPort) {
+        Write-Verbose "Port $ComfyPort is listening - nothing to do."
+        exit 0
+    }
+    if (Test-Path (Join-Path $FluxRoot ".video_stopped")) {
+        Write-Verbose "ComfyUI down, but .video_stopped is present - stopped on purpose, leaving it."
+        exit 0
+    }
+    if (Test-LivePid (Join-Path $FluxRoot "video.pid")) {
+        Write-Verbose "run_video.ps1 supervisor is alive - still loading, leaving it alone."
+        exit 0
+    }
+    # Flux resident while .mode says video means someone started it by hand.
+    # Its weights are on the card, so starting ComfyUI now is the double-tenant
+    # stall. Report rather than fight: a human picked this.
+    if (Test-PortUp $Port) {
+        Write-WatchdogLog "Mode is 'video' but the generator is up on port $Port - leaving both alone. Run switch_mode.ps1 to settle it."
+        exit 0
+    }
+
+    $videoLauncher = Join-Path $FluxRoot "run_video.ps1"
+    if (-not (Test-Path $videoLauncher)) {
+        Write-WatchdogLog "run_video.ps1 not found under $FluxRoot - cannot restart ComfyUI."
+        exit 1
+    }
+    if (-not $PSCmdlet.ShouldProcess("ComfyUI (video mode)", "restart")) { exit 0 }
+
+    Write-WatchdogLog "Port $ComfyPort down and no live supervisor - restarting ComfyUI."
+    $shell = $null
+    $pwshCmd = Get-Command pwsh.exe -ErrorAction SilentlyContinue
+    if ($pwshCmd) { $shell = $pwshCmd.Source } else { $shell = (Get-Command powershell.exe).Source }
+    try {
+        Start-Process -FilePath $shell `
+            -ArgumentList "-NoProfile", "-NoLogo", "-File", $videoLauncher `
+            -WorkingDirectory $FluxRoot -WindowStyle Hidden `
+            -RedirectStandardOutput (Join-Path $FluxRoot "video_supervisor.out.log") `
+            -RedirectStandardError (Join-Path $FluxRoot "video_supervisor.err.log")
+    } catch {
+        Write-WatchdogLog "ComfyUI restart failed: $($_.Exception.Message)"
+        exit 1
+    }
+    exit 0
+}
+
+# --- flux mode ---------------------------------------------------------------
+if (Test-PortUp $Port) {
     Write-Verbose "Port $Port is listening - nothing to do."
     exit 0
 }
@@ -50,6 +157,12 @@ if (netstat -ano | Select-String ":$Port\s.*LISTENING") {
 $stopFile = Join-Path $FluxRoot ".flux_stopped"
 if (Test-Path $stopFile) {
     Write-Verbose "Port $Port down, but .flux_stopped is present - stopped on purpose, leaving it."
+    exit 0
+}
+
+# ComfyUI resident while .mode says flux is the mirror of the case above.
+if (Test-PortUp $ComfyPort) {
+    Write-WatchdogLog "Mode is 'flux' but ComfyUI is up on port $ComfyPort - not starting a model on top of it. Run switch_mode.ps1 flux."
     exit 0
 }
 

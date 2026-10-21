@@ -2607,6 +2607,10 @@ def _api_model_info():
         'vae_tiling': getattr(flux_core, '_vae_tiling_mode', 'auto'),
         'vae_tiling_threshold_mp': getattr(flux_core, '_vae_tiling_threshold_mp', None),
         'hostname': socket.gethostname(),
+        # Where video_server.py listens. It is a separate app on its own port
+        # (it has to be: it stays up across the mode switch that stops this
+        # process), so the UI cannot infer the link from its own location.
+        'video_server_port': int(os.environ.get('VIDEO_SERVER_PORT', 2224)),
         'version': VERSION,
         'description': f"{model_type}{turbo_str}{uncensored_str} with {encoder_type}"
     }

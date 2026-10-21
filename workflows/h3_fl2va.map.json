@@ -1,0 +1,10 @@
+{
+  "prompt": "104.prompt",
+  "width": "104.width",
+  "height": "104.height",
+  "frames": "104.length",
+  "seed": "15.noise_seed",
+  "steps": "125.value",
+  "_steps_note": "turbo is on, so the step count comes from the switch's on_true branch; the other branch is wired but unused",
+  "start_image": "114.image"
+}

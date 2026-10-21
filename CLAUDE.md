@@ -36,6 +36,15 @@ entry points share one model core:
   source size (a 4x pass on 1MP produces 16MP). Everything imports lazily and
   `available()` returns `[]` when spandrel or the weights are missing, which is
   how the UI decides whether to show the control at all.
+- **`video_server.py`** — separate Flask app on port 2224 for MiniMax H3
+  video, and the owner of the **mode switch**. It holds no model and touches
+  no GPU: H3 peaks at ~27GB against the generator's 21-26GB, so on a 32GB card
+  the two cannot both be resident and switching means stopping one of them —
+  which is why the switch cannot live in either of the two services it
+  switches between. This one stays up in both modes, so it can be asked to go
+  either way. Generation itself belongs to ComfyUI on 8188 (`run_video.ps1`);
+  everything here is request validation plus patching **ComfyUI's own**
+  exported workflow. See the video-mode note under Architecture.
 - **`image_manager.py`** — separate Flask gallery/crop tool on port 2223 over
   the same `web-generated/` tree. Hide moves an image into `.hidden/` —
   the *same* folder the generator's hidden mode writes to, keeping its
@@ -94,6 +103,11 @@ recovery was a human relaunching it. `run_server.ps1` now sets
 `FOR_DISABLE_CONSOLE_CTRL_HANDLER=1` and `KMP_HANDLE_SIGNALS=0` to stop those
 handlers being installed at all.
 
+`switch_mode.ps1 video|flux` moves the card between the image generator and
+MiniMax H3 video (`run_video.ps1` / `kill_video.ps1` are that mode's
+supervisor and stop script, mirroring `run_server.ps1` / `kill_flux.ps1`).
+See the video-mode note under Architecture for why it works the way it does.
+
 A supervisor that dies for some *other* reason still leaves nothing to restart
 it, so `install_watchdog.ps1` registers a `FluxServerWatchdog` scheduled task
 running `watchdog.ps1` at logon and every 5 minutes. It restarts the last
@@ -103,7 +117,19 @@ bound the port yet — relaunching over it would make the two fight forever), or
 when `.flux_stopped` exists. That sentinel is what keeps a deliberate stop
 stopped: `kill_flux.ps1` writes it and `run_server.ps1` clears it on the next
 start, so "down" and "wanted down" stay distinguishable. Restarts are logged to
-`watchdog.log`; the no-op path stays silent.
+`watchdog.log`; the no-op path stays silent. It reads `.mode` first and
+supervises whichever tenant is wanted — in video mode it watches 8188 and
+relaunches `run_video.ps1`, gated by `.video_stopped` (written by
+`kill_video.ps1`, cleared by `run_video.ps1`) exactly as the flux path is
+gated by `.flux_stopped`. The two sentinels are separate because
+`switch_mode.ps1` writes `.flux_stopped` on its way *into* video mode, where
+flux being down is the point rather than a problem. It also stays out of the
+way entirely while `.switching` is fresh (a switch is both ports down for a
+minute or two, and relaunching into that window is how two models end up on
+one card), ensures `video_server.py` is up in either mode since that is the
+only way back out of video mode, and declines to start a model on top of a
+tenant that disagrees with `.mode` rather than fighting a human who started
+one by hand.
 
 ## Testing
 
@@ -113,6 +139,7 @@ python smoke_test_servers.py 9 10   # subset
 python test_rest_api.py             # /api/v1 contract checks, no GPU needed
 python test_gpu_pace.py             # sysmem-fallback detector, no GPU needed
 python test_fallback.py             # load-failure fallback, no GPU needed
+python test_video_server.py         # video mode gate + workflow patching, no GPU
 ```
 
 `smoke_test_servers.py` writes a live-updating HTML tracker to
@@ -124,6 +151,10 @@ the GPU — it is the one test to run after touching either API dialect.
 it also needs no GPU; run it after touching the SLOW_STEP_* logic.
 `test_fallback.py` checks the load-failure fallback's decision table (also no
 GPU) — run it after touching `FALLBACK_CONFIG` or the model-load error path.
+`test_video_server.py` runs against `video_server.py`'s test client with the
+port probes faked, so it covers the mode gate, request validation, frame/size
+snapping and every way a workflow map can be stale without needing ComfyUI —
+run it after touching `validate_request`, `patch_workflow` or the mode routes.
 
 ## Dependencies
 
@@ -216,7 +247,15 @@ retired for the first release that carries the pipeline.
   being hardcoded. `vlm_dialect()` probes `/api/version` once per URL and
   caches the answer (`VLM_API=ollama|openai` forces it); `_openai_body()`
   does the translation, and the reply is reshaped back into ollama's
-  envelope so every caller stays dialect-agnostic.
+  envelope so every caller stays dialect-agnostic. Guided decoding is
+  optional over there and a server without it **400s** on `response_format`
+  rather than ignoring it, which failed every critique/describe/boost
+  identically ("no rewrite from VLM"); the first such rejection is
+  remembered per URL (`_schema_unsupported`) and from then on the schema
+  goes out as an instruction in words (`_schema_instruction`), with
+  `_unfence()` peeling the ```json wrapper a chat-tuned model then wraps it
+  in. The reply parsers already accepted plain text, because a thinking
+  model ignores the schema often enough that they had to.
   `CRITIQUE_MODEL`/`DESCRIBE_MODEL` name the model, and default to `auto` —
   `resolve_vlm_model()` asks the endpoint what it serves (`/v1/models`, or
   ollama's `/api/ps` then `/api/tags`) and takes the first, preferring a
@@ -287,6 +326,86 @@ retired for the first release that carries the pipeline.
   fails before Flask starts, or a crash that repeats), it hops to
   `$FallbackConfig` once and then gives up normally, so a box where nothing
   loads still stops.
+- **Video mode (MiniMax H3)**: one card, one tenant. H3's open weights peak at
+  ~27GB on a 32GB card (measured: 864x480, 243 frames, 10 steps, 175s, NVFP4
+  transformer + Qwen3-VL-32B encoder) and the image configs sit at 21-26GB, so
+  the generator and the video backend are mutually exclusive — and running
+  both does not fail cleanly, it hits the same silent WDDM paging as the
+  sysmem-fallback case below. The arrangement that follows from that:
+  **`.mode`** (`flux` | `video`; absent means `flux`) records which tenant is
+  *wanted*, and **`switch_mode.ps1` is its only writer** — one writer is what
+  keeps "wanted" and "running" from disagreeing in two places. A switch stops
+  one side, waits for the port to clear *and* for `nvidia-smi` to show the
+  VRAM actually released (a process can be gone from the table while the
+  driver still holds its allocations; starting into that window is the stall),
+  writes `.mode`, then starts the other side. `.switching` marks one in
+  flight, is written before anything stops, and is removed in a `finally` —
+  which is why the script body is a function whose early exits are `return`s
+  rather than `exit`s. H3 generation itself is ComfyUI's: `video_server.py`
+  validates a request, patches **ComfyUI's own exported workflow** and submits
+  it to 8188. The graph is deliberately not in Python — H3's node set moves
+  across ComfyUI releases (0.30 base templates, 0.34 multiframe, 0.35 sparse
+  attention, 0.36 FastH3, 0.38 the `pruned_w6a8` build) — so
+  `workflows/<name>.json` is an **API-format** export and
+  `workflows/<name>.map.json` says which node input each field writes to.
+  `workflow_from_template.py` builds both pairs from ComfyUI's own templates
+  (`h3_t2va` from `video_minimax_h3_t2v`, `h3_fl2va` from
+  `video_minimax_h3_i2v`), which is the browser's `Export (API)` plus the map
+  — necessary because those templates wrap everything in a **subgraph** (the
+  instance's `type` is a UUID; the real 21 nodes are under
+  `definitions.subgraphs`) and because Chrome cannot reach 127.0.0.1:8188 on
+  this box at all. It derives the map by following the graph rather than by
+  hardcoding ids: the step count in particular lives behind a
+  `ComfySwitchNode` pair whose branch depends on whether turbo is on, so the
+  tool follows the switch. `--probe` / `GET /workflow/nodes` dumps a graph for
+  hand-editing; see `workflows/README.md`. Patching refuses to overwrite
+  an input that is wired to another node, because that detaches the graph and
+  produces a clip that silently ignored the setting. Finished clips land in
+  `web-generated/video/` as `h3_{timestamp}_{8hex}.mp4` with the same
+  `# Prompt:` sidecar the images use, fetched over ComfyUI's `/view` rather
+  than read off disk so this app never needs to know where that install keeps
+  its output.
+  **Boost** is `POST /boost` on 2224, and it calls `edit_loop` directly
+  rather than proxying to `web_server`'s — `web_server` is *down* in video
+  mode, which is exactly when the button is wanted. It answers synchronously
+  (no Boost xN or Evolve here to make a job id worth it) and uses two new
+  `BOOST_GUIDANCE` families: `h3` asks for a look statement, a scene line,
+  two to four **timecoded shots that add up to the clip length**, a camera
+  line and — uniquely among the models here — an audio line, since H3 scores
+  the clip whether or not the prompt says to. `h3-i2v` adds that the opening
+  shot must start from the supplied frame. The clip's real duration reaches
+  the VLM through `model_desc`, which is what makes the timecodes total
+  correctly. `vlm_boost` grew a `medium` parameter (default `"image"`, so
+  every existing caller is unchanged) that swaps the two places its prompt
+  says "image" — otherwise it tells the model it is prompting an image
+  system while asking it for a storyboard and a soundtrack. `has_image`
+  picks the family; `input_images` is the separate choice to spend a vision
+  pass. The VLM is off-box (`OLLAMA_URL`), so boosting costs this card
+  nothing; aimed at a local ollama it would compete with H3, and
+  `KEEP_ALIVE="0"` is what limits that. H3 has **no negative prompt**, so the
+  video UI has no such field and a supplied one is a 400 rather than a
+  silent drop.
+  **Never launch the switch with `DETACHED_PROCESS`.** A detached `pwsh`
+  started from `video_server.py` exits 0 without running the script at all —
+  the POST still answered 200, `.switching` never appeared, and the button
+  looked dead. `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` works, as does
+  no flag at all. Two things keep that failure visible if it recurs: the
+  child's output goes to `switch_launch.log` rather than `DEVNULL`, and the
+  endpoint waits up to 6s for `.switching` to appear before answering, so
+  "launched something that did nothing" becomes an error the page shows.
+  `powershell_exe()` also prefers the real `C:\Program Files\PowerShell\7`
+  binary over whatever `pwsh` resolves to on PATH (that is the WindowsApps
+  App Execution Alias) and over `7-preview`, which a plain reverse sort picks
+  by mistake.
+  `COMFY_HOME` names the checkout and defaults to
+  `E:\ComfyUI-h3`, kept separate from the older `E:\ComfyUI` running Wan on
+  purpose: H3 needs a much newer ComfyUI and torch than that tree has, and
+  upgrading it in place is what the second checkout avoids. One consequence
+  worth remembering when editing the kill scripts: `kill_flux.ps1` spares port
+  2224 the way it spares 2223, and it must — `video_server.py` runs from
+  `.venv` like the server does, so the straggler sweep would find it by path,
+  and killing it leaves the box in video mode with nothing able to switch
+  back.
 - **Reference images**: `generate_image` accepts one PIL image or a list of up
   to `MAX_REFERENCE_IMAGES` (3). FLUX.2 pipelines take the list natively;
   Kontext stitches multiple refs side-by-side (`_stitch_references`) since its

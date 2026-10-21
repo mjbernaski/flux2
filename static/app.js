@@ -98,6 +98,13 @@ if (apiKeyInput) {
             var mh = document.getElementById('modelHoverName');
             if (mh) mh.textContent = data.description || data.model || '';
             var h = document.getElementById('hostname'); if (h) h.textContent = data.hostname || '';
+            // video_server.py lives on its own port, not under this app, so the
+            // link is built from the browser's own hostname the way
+            // image_manager builds its generator link - a hardcoded localhost
+            // would break every visit from the LAN.
+            var vl = document.getElementById('videoLink');
+            if (vl) vl.href = location.protocol + '//' + location.hostname + ':' +
+                (data.video_server_port || 2224) + '/';
             var v = document.getElementById('version'); if (v) v.textContent = 'v' + (data.version || '');
             window.__fluxVersion = data.flux_version || null;
             window.__inpaintCapable = !!data.inpaint;

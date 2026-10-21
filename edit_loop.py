@@ -396,17 +396,50 @@ def _post_json(url, body, api_key=None, timeout=300):
         return json.loads(r.read().decode())
 
 
-def _openai_body(payload):
+# Guided decoding is optional in the OpenAI dialect, and a server that does
+# not implement it rejects `response_format` with a 400 rather than ignoring
+# it — which failed every critique/describe/boost call against that endpoint,
+# permanently and identically ("no rewrite from VLM"). There is no way to ask
+# an endpoint whether it supports the field except to use it, so the first
+# rejection is remembered per URL (never un-remembered: it is a property of
+# the serving engine, and a restart of this process re-learns it at the cost
+# of one request) and every later call asks for the JSON in words instead.
+# The reply parsers already tolerate that, because a thinking model ignores
+# the schema often enough that they had to.
+_schema_unsupported = set()
+
+# The complaint, in the shapes servers phrase it: vLLM names the field,
+# llama.cpp and this one name the feature.
+_NO_SCHEMA_RE = re.compile(r"(?i)response_format|structured output|guided")
+
+
+def _schema_instruction(schema):
+    """`format`'s schema restated as an instruction, for an endpoint that
+    cannot enforce one. Only the key names are asked for — the parsers want
+    the keys, and a full schema dump in the prompt buys nothing but tokens."""
+    props = schema.get("properties") or {}
+    keys = [k for k in (schema.get("required") or list(props)) if k]
+    if not keys:
+        return ""
+    return ("\n\nReply with ONE JSON object and nothing else — no markdown "
+            "fence, no preamble, no commentary. Required keys: "
+            + ", ".join(f'"{k}"' for k in keys) + ".")
+
+
+def _openai_body(payload, schema_ok=True):
     """Translate an ollama /api/chat payload into an OpenAI
     /v1/chat/completions body.
 
     Base64 `images` on a message become `image_url` data-URL content parts,
-    the `format` JSON schema becomes `response_format` (guided decoding),
-    `think` becomes the chat template's `enable_thinking` (see below), and
-    the rest of the ollama-only knobs drop out: `keep_alive`/`num_ctx` are
-    the serving process's business, not the client's, once the model lives
-    on another host.
+    the `format` JSON schema becomes `response_format` (guided decoding) —
+    or, with `schema_ok` false, a plain-text instruction appended to the last
+    message — `think` becomes the chat template's `enable_thinking` (see
+    below), and the rest of the ollama-only knobs drop out:
+    `keep_alive`/`num_ctx` are the serving process's business, not the
+    client's, once the model lives on another host.
     """
+    schema = payload.get("format")
+    asked = _schema_instruction(schema) if isinstance(schema, dict) and not schema_ok else ""
     messages = []
     for m in payload.get("messages", []):
         images = m.get("images") or []
@@ -418,10 +451,15 @@ def _openai_body(payload):
                 for b in images
             ]
         messages.append({"role": m.get("role", "user"), "content": content})
+    if asked and messages:
+        last = messages[-1]
+        if isinstance(last["content"], list):
+            last["content"][0]["text"] += asked
+        else:
+            last["content"] += asked
     body = {"model": payload["model"], "messages": messages, "stream": False,
             "max_tokens": VLM_MAX_TOKENS}
-    schema = payload.get("format")
-    if isinstance(schema, dict):
+    if isinstance(schema, dict) and schema_ok:
         body["response_format"] = {"type": "json_schema",
                                    "json_schema": {"name": "reply",
                                                    "schema": schema}}
@@ -436,14 +474,16 @@ def _openai_body(payload):
     # say so, emits the shortest string satisfying the schema, which is the
     # input echoed back. That is what made every /boost return the draft
     # verbatim at every level. So: thinking off whenever a schema is in
-    # play, and follows `think` otherwise. A template that doesn't take the
+    # play — asked for, whether or not this endpoint can enforce it, since a
+    # leaked thinking preamble in `content` is the parsers' other hard case
+    # — and follows `think` otherwise. A template that doesn't take the
     # kwarg ignores it; a server that rejects the field 400s, and
     # _chat_text's retry drops `think` from the payload, which drops this
     # with it.
     if "think" in payload:
         body["chat_template_kwargs"] = {
             "enable_thinking": bool(payload["think"])
-                               and "response_format" not in body
+                               and not isinstance(schema, dict)
         }
     return body
 
@@ -462,7 +502,26 @@ def _ollama_chat(vlm_url, payload, api_key=None):
         return _post_json(base + "/api/chat", payload, api_key)
     if not base.endswith("/v1"):
         base += "/v1"
-    resp = _post_json(base + "/chat/completions", _openai_body(payload), api_key)
+    url, key = base + "/chat/completions", api_key
+    schema_ok = base not in _schema_unsupported
+    try:
+        resp = _post_json(url, _openai_body(payload, schema_ok), key)
+    except urllib.error.HTTPError as e:
+        # A 400 naming response_format is this engine saying it has no guided
+        # decoding. Retried once without the schema and remembered, so the
+        # endpoint costs one failed request, not every call it ever serves.
+        detail = ""
+        if schema_ok and isinstance(payload.get("format"), dict) and e.code == 400:
+            try:
+                detail = e.read().decode("utf-8", "replace")
+            except Exception:
+                detail = ""
+        if not (detail and _NO_SCHEMA_RE.search(detail)):
+            raise
+        _schema_unsupported.add(base)
+        print(f"VLM: {base} rejects structured output "
+              "— asking for JSON in the prompt instead")
+        resp = _post_json(url, _openai_body(payload, schema_ok=False), key)
     choice = (resp.get("choices") or [{}])[0]
     return {"message": {"content": choice.get("message", {}).get("content") or ""},
             "done_reason": choice.get("finish_reason")}
@@ -497,7 +556,22 @@ def _chat_text(ollama_url, payload, api_key=None):
             payload.pop("think", None)
         resp = _ollama_chat(ollama_url, payload, api_key)
         text = resp["message"]["content"]
+    if isinstance(payload.get("format"), dict):
+        text = _unfence(text)
     return text
+
+
+def _unfence(text):
+    """Strip a ```json ... ``` wrapper. Guided decoding cannot emit one, so
+    this is for the endpoints that have none and are merely asked for JSON in
+    words: a fence is the usual way a chat-tuned model obliges, and
+    vlm_critique parses its reply with a bare json.loads."""
+    body = text.strip()
+    if not body.startswith("```"):
+        return text
+    body = body.split("\n", 1)[1] if "\n" in body else ""
+    end = body.rfind("```")
+    return (body[:end] if end != -1 else body).strip()
 
 
 def vlm_critique(model, direction, prompt, reference, output, metrics,
@@ -822,6 +896,42 @@ BOOST_GUIDANCE["flux1-img2img"] = (
     "changes relative to the starting image — the model re-renders from "
     "the description."
 )
+# The one video family. Everything above describes a single frame; H3 needs a
+# clip planned over time and — uniquely among the models here — a soundtrack,
+# because it generates picture and synchronized stereo audio in one pass. A
+# prompt that leaves the audio unsaid still gets audio, just whatever the model
+# infers. The shape below is the one MiniMax's own template prompts use.
+BOOST_GUIDANCE["h3"] = (
+    "The target model is MiniMax H3, a text-to-video model that generates "
+    "picture AND synchronized stereo audio together in a single pass. Write a "
+    "shot-planned prompt, never a still-image description:\n"
+    "- Open with the overall look: live-action or animation, film stock or "
+    "lens, depth of field, grading, grain, mood.\n"
+    "- One line of scene overview: who or what, where, and what happens.\n"
+    "- A storyboard of two to four shots, each with an explicit timecode "
+    "range, its own camera angle and the action inside it. The ranges must "
+    "run in order and add up to the clip length given above — do not plan "
+    "more story than the seconds allow, and do not leave the last second "
+    "empty.\n"
+    "- A camera line: how it moves within shots and how the cuts between "
+    "them work.\n"
+    "- An audio line, which matters as much as the picture: name the "
+    "ambience, the specific sound effects and roughly when they land, any "
+    "dialogue, and the music and how it resolves at the end.\n"
+    "Describe movement, not a frozen moment: every shot needs something "
+    "changing in it. Unlike the image models above, H3's own prompt idiom "
+    "ends with a short exclusion line — no text, subtitles, logos or "
+    "watermarks, and no CG look when the style is live-action — so keep one "
+    "if the draft implies it."
+)
+BOOST_GUIDANCE["h3-i2v"] = (
+    BOOST_GUIDANCE["h3"] + "\nThe user has attached a first frame and the "
+    "clip begins exactly on it, so the opening shot must start from what is "
+    "already in that image rather than setting a different scene. Do not "
+    "re-describe its contents as if the model had to create them; say how the "
+    "scene comes alive from there — what starts moving, where the camera "
+    "goes, how the light changes."
+)
 
 
 # How far /boost is allowed to depart from the user's draft, by level 1-5.
@@ -853,7 +963,7 @@ BOOST_LEVELS = {
 
 def vlm_boost(model, prompt, family="flux2", model_desc="", level=3,
               think=False, ollama_url="http://127.0.0.1:11434", variant=None,
-              negative_prompt=None, images=None, steer=None):
+              negative_prompt=None, images=None, steer=None, medium="image"):
     """Rewrite the user's draft prompt into a stronger one tuned to the
     prompting idiom of the loaded image model (`family` picks the guidance;
     `model_desc` is the human-readable model name for context; `level` 1-5
@@ -936,7 +1046,7 @@ def vlm_boost(model, prompt, family="flux2", model_desc="", level=3,
         plural = "images" if len(images) > 1 else "image"
         image_line = (
             f"Attached {'are' if len(images) > 1 else 'is'} the {len(images)} "
-            f"reference {plural} the image model will condition on, so you can "
+            f"reference {plural} the {medium} model will condition on, so you can "
             "see what it will be working from. Ground the rewrite in what is "
             "actually there - match the subject, setting and style you can see "
             "rather than adding detail that contradicts them. Write the prompt "
@@ -944,8 +1054,11 @@ def vlm_boost(model, prompt, family="flux2", model_desc="", level=3,
             "restate what the model can already see unless the draft asks to "
             "change it.\n"
         )
+    # `medium` swaps only the two places this text says "image", so a video
+    # backend is not told it is prompting an image model while the guidance
+    # above is asking it for a storyboard and a soundtrack.
     ask = (
-        "You improve prompts for a local text-to-image system"
+        f"You improve prompts for a local text-to-{medium} system"
         + (f" currently running {model_desc}" if model_desc else "") + ".\n"
         f"{guidance}\n"
         f"The user's draft prompt: {prompt}\n"

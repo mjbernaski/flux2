@@ -87,3 +87,18 @@ supervisor.err.log
 # the watchdog does not undo a deliberate stop
 watchdog.log
 .flux_stopped
+
+# Video mode: the H3/ComfyUI side (video_server.py, run_video.ps1, switch_mode.ps1)
+comfy.log
+video_server.log
+video_server.err.log
+video_supervisor.out.log
+video_supervisor.err.log
+switch_mode.log
+switch_launch.log
+video.pid
+# Which GPU tenant is wanted, and the sentinels that keep a deliberate stop
+# stopped. All are machine state, not configuration.
+.mode
+.switching
+.video_stopped
